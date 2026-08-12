@@ -1,8 +1,10 @@
 """Readiness, the claim/release/complete lifecycle, and the terminal states."""
 
+import asyncio
+
 import pytest
 
-from agl.core.dag import Dag, NodeState, UnknownNodeError
+from agl.core.dag import Dag, NodeId, NodeState, UnknownNodeError
 
 
 def chain(*node_ids: str) -> Dag:
@@ -167,6 +169,82 @@ def test_a_released_node_can_be_claimed_again() -> None:
     dag.release("A")
     finish(dag, "A")
     assert dag.is_complete() is True
+
+
+# -- claiming out of the ready set ----------------------------------------
+
+
+def test_claim_next_takes_the_node_ready_would_have_named() -> None:
+    dag = chain("A", "B")
+
+    assert dag.claim_next() == dag.nodes()[0] == "A"
+    assert dag.state("A") is NodeState.CLAIMED
+
+
+def test_claim_next_walks_the_ready_set_without_repeating_itself() -> None:
+    dag = chain("A", "B", "C")
+
+    claimed = [dag.claim_next() for _ in range(3)]
+
+    assert claimed == ["A", "B", "C"]
+    assert dag.claim_next() is None
+
+
+def test_claim_next_on_an_empty_graph_is_none() -> None:
+    assert Dag().claim_next() is None
+
+
+def test_claim_next_is_none_when_everything_is_claimed_or_done() -> None:
+    dag = chain("A", "B")
+    dag.claim("A")
+    finish(dag, "B")
+
+    assert dag.claim_next() is None
+
+
+def test_claim_next_is_none_while_the_only_pending_node_is_blocked() -> None:
+    dag = chain("A", "B")
+    dag.add_edge("A", "B")
+    dag.claim("B")
+
+    assert dag.claim_next() is None
+    assert dag.state("A") is NodeState.PENDING
+
+
+def test_claim_next_follows_the_priority_function() -> None:
+    dag = Dag(priority=lambda node_id: node_id)
+    for node_id in ("C", "A", "B"):
+        dag.add_node(node_id)
+
+    assert [dag.claim_next() for _ in range(3)] == ["A", "B", "C"]
+
+
+def test_completing_a_blocker_puts_its_dependent_in_reach_of_claim_next() -> None:
+    dag = chain("A", "B")
+    dag.add_edge("A", "B")
+
+    assert dag.claim_next() == "B"
+    assert dag.claim_next() is None
+    dag.complete("B")
+    assert dag.claim_next() == "A"
+
+
+async def test_concurrent_callers_each_get_a_node_of_their_own() -> None:
+    # The reason the method exists: `ready()` then `claim()` is only safe while
+    # nothing runs in between, and nothing enforces that at a call site. Here
+    # four tasks race over five nodes, awaiting after every claim.
+    dag = chain("A", "B", "C", "D", "E")
+    claimed: list[NodeId] = []
+
+    async def worker() -> None:
+        while (node := dag.claim_next()) is not None:
+            claimed.append(node)
+            await asyncio.sleep(0)
+
+    await asyncio.gather(*(worker() for _ in range(4)))
+
+    assert sorted(claimed) == ["A", "B", "C", "D", "E"]
+    assert all(dag.state(node) is NodeState.CLAIMED for node in dag.nodes())
 
 
 def test_lifecycle_calls_on_an_unknown_node_raise() -> None:

@@ -10,11 +10,18 @@ The layout::
     <home>/projects/<project>/                    project config and standards
     <home>/runs/<label>/                          run artifacts
     <trees_root>/<project>/<label>/<ticket_id>/   one worktree per ticket
-    <trees_root>/<project>/<label>/_merge/        the merge worktree
 
 Worktrees sit outside both the orchestrator repo and the target repo, and the
 trees root is supplied by the caller rather than derived from the home, so it
 stays configurable.
+
+There is no merge worktree here, and that is a decision rather than an omission:
+merges happen in the main repository root. Git refuses to check out a branch
+that another worktree already holds, and the base branch is checked out in the
+main repository, so a merge worktree could never hold the branch being merged
+into. The root is already on the base branch, ticket worktrees are untouched
+either way, and a conflict halt leaves the markers where someone looking to
+resolve them would go.
 
 Branches are `agl/<label>/<ticket_id>`, with bug branches as hyphenated
 siblings: `agl/<label>/<ticket_id>-bug-<n>`. Git stores refs as files, so
@@ -31,7 +38,6 @@ __all__ = [
     "InvalidLabelError",
     "branch_namespace",
     "bug_branch",
-    "merge_worktree_dir",
     "project_config",
     "project_dir",
     "project_standards",
@@ -43,7 +49,6 @@ __all__ = [
 ]
 
 BRANCH_PREFIX = "agl"
-MERGE_WORKTREE_NAME = "_merge"
 
 _LABEL = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
 
@@ -86,11 +91,6 @@ def trees_dir(trees_root: Path, project: str, label: str) -> Path:
 def worktree_dir(trees_root: Path, project: str, label: str, ticket_id: str) -> Path:
     """The worktree a single ticket is worked in."""
     return trees_dir(trees_root, project, label) / ticket_id
-
-
-def merge_worktree_dir(trees_root: Path, project: str, label: str) -> Path:
-    """The worktree ticket branches are merged in — a sibling, never nested."""
-    return trees_dir(trees_root, project, label) / MERGE_WORKTREE_NAME
 
 
 # -- branches -------------------------------------------------------------

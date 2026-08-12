@@ -62,6 +62,41 @@ def test_bugs_found_in_review_block_their_parent_until_they_are_done() -> None:
     assert dag.unsatisfied_blockers("T-03") == ()
 
 
+def test_the_documented_order_never_leaves_the_parent_claimable() -> None:
+    # Nodes, then edges, then the release — the order `Dag`'s docstring gives.
+    # Releasing first would leave the parent ready for a beat, and a scheduler
+    # that looked in that window would claim it out from under its own bugs.
+    dag = Dag()
+    dag.add_node("T-03")
+    dag.claim("T-03")
+
+    dag.add_node("T-03-bug-1")
+    dag.add_node("T-03-bug-2")
+    dag.add_edge("T-03", "T-03-bug-1")
+    dag.add_edge("T-03", "T-03-bug-2")
+    dag.release("T-03")
+
+    assert dag.ready() == ("T-03-bug-1", "T-03-bug-2")
+    assert dag.claim_next() == "T-03-bug-1"
+    assert dag.claim_next() == "T-03-bug-2"
+    assert dag.claim_next() is None
+    assert dag.state("T-03") is NodeState.PENDING
+
+
+def test_releasing_before_the_edges_exist_exposes_the_parent() -> None:
+    # The failure the order avoids, driven rather than argued: between the
+    # release and the first edge the parent is ready, and a `claim_next` in that
+    # window takes it.
+    dag = Dag()
+    dag.add_node("T-03")
+    dag.claim("T-03")
+    dag.add_node("T-03-bug-1")
+
+    dag.release("T-03")
+
+    assert dag.claim_next() == "T-03"
+
+
 def test_a_bug_may_not_depend_on_the_parent_it_blocks() -> None:
     dag = Dag()
     dag.add_node("T-03")

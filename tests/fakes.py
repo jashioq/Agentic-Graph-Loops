@@ -18,12 +18,19 @@ from agl.core.agent import (
     AgentResult,
     AgentRunner,
     AgentSpec,
+    Tool,
 )
 from agl.core.store import MissingKeyError, Store
 from agl.core.terminal import Answer, LiveSession, Question, Screen, Terminal
 from agl.core.terminal.impl.render import to_renderable
 
-__all__ = ["FakeAgentRunner", "HeadlessTerminal", "MemoryStore", "ScriptedRun"]
+__all__ = [
+    "FakeAgentRunner",
+    "HeadlessTerminal",
+    "MemoryStore",
+    "ScriptedRun",
+    "ToolResult",
+]
 
 
 class HeadlessTerminal(Terminal):
@@ -122,6 +129,20 @@ class MemoryStore(Store):
 
 
 @dataclass(frozen=True)
+class ToolResult:
+    """What one tool call handed back, and whether it came back as a failure.
+
+    The two are recorded together because a failed call is an outcome the run
+    kept going after, not an exception it died on — so a test asserting on
+    `tool_results` has to be able to tell the two apart without reading the
+    text. It is the same pair MCP hands the model: the text, and `is_error`.
+    """
+
+    text: str
+    is_error: bool = False
+
+
+@dataclass(frozen=True)
 class ScriptedRun:
     """What one call to `FakeAgentRunner` should do, and what it hands back.
 
@@ -166,13 +187,14 @@ class FakeAgentRunner(AgentRunner):
     Entries may be a bare string, a whole `AgentResult`, or a `ScriptedRun` when
     the call should also invoke tools, ask a question, or report activity.
 
-    Everything it was asked to do is recorded: `specs`, `answers`, `tool_results`.
+    Everything it was asked to do is recorded: `specs`, `answers`, and every
+    call's `ToolResult` in `tool_results`, failures included.
     """
 
     def __init__(self, script: Script = ()) -> None:
         self.specs: list[AgentSpec] = []
         self.answers: list[str] = []
-        self.tool_results: list[str] = []
+        self.tool_results: list[ToolResult] = []
         self._by_role: dict[str, ScriptedRun] | None = None
         self._in_order: deque[ScriptedRun] | None = None
 
@@ -218,15 +240,33 @@ class FakeAgentRunner(AgentRunner):
         assert self._in_order, f"the script ran out before role {role!r} was called"
         return self._in_order.popleft()
 
-    async def _invoke(self, spec: AgentSpec, name: str, arguments: dict[str, Any]) -> str:
-        """Call one of the spec's own tools, as a real run would."""
+    async def _invoke(self, spec: AgentSpec, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Call one of the spec's own tools, wrapped the way a real run wraps it.
+
+        The wrapping is `agent.impl.tools`', not an invention of the fake's: a
+        handler that *raises* is a fact about the world the model should react
+        to, so it becomes an error result and the run carries on; a handler
+        returning a *non-string* violates `Tool`'s own type, which the model
+        cannot fix, so it raises rather than being coerced into an answer.
+        """
         for tool in spec.tools:
             if tool.name == name:
-                return await tool.handler(arguments)
+                return await _wrapped(tool, arguments)
         raise AssertionError(
             f"role {spec.role!r} has no tool {name!r}; "
             f"it was given {[tool.name for tool in spec.tools]}"
         )
+
+
+async def _wrapped(tool: Tool, arguments: dict[str, Any]) -> ToolResult:
+    """One handler call, classified the way `agent.impl.tools._register` does."""
+    try:
+        result = await tool.handler(arguments)
+    except Exception as error:  # noqa: BLE001 - the model decides what to do
+        return ToolResult(f"{type(error).__name__}: {error}", is_error=True)
+    if not isinstance(result, str):
+        raise TypeError(f"tool {tool.name!r} returned {type(result).__name__}, expected str")
+    return ToolResult(result)
 
 
 def _scripted(run: ScriptedRun | AgentResult | str) -> ScriptedRun:

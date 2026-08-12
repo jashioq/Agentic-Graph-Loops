@@ -282,12 +282,15 @@ def test_a_branch_can_be_merged_again_after_an_abort(
 
 
 # -- resolving ------------------------------------------------------------
+#
+# Nothing below stages anything: `commit_merge` stages the paths that were
+# unmerged itself, because `Vcs` offers no way to do it and the documented path
+# — merge, resolve, commit — has to be walkable through the ABC alone.
 
 
 def test_a_hand_resolved_merge_can_be_committed(repo: Path, vcs: Git, diverged: Diverged) -> None:
     vcs.merge(repo, diverged.theirs)
     (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
-    git(repo, "add", "a.txt")
 
     sha = vcs.commit_merge(repo, "merge theirs into ours")
     assert sha == vcs.rev_parse("HEAD")
@@ -299,7 +302,6 @@ def test_a_hand_resolved_merge_can_be_committed(repo: Path, vcs: Git, diverged: 
 def test_a_resolved_merge_has_both_parents(repo: Path, vcs: Git, diverged: Diverged) -> None:
     vcs.merge(repo, diverged.theirs)
     (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
-    git(repo, "add", "a.txt")
     vcs.commit_merge(repo, "merge")
     assert len(git(repo, "rev-list", "--parents", "-1", "HEAD").split()) == 3
 
@@ -310,29 +312,109 @@ def test_a_resolved_merge_makes_the_source_an_ancestor(
     # The check the workflow uses to confirm a merge actually landed.
     vcs.merge(repo, diverged.theirs)
     (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
-    git(repo, "add", "a.txt")
     vcs.commit_merge(repo, "merge")
     assert vcs.is_ancestor(diverged.theirs, diverged.ours) is True
 
 
-def test_committing_with_paths_still_unresolved_raises(
+def test_the_resolution_is_committed_as_it_was_left_on_disk(
     repo: Path, vcs: Git, diverged: Diverged
 ) -> None:
     vcs.merge(repo, diverged.theirs)
-    with pytest.raises(VcsError):
-        vcs.commit_merge(repo, "premature")
-    assert vcs.merge_in_progress(repo) is True
+    (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
+    vcs.commit_merge(repo, "merge")
+    assert git(repo, "show", "HEAD:a.txt") == "resolved\n"
+
+
+def test_only_the_unmerged_paths_are_staged(repo: Path, vcs: Git, diverged: Diverged) -> None:
+    # A merge commit is the worst place for a surprise, so unrelated work in the
+    # tree stays out of it: a blanket `add -A` would sweep this file in.
+    commit_file(repo, "unrelated.txt", "committed\n", "add unrelated")
+    vcs.merge(repo, diverged.theirs)
+    (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
+    (repo / "unrelated.txt").write_text("edited while resolving\n", encoding="utf-8")
+
+    vcs.commit_merge(repo, "merge")
+
+    assert vcs.status(repo) == (FileStatus(path="unrelated.txt", code="M"),)
+    assert git(repo, "show", "HEAD:unrelated.txt") == "committed\n"
+
+
+def test_an_untracked_file_is_not_swept_into_the_merge_commit(
+    repo: Path, vcs: Git, diverged: Diverged
+) -> None:
+    vcs.merge(repo, diverged.theirs)
+    (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("notes\n", encoding="utf-8")
+
+    vcs.commit_merge(repo, "merge")
+
+    assert vcs.status(repo) == (FileStatus(path="scratch.txt", code="??"),)
+
+
+def test_resolving_by_deleting_the_conflicted_file_commits(
+    repo: Path, vcs: Git, diverged: Diverged
+) -> None:
+    # A legitimate resolution: staging has to cope with a path that is no longer
+    # there rather than failing on it.
+    vcs.merge(repo, diverged.theirs)
+    (repo / "a.txt").unlink()
+
+    sha = vcs.commit_merge(repo, "merge, dropping a.txt")
+
+    assert sha == vcs.rev_parse("HEAD")
+    assert vcs.merge_in_progress(repo) is False
+    assert vcs.has_changes(repo) is False
+    assert (repo / "a.txt").exists() is False
+    assert vcs.is_ancestor(diverged.theirs, diverged.ours) is True
+
+
+def test_two_conflicted_files_are_both_staged(repo: Path, vcs: Git) -> None:
+    commit_file(repo, "a.txt", "base a\n", "add a")
+    commit_file(repo, "b.txt", "base b\n", "add b")
+    git(repo, "checkout", "-q", "-b", "theirs")
+    commit_file(repo, "a.txt", "theirs a\n", "their a")
+    commit_file(repo, "b.txt", "theirs b\n", "their b")
+    git(repo, "checkout", "-q", "main")
+    commit_file(repo, "a.txt", "ours a\n", "our a")
+    commit_file(repo, "b.txt", "ours b\n", "our b")
+    vcs.merge(repo, "theirs")
+
+    (repo / "a.txt").write_text("resolved a\n", encoding="utf-8")
+    (repo / "b.txt").write_text("resolved b\n", encoding="utf-8")
+    vcs.commit_merge(repo, "merge")
+
+    assert vcs.unmerged_paths(repo) == ()
+    assert vcs.has_changes(repo) is False
+    assert git(repo, "show", "HEAD:b.txt") == "resolved b\n"
+
+
+def test_committing_without_resolving_commits_what_it_was_given(
+    repo: Path, vcs: Git, diverged: Diverged
+) -> None:
+    # Conflict markers are not this method's problem: it stages and commits what
+    # the caller left, and verifying the resolution is the caller's job.
+    vcs.merge(repo, diverged.theirs)
+
+    vcs.commit_merge(repo, "committed unverified")
+
+    assert vcs.merge_in_progress(repo) is False
+    assert "<<<<<<<" in git(repo, "show", "HEAD:a.txt")
 
 
 def test_committing_a_merge_when_none_is_running_raises(repo: Path, vcs: Git) -> None:
+    # The guard that stops a stray call turning staged content into an ordinary
+    # commit; staging the resolution does not soften it.
+    (repo / "a.txt").write_text("not part of any merge\n", encoding="utf-8")
+
     with pytest.raises(VcsError):
         vcs.commit_merge(repo, "nothing to merge")
+
+    assert vcs.status(repo) == (FileStatus(path="a.txt", code="??"),)
 
 
 def test_the_merge_message_round_trips(repo: Path, vcs: Git, diverged: Diverged) -> None:
     vcs.merge(repo, diverged.theirs)
     (repo / "a.txt").write_text("resolved\n", encoding="utf-8")
-    git(repo, "add", "a.txt")
     message = 'merge "theirs"\n\nResolved a.txt by hand.\n'
     vcs.commit_merge(repo, message)
     assert git(repo, "log", "-1", "--pretty=%B").strip() == message.strip()

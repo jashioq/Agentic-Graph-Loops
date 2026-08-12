@@ -8,7 +8,6 @@ from agl.core.paths import (
     InvalidLabelError,
     branch_namespace,
     bug_branch,
-    merge_worktree_dir,
     project_config,
     project_dir,
     project_standards,
@@ -84,20 +83,6 @@ def test_two_runs_of_one_project_get_different_trees_dirs() -> None:
 
 def test_two_projects_get_different_trees_dirs() -> None:
     assert trees_dir(TREES, "acme-api", "add-auth") != trees_dir(TREES, "acme-web", "add-auth")
-
-
-def test_merge_worktree_dir() -> None:
-    assert merge_worktree_dir(TREES, "acme-api", "add-auth") == Path(
-        "/home/jan/.agl-trees/acme-api/add-auth/_merge"
-    )
-
-
-def test_the_merge_worktree_is_a_sibling_of_ticket_worktrees() -> None:
-    merge = merge_worktree_dir(TREES, "acme-api", "add-auth")
-    ticket = worktree_dir(TREES, "acme-api", "add-auth", "T-03")
-    assert merge.parent == ticket.parent
-    assert not merge.is_relative_to(ticket)
-    assert not ticket.is_relative_to(merge)
 
 
 def test_worktrees_live_under_the_trees_root_not_the_agl_home() -> None:
@@ -220,7 +205,6 @@ def test_path_functions_are_repeatable_and_create_nothing(tmp_path: Path) -> Non
         lambda: run_dir(home, "add-auth"),
         lambda: trees_dir(trees, "acme-api", "add-auth"),
         lambda: worktree_dir(trees, "acme-api", "add-auth", "T-03"),
-        lambda: merge_worktree_dir(trees, "acme-api", "add-auth"),
     ]
     for call in calls:
         assert call() == call()

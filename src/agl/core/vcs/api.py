@@ -266,8 +266,16 @@ class Vcs(ABC):
 
     @abstractmethod
     def commit_merge(self, cwd: Path, message: str) -> str:
-        """Commit a merge whose conflicts have been resolved and staged.
+        """Commit a merge whose conflicts have been resolved in the worktree.
 
-        Raises `VcsError` if no merge is in progress or paths are still
-        unresolved.
+        Resolving means leaving the files as they should be — edited, or
+        deleted — and nothing else: the paths the merge left unmerged are
+        staged here, since `Vcs` offers no way to stage and the documented
+        path has to be walkable through this interface alone. Only those paths
+        are staged, so unrelated work in the tree stays out of the merge commit.
+
+        Conflict markers still in a file are not checked for. This commits what
+        it was given; verifying a resolution is the caller's job.
+
+        Raises `VcsError` if no merge is in progress.
         """

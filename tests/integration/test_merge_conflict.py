@@ -24,7 +24,7 @@ import pytest
 from agl.core import paths
 from agl.core.vcs import Conflict, ConflictHunk, MergeResult
 from agl.core.vcs.impl.git import Git
-from tests.conftest import commit_file, git
+from tests.conftest import commit_file
 from tests.integration.conftest import PROJECT, copy_repo
 
 LABEL = "add-auth"
@@ -163,10 +163,9 @@ def test_the_base_side_is_absent_under_this_conflict_style(collision: Collision)
 
 def test_a_hand_resolved_merge_lands(unresolved: Collision) -> None:
     vcs, repo = unresolved.vcs, unresolved.repo
+    # Writing the file is the whole resolution: `commit_merge` stages what the
+    # merge left unmerged, so the scenario never leaves the `Vcs` interface.
     (repo / FILE).write_text('MODE = "strict"\n', encoding="utf-8")
-    # `Vcs` has no way to stage a path, so the resolution is staged with git
-    # itself; see the report.
-    git(repo, "add", "--", FILE)
 
     sha = vcs.commit_merge(repo, f"merge {unresolved.second}")
 
@@ -179,7 +178,6 @@ def test_a_hand_resolved_merge_lands(unresolved: Collision) -> None:
 def test_the_resolved_merge_has_both_branches_behind_it(unresolved: Collision) -> None:
     vcs, repo = unresolved.vcs, unresolved.repo
     (repo / FILE).write_text(OURS, encoding="utf-8")
-    git(repo, "add", "--", FILE)
     vcs.commit_merge(repo, "merge")
 
     assert vcs.is_ancestor(unresolved.first, "main") is True

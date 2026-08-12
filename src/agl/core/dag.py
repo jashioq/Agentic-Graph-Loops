@@ -8,6 +8,14 @@ the same ids.
 Edges point from blocked to blocker: `add_edge(blocked, blocker)` means `blocked`
 cannot start until `blocker` is `DONE`. Every mutation validates before it
 touches anything, so a raising mutation leaves the graph exactly as it was.
+
+Mutating a graph that is already running has one load-bearing ordering. When
+work discovered mid-run must block a node that is already claimed — a review
+finding bugs in the ticket it was reviewing — the sequence is: **add the new
+nodes, add the edges, then release the parent.** Releasing first leaves the
+parent ready for a beat, and a scheduler that happens to look in that window
+claims it out from under the work meant to block it. Adding an edge to a
+still-`CLAIMED` node is legal by design, which is what makes edges-first safe.
 """
 
 from collections.abc import Callable, Iterable
@@ -119,6 +127,21 @@ class Dag:
         if blocking:
             raise ValueError(f"cannot claim {node_id!r}, blocked by {', '.join(blocking)}")
         self._states[node_id] = NodeState.CLAIMED
+
+    def claim_next(self) -> NodeId | None:
+        """The highest-priority ready node, claimed, or `None` if nothing is ready.
+
+        Synchronous, and that is the whole point: reading the ready set and
+        claiming out of it is one step no caller can separate. A scheduler that
+        called `ready()`, awaited, and only then called `claim()` would hand the
+        same node to two workers — which in a run means two agents in one
+        worktree. Priority ordering is `ready()`'s.
+        """
+        ready = self.ready()
+        if not ready:
+            return None
+        self.claim(ready[0])
+        return ready[0]
 
     def release(self, node_id: NodeId) -> None:
         """Give a failed node back for a retry: `CLAIMED` -> `PENDING`.

@@ -13,7 +13,6 @@ passes another record's id and still gets the one its tool was built for.
 """
 
 import json
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +21,7 @@ import pytest
 from agl.core.agent import AgentSpec, Tool
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
-from tests.fakes import FakeAgentRunner, ScriptedRun
+from tests.fakes import FakeAgentRunner, ScriptedRun, ToolResult
 
 NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
@@ -95,24 +94,6 @@ def failing_tool() -> Tool:
     )
 
 
-def reporting(tool: Tool, errors: list[str]) -> Tool:
-    """`tool` with its failures turned into an answer, and recorded on the way.
-
-    This is what `agent.impl.tools` does around every registered handler: a
-    handler that raises is a fact about the world the model should react to, so
-    it becomes an error result and the run carries on.
-    """
-
-    async def handler(arguments: dict[str, Any]) -> str:
-        try:
-            return await tool.handler(arguments)
-        except Exception as error:  # noqa: BLE001 - the model decides what to do
-            errors.append(f"{type(error).__name__}: {error}")
-            return f"error: {type(error).__name__}: {error}"
-
-    return replace(tool, handler=handler)
-
-
 def spec(role: str, cwd: Path, *tools: Tool) -> AgentSpec:
     return AgentSpec(prompt="Do the work.", cwd=cwd, role=role, tools=tools)
 
@@ -130,8 +111,8 @@ async def test_two_runs_bound_to_different_records_each_get_their_own(
     await runner.run(spec("review", tmp_path, read_ticket_tool(store, "T-01")))
     await runner.run(spec("review", tmp_path, read_ticket_tool(store, "T-02")))
 
-    assert json.loads(runner.tool_results[0]) == TICKETS["T-01"]
-    assert json.loads(runner.tool_results[1]) == TICKETS["T-02"]
+    assert json.loads(runner.tool_results[0].text) == TICKETS["T-01"]
+    assert json.loads(runner.tool_results[1].text) == TICKETS["T-02"]
 
 
 async def test_the_tool_has_the_same_name_in_both_runs(store: FileStore, tmp_path: Path) -> None:
@@ -158,7 +139,7 @@ async def test_no_argument_reaches_another_record(store: FileStore, tmp_path: Pa
 
     await runner.run(spec("review", tmp_path, read_ticket_tool(store, "T-01")))
 
-    assert json.loads(runner.tool_results[0]) == TICKETS["T-01"]
+    assert json.loads(runner.tool_results[0].text) == TICKETS["T-01"]
 
 
 def test_the_schema_offers_no_parameter_to_pass(store: FileStore) -> None:
@@ -191,7 +172,7 @@ async def test_a_write_lands_at_the_key_the_closure_chose(
 
     assert store.list("reviews/") == ("reviews/T-01.md",)
     assert store.read("reviews/T-01.md") == "Looks fine.\n"
-    assert runner.tool_results == ["saved reviews/T-01.md"]
+    assert runner.tool_results == [ToolResult("saved reviews/T-01.md")]
 
 
 def test_the_write_schema_takes_the_content_and_not_the_key(store: FileStore) -> None:
@@ -213,27 +194,35 @@ async def test_two_writers_cannot_land_on_each_other_s_key(
 # -- a handler that fails ---------------------------------------------------
 
 
-async def test_a_reported_failure_is_visible_and_the_run_survives(tmp_path: Path) -> None:
-    errors: list[str] = []
+async def test_a_failure_is_visible_and_the_run_survives(tmp_path: Path) -> None:
+    # The handler is handed over raw: the wrapping that turns a raise into
+    # something the model reads belongs to the runner, not to the caller
+    # building the tool.
     runner = FakeAgentRunner(
         {"review": ScriptedRun("finished anyway", calls=(("read_standards", {}),))}
     )
 
-    result = await runner.run(spec("review", tmp_path, reporting(failing_tool(), errors)))
+    result = await runner.run(spec("review", tmp_path, failing_tool()))
 
-    assert errors == ["FileNotFoundError: standards.md"]
-    assert runner.tool_results == ["error: FileNotFoundError: standards.md"]
+    assert runner.tool_results == [
+        ToolResult("FileNotFoundError: standards.md", is_error=True)
+    ]
     assert result.text == "finished anyway"
     assert result.is_error is False
 
 
-async def test_an_unwrapped_raise_takes_the_whole_run_down(tmp_path: Path) -> None:
-    # `FakeAgentRunner` awaits the handler as given, so a raising one propagates
-    # out of `run`. `ClaudeRunner` does not behave this way — every handler it
-    # registers is wrapped, and the raise becomes an error result the model
-    # reads. A workflow tested only against the fake would be written against
-    # the wrong contract; see the report.
-    runner = FakeAgentRunner({"review": ScriptedRun(calls=(("read_standards", {}),))})
+async def test_a_failed_tool_does_not_reach_past_its_own_call(
+    store: FileStore, tmp_path: Path
+) -> None:
+    # The run continues, so what a failing tool costs is that one answer — the
+    # next call is still scoped exactly as its closure decided.
+    runner = FakeAgentRunner(
+        {"review": ScriptedRun(calls=(("read_standards", {}), ("read_ticket", {})))}
+    )
 
-    with pytest.raises(FileNotFoundError):
-        await runner.run(spec("review", tmp_path, failing_tool()))
+    await runner.run(
+        spec("review", tmp_path, failing_tool(), read_ticket_tool(store, "T-01"))
+    )
+
+    assert runner.tool_results[0].is_error is True
+    assert json.loads(runner.tool_results[1].text) == TICKETS["T-01"]

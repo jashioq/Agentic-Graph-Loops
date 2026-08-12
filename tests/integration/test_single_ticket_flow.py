@@ -10,9 +10,9 @@ The flow runs once for the whole module and every test reads what it left
 behind, because running eight git processes per assertion is most of the file's
 runtime and none of its meaning. Nothing below mutates the flow.
 
-The merge runs in the main repository root rather than in
-`paths.merge_worktree_dir`: git will not check the same branch out twice, and
-`Vcs` has no way to move a branch onto a merge made somewhere else.
+The merge runs in the main repository root, which is where merges happen: the
+root is already on the base branch, and git will not check that branch out a
+second time in a worktree of its own.
 """
 
 import asyncio
@@ -29,7 +29,7 @@ from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
 from agl.core.vcs import MergeResult, Worktree
 from agl.core.vcs.impl.git import Git
-from tests.fakes import FakeAgentRunner, ScriptedRun
+from tests.fakes import FakeAgentRunner, ScriptedRun, ToolResult
 from tests.integration.conftest import PROJECT, copy_repo
 
 LABEL = "add-auth"
@@ -172,7 +172,7 @@ def test_the_branch_is_the_one_paths_named(flow: Flow) -> None:
 
 
 def test_a_tool_handed_to_the_agent_reached_the_store(flow: Flow) -> None:
-    assert flow.runner.tool_results == [SPEC, "wrote auth.py"]
+    assert flow.runner.tool_results == [ToolResult(SPEC), ToolResult("wrote auth.py")]
 
 
 def test_the_agent_returned_what_it_was_scripted_to(flow: Flow) -> None:

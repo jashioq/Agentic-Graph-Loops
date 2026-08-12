@@ -134,14 +134,15 @@ async def drive(repo: Path, home: Path, trees: Path) -> Ran:
     )
     bugs = review.structured["bugs"]
 
-    # The mutation: the new work goes in first, then the parent goes back to
-    # pending, then the edges. Adding a blocker to a claimed node is allowed,
-    # but releasing first would leave the parent ready for a beat.
+    # The mutation, in the order `Dag`'s docstring gives: the new work goes in,
+    # then the edges, then the parent goes back to pending. Adding a blocker to
+    # a claimed node is legal, which is what makes edges-first possible;
+    # releasing first would leave the parent ready for a beat and re-claimable.
     for bug in bugs:
         dag.add_node(bug["id"])
-    dag.release(PARENT)
     for bug in bugs:
         dag.add_edge(PARENT, bug["id"])
+    dag.release(PARENT)
 
     after_bugs = Snapshot(
         parent_state=dag.state(PARENT),

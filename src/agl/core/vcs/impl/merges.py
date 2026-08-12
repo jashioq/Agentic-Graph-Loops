@@ -6,8 +6,9 @@ this project allows. Conflict marker parsing lives in `conflicts.py`, so this
 file reads files and runs commands and never looks at a `<<<<<<<` itself.
 
 A conflicted merge is deliberately left in progress. The caller inspects the
-conflicts, resolves them, and calls `commit_merge` — or `abort_merge`. Nothing
-here silently unwinds a merge on the caller's behalf.
+conflicts, resolves them in the worktree, and calls `commit_merge` — which
+stages what the merge had left unmerged — or `abort_merge`. Nothing here
+silently unwinds a merge on the caller's behalf.
 """
 
 from pathlib import Path
@@ -87,12 +88,33 @@ class MergeOps(GitRunner):
             # Without this, a stray call would quietly make an ordinary commit
             # out of whatever happened to be staged.
             raise VcsError(f"no merge in progress in {cwd}")
+        self._stage_resolution(cwd)
         result = self._run(["commit", "-m", message], cwd, check=False)
         if result.code != 0:
             raise VcsError(f"cannot commit the merge in {cwd}: {self._reason(result)}")
         return self._head(cwd)
 
     # -- internals --------------------------------------------------------
+
+    def _stage_resolution(self, cwd: Path) -> None:
+        """Stage the paths this merge left unmerged, and nothing else.
+
+        Named paths rather than `add -A`, because a merge commit is the worst
+        place for a surprise: whatever else the tree happens to hold — an
+        unrelated edit, an untracked scratch file — is none of this merge's
+        business. `-A` under that pathspec is what makes a conflicted file the
+        resolver *deleted* stage as a deletion instead of failing on a path
+        that is no longer there; deleting is a legitimate resolution.
+
+        Whether the content still holds conflict markers is not asked. This
+        stages and commits what it was given; verification is the caller's.
+        """
+        unmerged = self.unmerged_paths(cwd)
+        if not unmerged:
+            return
+        result = self._run(["add", "-A", "--", *unmerged], cwd, check=False)
+        if result.code != 0:
+            raise VcsError(f"cannot stage the resolution in {cwd}: {self._reason(result)}")
 
     def _diff(self, argv: list[str], cwd: Path, base: str, head: str) -> ExecResult:
         """Run a `base...head` diff, naming whichever ref failed to resolve.

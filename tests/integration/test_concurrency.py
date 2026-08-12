@@ -16,7 +16,8 @@ not exist yet, and what this file is probing is which shape the real one has to
 have. The two properties it was written to keep are that a slot is taken before
 the graph is asked what is ready — a node still waiting on its blockers must
 never occupy one — and that reading `ready()` and claiming what it names is a
-single synchronous step, so two passes cannot pick up the same node.
+single synchronous step, so two passes cannot pick up the same node. The second
+one is `Dag.claim_next`'s to keep, not the scheduler's.
 """
 
 import asyncio
@@ -64,19 +65,6 @@ def build_graph() -> Dag:
 type Work = Callable[[NodeId], Awaitable[None]]
 
 
-def claim_next(dag: Dag) -> NodeId | None:
-    """Take the first ready node, or `None`. Synchronous on purpose.
-
-    Reading `ready()` and claiming out of it must not be separated by an await,
-    or two schedulers reach the same node between the two steps.
-    """
-    ready = dag.ready()
-    if not ready:
-        return None
-    dag.claim(ready[0])
-    return ready[0]
-
-
 async def run_graph(dag: Dag, cap: int, work: Work) -> None:
     """Run every node, at most `cap` at once, until the graph is complete."""
     slots = asyncio.Semaphore(cap)
@@ -104,7 +92,11 @@ async def run_graph(dag: Dag, cap: int, work: Work) -> None:
             # looking at the graph, so the last node can finish underneath it.
             slots.release()
             break
-        node = claim_next(dag)
+        # `claim_next` rather than `ready()` and `claim()`: reading the ready
+        # set and claiming out of it must not be separated by an await, or two
+        # passes reach the same node between the two steps. The graph is what
+        # guarantees that, which is why the method exists.
+        node = dag.claim_next()
         if node is not None:
             task = asyncio.create_task(run_one(node))
             tasks.add(task)
@@ -394,7 +386,7 @@ async def test_a_cap_of_one_is_serial_and_topologically_ordered() -> None:
 async def test_two_scheduler_passes_never_start_the_same_node_twice() -> None:
     # Claiming has to be atomic with respect to reading `ready()`: a pass that
     # read the ready set, awaited, and only then claimed would hand the same
-    # node to both.
+    # node to both. `Dag.claim_next` is the graph making that impossible.
     dag = Dag()
     for node in ROOTS:
         dag.add_node(node)
@@ -403,7 +395,7 @@ async def test_two_scheduler_passes_never_start_the_same_node_twice() -> None:
     by_pass: dict[str, list[NodeId]] = {"a": [], "b": []}
 
     async def scheduler_pass(name: str) -> None:
-        while (node := claim_next(dag)) is not None:
+        while (node := dag.claim_next()) is not None:
             by_pass[name].append(node)
             observer.enter(node)
             await resume.wait()
