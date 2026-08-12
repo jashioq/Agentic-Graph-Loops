@@ -27,7 +27,15 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 # The vcs tests drive real git, and a git process costs more than the test
 # around it. Serially that is half a minute; spread over cores it is seconds.
-# `-n0` turns it off when a failure is easier to read one worker at a time.
+#
+# This does make xdist a hard requirement: `-n` is an unrecognised argument
+# without the plugin, so `-p no:xdist` fails rather than falling back. Making it
+# degrade needs a real pytest plugin — `pytest_load_initial_conftests` is the
+# hook that could do it, and a conftest cannot implement it, because the rootdir
+# conftest is loaded *by* that hook and so registers too late. A plugin module
+# is not worth it for a dev-group dependency we always install. Run `-n0`
+# instead: it turns parallel off when a failure is easier to read one worker at
+# a time, and it is documented in CLAUDE.md next to `uv run pytest`.
 addopts = "-n auto"
 
 [tool.ruff]
@@ -50,7 +58,6 @@ modules = [
   "agl.core.terminal",
   "agl.core.agent",
   "agl.core.store",
-  "agl.core.proc",
   "agl.core.vcs",
   "agl.core.dag",
   "agl.core.paths",
@@ -69,6 +76,5 @@ forbidden_modules = [
   "agl.core.terminal.impl",
   "agl.core.agent.impl",
   "agl.core.store.impl",
-  "agl.core.proc.impl",
   "agl.core.vcs.impl",
 ]

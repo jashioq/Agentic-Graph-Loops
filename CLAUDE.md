@@ -43,7 +43,11 @@ implementation. Run the checks before claiming anything works.
 
 ## Commands
 
-    uv run pytest
+    uv run pytest              # parallel by default (-n auto)
+    uv run pytest -n0          # serial, for reading a failure one worker at a time
     uv run mypy
     uv run ruff check --fix
     uv run lint-imports
+
+`-n auto` is in `addopts`, so pytest-xdist has to be installed. `-p no:xdist`
+does not work; pass `-n0`.

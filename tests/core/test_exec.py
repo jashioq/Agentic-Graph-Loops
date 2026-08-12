@@ -1,10 +1,24 @@
-"""The subprocess helper, against real trivial commands — no git yet."""
+"""The subprocess helper, against real trivial commands — no git yet.
 
+Anything needing more than a bare coreutil goes through `sys.executable`, not
+through `sh`. `/bin/sh` is bash on macOS and dash on Debian, and the two differ
+on `printf` escapes among other things; the interpreter running the tests is the
+one portable program we are guaranteed to have.
+"""
+
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
 from agl.core._exec import ExecError, ExecResult, run
+
+
+def python(source: str) -> list[str]:
+    """An argv running `source` under the interpreter running the tests."""
+    return [sys.executable, "-c", source]
+
 
 # -- results --------------------------------------------------------------
 
@@ -19,7 +33,7 @@ def test_stdout_is_captured(tmp_path: Path) -> None:
 
 
 def test_stderr_is_captured(tmp_path: Path) -> None:
-    result = run(["sh", "-c", "echo oops >&2"], cwd=tmp_path)
+    result = run(python("import sys; print('oops', file=sys.stderr)"), cwd=tmp_path)
     assert result.stderr == "oops\n"
     assert result.stdout == ""
 
@@ -43,22 +57,25 @@ def test_a_failing_command_raises_by_default(tmp_path: Path) -> None:
         run(["false"], cwd=tmp_path)
 
 
+FAIL_WITH_OOPS = "import sys; print('oops', file=sys.stderr); sys.exit(3)"
+
+
 def test_the_error_carries_the_result(tmp_path: Path) -> None:
     with pytest.raises(ExecError) as caught:
-        run(["sh", "-c", "echo oops >&2; exit 3"], cwd=tmp_path)
+        run(python(FAIL_WITH_OOPS), cwd=tmp_path)
     result = caught.value.result
     assert isinstance(result, ExecResult)
     assert result.code == 3
     assert result.stderr == "oops\n"
-    assert result.argv == ("sh", "-c", "echo oops >&2; exit 3")
+    assert result.argv == (sys.executable, "-c", FAIL_WITH_OOPS)
 
 
 def test_the_error_message_names_the_command_and_the_stderr(tmp_path: Path) -> None:
     with pytest.raises(ExecError) as caught:
-        run(["sh", "-c", "echo oops >&2; exit 3"], cwd=tmp_path)
+        run(python(FAIL_WITH_OOPS), cwd=tmp_path)
     message = str(caught.value)
     assert "oops" in message
-    assert "sh" in message
+    assert sys.executable in message
 
 
 def test_check_false_returns_the_failure_instead_of_raising(tmp_path: Path) -> None:
@@ -67,7 +84,11 @@ def test_check_false_returns_the_failure_instead_of_raising(tmp_path: Path) -> N
 
 
 def test_check_false_still_returns_output(tmp_path: Path) -> None:
-    result = run(["sh", "-c", "echo out; echo err >&2; exit 7"], cwd=tmp_path, check=False)
+    result = run(
+        python("import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)"),
+        cwd=tmp_path,
+        check=False,
+    )
     assert (result.code, result.stdout, result.stderr) == (7, "out\n", "err\n")
 
 
@@ -98,6 +119,65 @@ def test_an_argument_with_a_space_stays_one_argument(tmp_path: Path) -> None:
     assert run(["echo", "two words"], cwd=tmp_path).stdout == "two words\n"
 
 
+# -- timeouts -------------------------------------------------------------
+
+
+def _sleep(seconds: float) -> list[str]:
+    return python(f"import time; time.sleep({seconds})")
+
+
+def test_a_fast_command_under_a_generous_timeout_is_unaffected(tmp_path: Path) -> None:
+    result = run(["true"], cwd=tmp_path, timeout=30)
+    assert (result.code, result.timed_out) == (0, False)
+
+
+def test_no_timeout_means_no_timeout(tmp_path: Path) -> None:
+    result = run(["echo", "hello"], cwd=tmp_path, timeout=None)
+    assert (result.stdout, result.timed_out) == ("hello\n", False)
+
+
+def test_a_hanging_command_comes_back_as_a_timed_out_result(tmp_path: Path) -> None:
+    result = run(_sleep(30), cwd=tmp_path, check=False, timeout=0.2)
+    assert result.timed_out is True
+    assert result.code != 0
+
+
+def test_a_timeout_under_check_raises(tmp_path: Path) -> None:
+    with pytest.raises(ExecError) as caught:
+        run(_sleep(30), cwd=tmp_path, timeout=0.2)
+    assert caught.value.result.timed_out is True
+
+
+def test_the_timeout_error_message_says_it_timed_out_and_after_how_long(tmp_path: Path) -> None:
+    with pytest.raises(ExecError) as caught:
+        run(_sleep(30), cwd=tmp_path, timeout=0.25)
+    message = str(caught.value)
+    assert "timed out" in message
+    assert "0.25" in message
+
+
+def test_a_plain_failure_is_not_reported_as_a_timeout(tmp_path: Path) -> None:
+    result = run(["false"], cwd=tmp_path, check=False, timeout=30)
+    assert result.timed_out is False
+
+
+def test_partial_output_survives_a_timeout(tmp_path: Path) -> None:
+    result = run(
+        python("import sys, time; print('partial'); sys.stdout.flush(); time.sleep(30)"),
+        cwd=tmp_path,
+        check=False,
+        timeout=1.0,
+    )
+    assert result.timed_out is True
+    assert "partial" in result.stdout
+
+
+def test_the_timeout_bounds_the_wall_clock(tmp_path: Path) -> None:
+    started = time.monotonic()
+    run(_sleep(30), cwd=tmp_path, check=False, timeout=0.2)
+    assert time.monotonic() - started < 5
+
+
 # -- decoding -------------------------------------------------------------
 
 
@@ -106,5 +186,8 @@ def test_utf8_output_is_decoded(tmp_path: Path) -> None:
 
 
 def test_invalid_utf8_is_replaced_rather_than_raising(tmp_path: Path) -> None:
-    result = run(["sh", "-c", r"printf '\xff\xfe'"], cwd=tmp_path)
+    result = run(
+        python("import sys; sys.stdout.buffer.write(b'\\xff\\xfe')"),
+        cwd=tmp_path,
+    )
     assert result.stdout == "��"
