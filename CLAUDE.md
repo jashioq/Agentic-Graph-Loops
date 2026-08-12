@@ -8,8 +8,11 @@ workflows compose them. The first workflow is a ticket orchestrator.
 
 1. **No core module imports another core module.** Enforced by import-linter.
    Cross-module wiring happens in workflows, never in core.
-2. **Core modules take callbacks, not dependencies.** A core module that needs to
-   report something exposes `on_event`; the workflow routes it to `events`.
+2. **Core modules report by returning values, not by emitting.** The caller invoked
+   the method and already knows what happened, so there is no `on_event` parameter
+   anywhere. The one exception is `agent`: its calls run for minutes, so it takes an
+   `on_activity` callback for the dashboard footer. Do not add reporting callbacks to
+   any other module.
 3. **Layers:** `cli` → `workflows` → `core`. Never upward.
 4. **Every core module with a stand-in is a package:** `api.py` holds the ABC and
    its data types; `impl/` holds the implementation. `__init__.py` re-exports the

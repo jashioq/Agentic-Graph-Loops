@@ -12,7 +12,11 @@ touches anything, so a raising mutation leaves the graph exactly as it was.
 
 from collections.abc import Callable, Iterable
 from enum import Enum
-from typing import Any, cast
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Only exists for type checkers, so the annotation below stays a string.
+    from _typeshed import SupportsRichComparison
 
 __all__ = [
     "CycleError",
@@ -56,11 +60,14 @@ class NodeState(Enum):
 class Dag:
     """Work items and their dependencies, plus what a scheduler may start now."""
 
-    def __init__(self, priority: Callable[[NodeId], object] | None = None) -> None:
+    def __init__(
+        self, priority: "Callable[[NodeId], SupportsRichComparison] | None" = None
+    ) -> None:
         """Build an empty graph.
 
         `priority` is a sort key applied to `ready()` results; `None` keeps
-        insertion order. Ties keep insertion order either way.
+        insertion order. Ties keep insertion order either way. The key must
+        return something sortable, and a checker says so at the call site.
         """
         self._priority = priority
         self._states: dict[NodeId, NodeState] = {}
@@ -181,7 +188,7 @@ class Dag:
         ]
         if self._priority is None:
             return tuple(pending)
-        return tuple(sorted(pending, key=cast(Callable[[NodeId], Any], self._priority)))
+        return tuple(sorted(pending, key=self._priority))
 
     def levels(self) -> tuple[tuple[NodeId, ...], ...]:
         """Nodes grouped by depth, where depth is the longest path from any root.
@@ -202,6 +209,17 @@ class Dag:
     def is_complete(self) -> bool:
         """True when every node is `DONE`. An empty graph is complete."""
         return all(state is NodeState.DONE for state in self._states.values())
+
+    def is_stalled(self) -> bool:
+        """Not complete, nothing claimed, and nothing ready — the graph cannot advance.
+
+        A workflow that sees this has a bug; the graph only reports the condition.
+        It separates a scheduler waiting on work in flight from one that will
+        wait forever, so a bad graph says so instead of hanging silently.
+        """
+        if self.is_complete() or self.ready():
+            return False
+        return not any(state is NodeState.CLAIMED for state in self._states.values())
 
     # -- internals --------------------------------------------------------
 

@@ -1,5 +1,8 @@
 """The sort key applied to `ready()`, and the insertion-order fallback."""
 
+import subprocess
+import sys
+
 from agl.core.dag import Dag, NodeId
 
 
@@ -88,3 +91,18 @@ def test_a_reordering_priority_survives_completion() -> None:
     dag.complete("bug")
 
     assert dag.ready() == ("feat",)
+
+
+def test_the_module_imports_and_takes_a_priority_at_runtime() -> None:
+    # The priority annotation names `_typeshed`, which exists for type checkers
+    # and not at runtime. In a fresh interpreter, so an earlier import cannot
+    # mask a failure here.
+    source = (
+        "from agl.core.dag import Dag; "
+        "d = Dag(priority=lambda node_id: node_id); "
+        "d.add_node('B'); d.add_node('A'); print(d.ready())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "('A', 'B')"

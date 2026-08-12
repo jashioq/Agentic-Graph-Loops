@@ -190,6 +190,79 @@ def test_removing_a_blocker_frees_its_dependent_rather_than_stalling() -> None:
     assert dag.ready() == ("A",)
 
 
+def test_an_empty_graph_is_not_stalled() -> None:
+    # Complete, and completion is the opposite of stuck.
+    assert Dag().is_stalled() is False
+
+
+def test_a_finished_graph_is_not_stalled() -> None:
+    dag = chain("A", "B")
+    finish(dag, "A")
+    finish(dag, "B")
+    assert dag.is_stalled() is False
+
+
+def test_a_graph_with_something_ready_is_not_stalled() -> None:
+    dag = chain("A", "B")
+    dag.add_edge("A", "B")
+    assert dag.ready() == ("B",)
+    assert dag.is_stalled() is False
+
+
+def test_work_in_flight_is_not_a_stall() -> None:
+    # Nothing is ready and the graph is not complete, but a worker is running:
+    # the scheduler is waiting, not deadlocked.
+    dag = chain("A", "B")
+    dag.add_edge("A", "B")
+    dag.claim("B")
+    assert dag.ready() == ()
+    assert dag.is_complete() is False
+    assert dag.is_stalled() is False
+
+
+def test_a_released_blocker_leaves_the_graph_advancing() -> None:
+    # The shape that catches an implementation looking only at `ready()`:
+    # after the release nothing is claimed, but `B` can be picked up again.
+    dag = chain("A", "B")
+    dag.add_edge("A", "B")
+    dag.claim("B")
+    dag.release("B")
+    assert dag.ready() == ("B",)
+    assert dag.is_stalled() is False
+
+    dag.claim("B")
+    assert dag.ready() == ()
+    assert dag.is_stalled() is False
+
+
+def test_a_graph_that_cannot_advance_is_stalled() -> None:
+    # `add_edge` refuses cycles, so a stall cannot be built through the public
+    # API — which is the point of the predicate: it names the condition a
+    # corrupted or wrongly-restored graph would land the scheduler in, instead
+    # of leaving it to wait forever. Injected here, since nothing else can.
+    dag = chain("A", "B")
+    dag._blockers["A"].add("B")
+    dag._blockers["B"].add("A")
+
+    assert dag.is_complete() is False
+    assert dag.ready() == ()
+    assert dag.is_stalled() is True
+
+
+def test_claiming_the_last_ready_node_of_a_stalling_graph_hides_the_stall() -> None:
+    # A claim is always the honest answer while a worker holds a node.
+    dag = chain("A", "B", "C")
+    dag.add_edge("A", "B")
+    dag.claim("C")
+    dag._blockers["B"].add("A")
+
+    assert dag.is_stalled() is False
+
+    dag.complete("C")
+
+    assert dag.is_stalled() is True
+
+
 def test_every_node_can_be_worked_through_to_completion() -> None:
     # The invariant behind that claim: with nothing claimed, the pending subgraph
     # is acyclic, so it has a node whose blockers are all done — a ready node.
