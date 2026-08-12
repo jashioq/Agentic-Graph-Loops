@@ -3,7 +3,10 @@ name = "agl"
 version = "0.1.0"
 description = "Agentic Graph Loops"
 requires-python = ">=3.12"
-dependencies = ["rich>=13.7"]
+dependencies = [
+    "claude-agent-sdk>0.1.59",
+    "rich>=13.7",
+]
 
 [project.scripts]
 agl = "agl.cli:main"

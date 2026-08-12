@@ -1,0 +1,355 @@
+"""The adapter, driven against a stub `query_fn`. Never the real SDK.
+
+Nothing here spawns the Claude Code CLI or reaches the network: `query_fn` is
+the one injection seam the module has, and every test uses it.
+"""
+
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    PermissionResultAllow,
+    PermissionResultDeny,
+    ResultMessage,
+    TextBlock,
+    ToolPermissionContext,
+    ToolUseBlock,
+)
+
+from agl.core.agent import (
+    AgentBudgetError,
+    AgentError,
+    AgentQuestion,
+    AgentSpec,
+    Tool,
+)
+from agl.core.agent.impl.claude_runner import ClaudeRunner
+
+SPEC = AgentSpec(prompt="do the thing", cwd=Path("/repo"), role="implement")
+
+
+def messages(text: str = "done", **overrides: Any) -> list[Any]:
+    fields: dict[str, Any] = {
+        "subtype": "success",
+        "duration_ms": 10,
+        "duration_api_ms": 8,
+        "is_error": False,
+        "num_turns": 1,
+        "session_id": "s-1",
+        "total_cost_usd": 0.1,
+        "terminal_reason": "completed",
+    }
+    fields.update(overrides)
+    return [
+        AssistantMessage(content=[TextBlock(text=text)], model="claude-sonnet-4-5"),
+        ResultMessage(**fields),
+    ]
+
+
+class StubQuery:
+    """A `query_fn` that replays scripted outcomes and records every call.
+
+    An entry that is an exception is raised instead of streamed, which is how
+    the retry ladder is exercised without a network anywhere near it.
+    """
+
+    def __init__(self, *outcomes: Any) -> None:
+        self.outcomes = list(outcomes)
+        self.options: list[ClaudeAgentOptions] = []
+        self.prompts: list[Any] = []
+
+    @property
+    def calls(self) -> int:
+        return len(self.options)
+
+    def __call__(self, *, prompt: Any, options: ClaudeAgentOptions) -> AsyncIterator[Any]:
+        self.options.append(options)
+        self.prompts.append(prompt)
+        outcome = self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
+
+        async def stream() -> AsyncIterator[Any]:
+            if isinstance(outcome, Exception):
+                raise outcome
+            for message in outcome:
+                yield message
+
+        return stream()
+
+
+async def ask(
+    options: ClaudeAgentOptions, tool: str, tool_input: dict[str, Any]
+) -> Any:
+    """Fire the permission callback the runner installed."""
+    assert options.can_use_tool is not None
+    return await options.can_use_tool(tool, tool_input, ToolPermissionContext())
+
+
+QUESTION_INPUT = {
+    "questions": [
+        {
+            "question": "Which storage?",
+            "header": "Storage",
+            "options": [
+                {"label": "sqlite", "description": "One file on disk"},
+                {"label": "postgres", "description": "A server"},
+            ],
+        }
+    ]
+}
+
+
+# -- the happy path --------------------------------------------------------
+
+
+async def test_a_successful_call_returns_the_folded_result() -> None:
+    query = StubQuery(messages("all done"))
+
+    result = await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert result.text == "all done"
+    assert result.cost_usd == 0.1
+    assert result.session_id == "s-1"
+    assert query.calls == 1
+
+
+async def test_activity_reaches_the_caller() -> None:
+    stream = messages()
+    stream.insert(
+        0,
+        AssistantMessage(
+            content=[ToolUseBlock(id="t", name="Read", input={"file_path": "a.py"})],
+            model="claude-sonnet-4-5",
+        ),
+    )
+    seen: list[str] = []
+
+    await ClaudeRunner(query_fn=StubQuery(stream)).run(SPEC, on_activity=seen.append)
+
+    assert seen == ["Read a.py"]
+
+
+async def test_the_prompt_is_streamed_because_the_permission_callback_needs_it() -> None:
+    # `can_use_tool` is rejected outright with a string prompt, so every call is
+    # made in streaming mode whether or not it will end up asking anything.
+    query = StubQuery(messages())
+
+    await ClaudeRunner(query_fn=query).run(SPEC)
+
+    (prompt,) = query.prompts
+    sent = [message async for message in prompt]
+    assert sent == [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "do the thing"},
+            "parent_tool_use_id": None,
+            "session_id": "default",
+        }
+    ]
+
+
+# -- options ---------------------------------------------------------------
+
+
+async def test_a_spec_with_tools_produces_options_carrying_the_server() -> None:
+    async def handler(arguments: dict[str, Any]) -> str:
+        return str(arguments["a"] + arguments["b"])
+
+    spec = AgentSpec(
+        prompt="add them",
+        cwd=Path("/repo"),
+        role="implement",
+        tools=(Tool(name="add", description="Add", schema={}, handler=handler),),
+    )
+    query = StubQuery(messages())
+
+    await ClaudeRunner(query_fn=query).run(spec)
+
+    (options,) = query.options
+    assert set(options.mcp_servers) == {"agl"}
+    assert options.allowed_tools == ["mcp__agl__add"]
+
+
+async def test_a_spec_with_no_tools_still_gets_a_server() -> None:
+    # An in-process MCP server is what keeps the SDK's input stream open past
+    # the prompt. Without one the CLI can close stdin before the permission
+    # callback fires, and a question would hang instead of being asked.
+    query = StubQuery(messages())
+
+    await ClaudeRunner(query_fn=query).run(SPEC)
+
+    (options,) = query.options
+    assert set(options.mcp_servers) == {"agl"}
+    assert options.allowed_tools == []
+
+
+async def test_the_settings_path_reaches_the_options() -> None:
+    query = StubQuery(messages())
+
+    await ClaudeRunner(settings_path=Path("/etc/agl.json"), query_fn=query).run(SPEC)
+
+    assert query.options[0].settings == "/etc/agl.json"
+
+
+# -- questions -------------------------------------------------------------
+
+
+async def test_on_question_is_awaited_and_its_answer_reaches_the_decision() -> None:
+    asked: list[AgentQuestion] = []
+
+    async def answer(question: AgentQuestion) -> str:
+        asked.append(question)
+        return "postgres"
+
+    query = StubQuery(messages())
+    await ClaudeRunner(query_fn=query).run(SPEC, on_question=answer)
+
+    decision = await ask(query.options[0], "AskUserQuestion", QUESTION_INPUT)
+
+    assert isinstance(decision, PermissionResultAllow)
+    assert decision.updated_input is not None
+    assert decision.updated_input["answers"] == {"Which storage?": "postgres"}
+    assert [question.title for question in asked] == ["Which storage?"]
+    assert [option.label for option in asked[0].options] == ["sqlite", "postgres"]
+
+
+async def test_every_question_in_one_call_is_asked() -> None:
+    async def answer(question: AgentQuestion) -> str:
+        return f"answer to {question.title}"
+
+    tool_input = {
+        "questions": [
+            {"question": "First?", "options": [{"label": "a", "description": "A"}]},
+            {"question": "Second?", "options": [{"label": "b", "description": "B"}]},
+        ]
+    }
+    query = StubQuery(messages())
+    await ClaudeRunner(query_fn=query).run(SPEC, on_question=answer)
+
+    decision = await ask(query.options[0], "AskUserQuestion", tool_input)
+
+    assert isinstance(decision, PermissionResultAllow)
+    assert decision.updated_input is not None
+    assert decision.updated_input["answers"] == {
+        "First?": "answer to First?",
+        "Second?": "answer to Second?",
+    }
+
+
+async def test_the_questions_survive_into_the_updated_input() -> None:
+    async def answer(question: AgentQuestion) -> str:
+        return "sqlite"
+
+    query = StubQuery(messages())
+    await ClaudeRunner(query_fn=query).run(SPEC, on_question=answer)
+
+    decision = await ask(query.options[0], "AskUserQuestion", QUESTION_INPUT)
+
+    assert isinstance(decision, PermissionResultAllow)
+    assert decision.updated_input is not None
+    assert decision.updated_input["questions"] == QUESTION_INPUT["questions"]
+
+
+async def test_no_handler_denies_rather_than_hanging() -> None:
+    query = StubQuery(messages())
+    await ClaudeRunner(query_fn=query).run(SPEC, on_question=None)
+
+    decision = await ask(query.options[0], "AskUserQuestion", QUESTION_INPUT)
+
+    assert isinstance(decision, PermissionResultDeny)
+    assert "judgement" in decision.message
+    assert decision.interrupt is False
+
+
+async def test_every_other_tool_is_allowed_unchanged() -> None:
+    query = StubQuery(messages())
+    await ClaudeRunner(query_fn=query).run(SPEC)
+
+    decision = await ask(query.options[0], "Bash", {"command": "ls"})
+
+    assert isinstance(decision, PermissionResultAllow)
+    assert decision.updated_input is None
+
+
+# -- retry -----------------------------------------------------------------
+
+
+async def test_two_failures_then_a_success_returns_after_three_calls() -> None:
+    query = StubQuery(
+        RuntimeError("transport died"), RuntimeError("transport died"), messages("third")
+    )
+
+    result = await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert result.text == "third"
+    assert query.calls == 3
+
+
+async def test_a_stub_that_always_raises_exhausts_the_attempts() -> None:
+    query = StubQuery(RuntimeError("transport died"))
+
+    with pytest.raises(AgentError) as raised:
+        await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert query.calls == 3
+    assert "transport died" in str(raised.value)
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_max_attempts_is_honoured() -> None:
+    query = StubQuery(RuntimeError("nope"))
+
+    with pytest.raises(AgentError):
+        await ClaudeRunner(max_attempts=5, query_fn=query).run(SPEC)
+
+    assert query.calls == 5
+
+
+async def test_a_stream_that_never_resolves_is_retried() -> None:
+    query = StubQuery([], messages("second time lucky"))
+
+    result = await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert result.text == "second time lucky"
+    assert query.calls == 2
+
+
+# -- exhaustion is not retried ---------------------------------------------
+
+
+async def test_budget_exhaustion_raises_immediately() -> None:
+    query = StubQuery(messages(subtype="error_max_budget_usd", is_error=True))
+
+    with pytest.raises(AgentBudgetError):
+        await ClaudeRunner(query_fn=query).run(SPEC)
+
+    # Retrying spends the budget again for the same outcome.
+    assert query.calls == 1
+
+
+async def test_turn_exhaustion_raises_immediately() -> None:
+    query = StubQuery(messages(subtype="error_max_turns", is_error=True))
+
+    with pytest.raises(AgentBudgetError):
+        await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert query.calls == 1
+
+
+async def test_the_budget_error_says_which_limit_was_hit() -> None:
+    query = StubQuery(messages(subtype="error_max_budget_usd", is_error=True))
+
+    with pytest.raises(AgentBudgetError, match="error_max_budget_usd"):
+        await ClaudeRunner(query_fn=query).run(SPEC)
+
+
+async def test_an_ordinary_error_result_is_returned_not_raised() -> None:
+    query = StubQuery(messages(subtype="error_during_execution", is_error=True))
+
+    result = await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert result.is_error is True
+    assert query.calls == 1
