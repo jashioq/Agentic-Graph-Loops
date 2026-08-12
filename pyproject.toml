@@ -38,7 +38,6 @@ type = "independence"
 modules = [
   "agl.core.terminal",
   "agl.core.agent",
-  "agl.core.events",
   "agl.core.store",
   "agl.core.proc",
   "agl.core.vcs",
@@ -58,7 +57,6 @@ source_modules = ["agl.workflows"]
 forbidden_modules = [
   "agl.core.terminal.impl",
   "agl.core.agent.impl",
-  "agl.core.events.impl",
   "agl.core.store.impl",
   "agl.core.proc.impl",
   "agl.core.vcs.impl",

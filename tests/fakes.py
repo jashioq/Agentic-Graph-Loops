@@ -11,10 +11,11 @@ from contextlib import asynccontextmanager
 
 from rich.console import Console
 
+from agl.core.store import MissingKeyError, Store
 from agl.core.terminal import Answer, LiveSession, Question, Screen, Terminal
 from agl.core.terminal.impl.render import to_renderable
 
-__all__ = ["HeadlessTerminal"]
+__all__ = ["HeadlessTerminal", "MemoryStore"]
 
 
 class HeadlessTerminal(Terminal):
@@ -80,3 +81,33 @@ class _HeadlessSession(LiveSession):
         """Record the frame the question interrupted, then answer from the script."""
         self.frame()
         return self._terminal.answer(question)
+
+
+class MemoryStore(Store):
+    """Documents in a dict, so the base class's JSON layer can be exercised alone.
+
+    Keys are taken as given — validation is a `FileStore` concern, and there is
+    no root here for a key to escape from.
+    """
+
+    def __init__(self) -> None:
+        self.documents: dict[str, str] = {}
+
+    def read(self, key: str) -> str:
+        if key not in self.documents:
+            raise MissingKeyError(key)
+        return self.documents[key]
+
+    def write(self, key: str, content: str) -> None:
+        self.documents[key] = content
+
+    def delete(self, key: str) -> None:
+        if key not in self.documents:
+            raise MissingKeyError(key)
+        del self.documents[key]
+
+    def exists(self, key: str) -> bool:
+        return key in self.documents
+
+    def list(self, prefix: str = "") -> tuple[str, ...]:
+        return tuple(sorted(key for key in self.documents if key.startswith(prefix)))
