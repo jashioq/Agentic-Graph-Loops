@@ -19,11 +19,14 @@ budget or turns fails the same way next time and spends the budget again, so
 three attempts would cost three times as much for the same outcome.
 """
 
+import re
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
+    CanUseToolShadowedWarning,
     ClaudeAgentOptions,
     PermissionResult,
     PermissionResultAllow,
@@ -41,13 +44,15 @@ from agl.core.agent.api import (
     AgentRunner,
     AgentSpec,
 )
-from agl.core.agent.impl.options import build_options
+from agl.core.agent.impl.options import QUESTION_TOOL, build_options
 from agl.core.agent.impl.stream import fold
-from agl.core.agent.impl.tools import build_keepalive_server, build_tool_server
+from agl.core.agent.impl.tools import (
+    SERVER_NAME,
+    build_keepalive_server,
+    build_tool_server,
+)
 
 __all__ = ["ClaudeRunner"]
-
-QUESTION_TOOL = "AskUserQuestion"
 
 NO_ANSWERS = (
     "Nobody is available to answer questions on this run. Proceed with your "
@@ -58,6 +63,28 @@ NO_ANSWERS = (
 # wrong. `max_turns` is the SDK's own wording; the `error_max_` pair is what a
 # result message reports as its subtype.
 EXHAUSTED = frozenset({"max_turns", "error_max_turns", "error_max_budget_usd"})
+
+# The SDK warns when an `allowed_tools` entry auto-approves a tool ahead of
+# `can_use_tool`, because the callback then never sees it. For our own MCP tools
+# that is deliberate: they are in `allowed_tools` because a registered tool the
+# model may not call is a silent dead end, and sending them through a callback
+# that always says yes would be a round trip for nothing.
+#
+# The warning still has to go, because it goes to stderr, and once `rich.Live`
+# owns the terminal anything written to stderr takes the display apart — a
+# dashboard that comes apart the first time an agent uses a tool is not
+# acceptable.
+#
+# So it is matched by message rather than by category, and the pattern only
+# matches when *every* tool the SDK named is one of ours. Shadowing we did not
+# choose stays visible: a spec that allows `Read` outright has really disabled
+# the callback for `Read`, and `bypassPermissions` — which produces a different
+# message and stops questions working altogether — is louder still.
+OUR_TOOLS_ONLY = (
+    r"can_use_tool will not be invoked for: "
+    rf"mcp__{re.escape(SERVER_NAME)}__[^\s,]+"
+    rf"(, mcp__{re.escape(SERVER_NAME)}__[^\s,]+)*\."
+)
 
 
 class ClaudeRunner(AgentRunner):
@@ -73,7 +100,13 @@ class ClaudeRunner(AgentRunner):
 
         It exists so the retry ladder can be driven against a stub, and it is
         the only injection seam in this module.
+
+        Raises `ValueError` for fewer than one attempt: the ladder would never
+        run, and a run that was never attempted has no failure to report.
         """
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
+
         self._settings_path = settings_path
         self._max_attempts = max_attempts
         self._query = query_fn if query_fn is not None else query
@@ -124,7 +157,12 @@ class ClaudeRunner(AgentRunner):
         spec: AgentSpec,
         on_question: Callable[[AgentQuestion], Awaitable[str]] | None,
     ) -> ClaudeAgentOptions:
-        """The SDK options for this call, with the question callback installed."""
+        """The SDK options for this call, with the question callback installed.
+
+        Installing the callback is what makes our own tool names shadow it, so
+        this is also where that shadowing is declared intentional.
+        """
+        _silence_shadowing_by_our_own_tools()
         servers, tool_names = build_tool_server(spec.tools)
         options = build_options(
             spec,
@@ -134,6 +172,32 @@ class ClaudeRunner(AgentRunner):
         )
         options.can_use_tool = _permission_handler(on_question)
         return options
+
+
+def _silence_shadowing_by_our_own_tools() -> None:
+    """Put `OUR_TOOLS_ONLY` in the warning filters, unless it is already there.
+
+    A filter rather than a `catch_warnings` block around the call: that context
+    manager swaps a process-global list, and agent runs overlap. Two of them
+    nesting it would leave each other unprotected on the way in and leak a
+    filter on the way out, which is a worse bargain than one entry that stays.
+
+    The list is re-checked each time instead of a flag being set once, because
+    `catch_warnings` anywhere — pytest opens one per test — restores the filters
+    it saved and takes ours with it.
+    """
+    if any(
+        action == "ignore"
+        and category is CanUseToolShadowedWarning
+        and message is not None
+        and message.pattern == OUR_TOOLS_ONLY
+        for action, message, category, _module, _lineno in warnings.filters
+    ):
+        return
+
+    warnings.filterwarnings(
+        "ignore", message=OUR_TOOLS_ONLY, category=CanUseToolShadowedWarning
+    )
 
 
 def _streamed(prompt: str) -> AsyncIterator[dict[str, Any]]:
@@ -172,6 +236,14 @@ def _permission_handler(
         answers: dict[str, str] = {}
         for entry in tool_input.get("questions", []):
             question = _question(entry)
+            # Four questions can arrive in one call and nothing stops two of
+            # them sharing their text. The map the tool reads is keyed by that
+            # text, so a second answer has nowhere to go but on top of the
+            # first. Asking once and letting both take the answer loses nothing
+            # a second round trip would have kept, and does not put the same
+            # string in front of a person twice.
+            if question.title in answers:
+                continue
             answers[question.title] = await on_question(question)
 
         return PermissionResultAllow(updated_input={**tool_input, "answers": answers})

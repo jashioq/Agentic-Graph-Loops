@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "Agentic Graph Loops"
 requires-python = ">=3.12"
 dependencies = [
-    "claude-agent-sdk>0.1.59",
+    # The floor is not arbitrary: up to and including 0.1.59, `setting_sources=[]`
+    # was treated the same as omitting the option, so the hermetic configuration
+    # `core/agent/impl/options.py` exists to guarantee would have been silently
+    # defeated — user, project and local settings loaded anyway. The ceiling is
+    # there because `>0.1.59` resolved across a major boundary to 0.2.x on its
+    # own; it happened to work, and nothing about that was deliberate.
+    "claude-agent-sdk>=0.2,<0.3",
     "rich>=13.7",
 ]
 

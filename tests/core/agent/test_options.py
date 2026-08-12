@@ -165,3 +165,53 @@ def test_an_unknown_permission_mode_is_refused_here() -> None:
     spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", permission_mode="yolo")
     with pytest.raises(ValueError, match="yolo"):
         build(spec)
+
+
+# -- allowing the question tool outright is refused ------------------------
+
+
+def allowing(*entries: str) -> AgentSpec:
+    return AgentSpec(prompt="p", cwd=Path("/repo"), role="r", allowed_tools=entries)
+
+
+@pytest.mark.parametrize(
+    "entry", ["AskUserQuestion", "AskUserQuestion()", "AskUserQuestion(*)"]
+)
+def test_allowing_the_question_tool_as_a_whole_is_refused(entry: str) -> None:
+    # An allow rule is matched before the permission callback is consulted, and
+    # the callback is the only thing that injects the answers. Allowing the tool
+    # gets it approved with nothing in it, silently.
+    with pytest.raises(ValueError, match="AskUserQuestion"):
+        build(allowing(entry))
+
+
+def test_the_refusal_says_what_allowing_it_would_cost() -> None:
+    with pytest.raises(ValueError) as raised:
+        build(allowing("AskUserQuestion"))
+
+    message = str(raised.value)
+    assert "AskUserQuestion" in message
+    # Why, not just what: the callback never fires, and the answers ride on it.
+    assert "callback" in message
+    assert "answers" in message
+
+
+def test_it_is_found_wherever_it_sits_in_the_list() -> None:
+    with pytest.raises(ValueError, match="AskUserQuestion"):
+        build(allowing("Read", "Edit", "AskUserQuestion"))
+
+
+def test_allowing_any_other_tool_as_a_whole_is_left_alone() -> None:
+    # This is only about the one tool whose answers ride on the callback.
+    assert build(allowing("Read")).allowed_tools == ["Read"]
+
+
+def test_a_narrowed_entry_is_not_a_whole_tool_allow() -> None:
+    # A specifier leaves non-matching calls falling through to the callback, so
+    # it does not disable asking.
+    entry = "Bash(AskUserQuestion:*)"
+    assert build(allowing(entry)).allowed_tools == [entry]
+
+
+def test_a_spec_that_allows_nothing_is_fine() -> None:
+    assert build(MINIMAL).allowed_tools == []

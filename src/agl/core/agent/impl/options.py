@@ -28,9 +28,11 @@ from claude_agent_sdk.types import SystemPromptPreset
 
 from agl.core.agent.api import AgentSpec
 
-__all__ = ["build_options"]
+__all__ = ["QUESTION_TOOL", "build_options"]
 
 PERMISSION_MODES: frozenset[str] = frozenset(get_args(PermissionMode))
+
+QUESTION_TOOL = "AskUserQuestion"
 
 
 def build_options(
@@ -48,13 +50,16 @@ def build_options(
 
     Raises `ValueError` when the spec's permission mode is not one the SDK
     knows. The spec types it as `str` to keep the API free of SDK types, so
-    this is where the check the `Literal` would have given us happens.
+    this is where the check the `Literal` would have given us happens. It also
+    raises when the spec allows the question tool outright, for the reason
+    below.
     """
     if spec.permission_mode not in PERMISSION_MODES:
         raise ValueError(
             f"unknown permission mode {spec.permission_mode!r}: "
             f"expected one of {', '.join(sorted(PERMISSION_MODES))}"
         )
+    _refuse_allowing_the_question_tool(spec.allowed_tools)
 
     system_prompt: SystemPromptPreset = {"type": "preset", "preset": "claude_code"}
     if spec.system_prompt_append is not None:
@@ -83,3 +88,53 @@ def build_options(
         strict_mcp_config=True,
         settings=str(settings_path) if settings_path is not None else None,
     )
+
+
+def _refuse_allowing_the_question_tool(allowed_tools: Sequence[str]) -> None:
+    """Raise if any entry allows `AskUserQuestion` as a whole tool.
+
+    The SDK resolves a tool call in three stages and stops at the first answer:
+    a deny rule, then an allow rule, then `can_use_tool`. For every other tool
+    an allow rule merely skips a check that would have said yes. For this one
+    the callback *is* the mechanism — the user's answers are injected by it, as
+    `updated_input`, and take no other path — so allowing the tool outright
+    approves a call that nobody was asked and that carries no answers. The model
+    reads an empty result and guesses, and nothing on the dashboard or in the
+    result says so.
+
+    It is refused rather than quietly dropped because it is a plausible mistake:
+    "the agent needs to ask questions, so I should allow the tool" reads as the
+    correct thing to do, and does the opposite.
+    """
+    for entry in allowed_tools:
+        if _whole_tool_allowed(entry) == QUESTION_TOOL:
+            raise ValueError(
+                f"allowed_tools entry {entry!r} allows {QUESTION_TOOL} as a whole "
+                f"tool, which stops the run from ever asking anything: an allow "
+                f"rule is matched before the permission callback is consulted, so "
+                f"the callback never fires — and the answers are injected by that "
+                f"callback. The tool would be approved with no answers in it and "
+                f"the model would proceed on a guess. Drop the entry: "
+                f"{QUESTION_TOOL} is answered through the callback and does not "
+                f"need allowing."
+            )
+
+
+def _whole_tool_allowed(entry: str) -> str | None:
+    """The tool an `allowed_tools` entry allows outright, or `None`.
+
+    Mirrors the CLI's own rule parser, which is what decides whether the entry
+    shadows the callback: an entry allows a whole tool when it carries no
+    `(...)` specifier (`"Read"`), or when the specifier is empty or a lone
+    wildcard (`"Read()"`, `"Read(*)"`). A real specifier (`"Bash(ls:*)"`) allows
+    only matching invocations and leaves the rest falling through, so it is not
+    the same thing. Malformed entries match nothing and are ignored.
+    """
+    if not entry.strip():
+        return None
+    open_index = entry.find("(")
+    if open_index == -1:
+        return entry
+    if open_index == 0 or not entry.endswith(")"):
+        return None
+    return entry[:open_index] if entry[open_index + 1 : -1] in ("", "*") else None
