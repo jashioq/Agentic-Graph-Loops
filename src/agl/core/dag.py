@@ -203,17 +203,6 @@ class Dag:
         """True when every node is `DONE`. An empty graph is complete."""
         return all(state is NodeState.DONE for state in self._states.values())
 
-    def is_stalled(self) -> bool:
-        """True when the graph is not complete, nothing is `CLAIMED`, and nothing is ready.
-
-        A graph driven only through this API never stalls: with nothing claimed,
-        the pending subgraph is acyclic and so always holds a ready node. Seeing
-        this go true means a caller has corrupted the graph — it is reported
-        rather than left to look like an idle scheduler.
-        """
-        claimed = any(state is NodeState.CLAIMED for state in self._states.values())
-        return not self.is_complete() and not claimed and not self.ready()
-
     # -- internals --------------------------------------------------------
 
     def _transition(self, node_id: NodeId, expected: NodeState, target: NodeState) -> None:

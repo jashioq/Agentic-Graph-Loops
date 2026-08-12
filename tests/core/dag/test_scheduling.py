@@ -17,7 +17,6 @@ def test_an_empty_graph_is_complete_and_has_nothing_ready() -> None:
     dag = Dag()
     assert dag.ready() == ()
     assert dag.is_complete() is True
-    assert dag.is_stalled() is False
 
 
 def test_nodes_without_edges_are_all_ready() -> None:
@@ -183,36 +182,15 @@ def test_a_graph_with_work_left_is_not_complete() -> None:
     assert dag.is_complete() is False
 
 
-def test_a_claimed_graph_is_not_stalled() -> None:
-    dag = chain("A", "B")
-    dag.add_edge("A", "B")
-    dag.claim("B")
-    assert dag.ready() == ()
-    assert dag.is_complete() is False
-    assert dag.is_stalled() is False
-
-
-def test_a_graph_with_work_ready_is_not_stalled() -> None:
-    dag = chain("A", "B")
-    assert dag.is_stalled() is False
-
-
-def test_a_completed_graph_is_not_stalled() -> None:
-    dag = chain("A")
-    finish(dag, "A")
-    assert dag.is_stalled() is False
-
-
 def test_removing_a_blocker_frees_its_dependent_rather_than_stalling() -> None:
     dag = chain("A", "B")
     dag.add_edge("A", "B")
     dag.claim("B")
     dag.remove_node("B")
     assert dag.ready() == ("A",)
-    assert dag.is_stalled() is False
 
 
-def test_a_graph_driven_only_through_its_own_api_never_stalls() -> None:
+def test_every_node_can_be_worked_through_to_completion() -> None:
     # The invariant behind that claim: with nothing claimed, the pending subgraph
     # is acyclic, so it has a node whose blockers are all done — a ready node.
     dag = chain("A", "B", "C", "D")
@@ -221,23 +199,7 @@ def test_a_graph_driven_only_through_its_own_api_never_stalls() -> None:
     dag.add_edge("B", "D")
     dag.add_edge("C", "D")
     for _ in range(len(dag.nodes())):
-        assert dag.is_stalled() is False
         node_id = dag.ready()[0]
         dag.claim(node_id)
-        assert dag.is_stalled() is False
         dag.complete(node_id)
     assert dag.is_complete() is True
-    assert dag.is_stalled() is False
-
-
-def test_a_graph_that_cannot_move_is_stalled() -> None:
-    # `add_edge` refuses cycles, so a mutual wait is not reachable through the
-    # public API — the state has to be forced. That is the point of the query:
-    # it reports a graph that has somehow lost its invariant instead of hanging.
-    dag = chain("A", "B")
-    dag._blockers["A"].add("B")
-    dag._blockers["B"].add("A")
-
-    assert dag.ready() == ()
-    assert dag.is_complete() is False
-    assert dag.is_stalled() is True
