@@ -10,6 +10,9 @@ the display is restored. A lock serialises concurrent askers into a FIFO queue.
 
 When the console cannot animate — piped output, a dumb terminal — there is no
 display to update, so frames are printed as they change instead.
+
+A `build()` that raises becomes an error frame rather than a dead repaint task:
+the display keeps moving, the failure is on screen, and the next tick retries.
 """
 
 import asyncio
@@ -21,13 +24,29 @@ from rich.console import Console
 from rich.live import Live
 from rich.text import Text as RichText
 
-from agl.core.terminal.api import Answer, LiveSession, Question, Screen, Terminal
+from agl.core.terminal.api import (
+    Answer,
+    Color,
+    LiveSession,
+    Question,
+    Row,
+    Rows,
+    Screen,
+    Terminal,
+    Text,
+)
 from agl.core.terminal.impl.render import to_renderable
 from agl.core.terminal.impl.screen import to_layout
 
 __all__ = ["RichTerminal"]
 
 _OTHER_LABEL = "Other… (type your answer)"
+
+
+def _error_screen(error: Exception) -> Screen:
+    """The frame shown in place of one `build()` failed to produce."""
+    message = Text(f"frame failed: {type(error).__name__}: {error}", Color.BOLD_RED)
+    return Screen(header=None, content=Rows(Row(message)), footer=None)
 
 
 class RichTerminal(Terminal):
@@ -62,6 +81,11 @@ class RichTerminal(Terminal):
     async def _repaint(
         self, session: "_RichLiveSession", build: Callable[[], Screen], fps: int
     ) -> None:
+        """Tick until cancelled.
+
+        `paint` handles a failing frame, so this task ends only by cancellation
+        and the `await repaint` on exit cannot mask an error from the body.
+        """
         interval = 1 / fps
         while True:
             await asyncio.sleep(interval)
@@ -89,10 +113,17 @@ class _RichLiveSession(LiveSession):
         self._last_frame = ""
 
     def paint(self, build: Callable[[], Screen]) -> None:
-        """Render one frame, unless a question currently owns the screen."""
+        """Render one frame, unless a question currently owns the screen.
+
+        A `build()` that raises is caught here, not left to kill the repaint
+        task: the failure is shown as a frame and the next tick tries again.
+        """
         if self._suspended:
             return
-        screen = build()
+        try:
+            screen = build()
+        except Exception as error:
+            screen = _error_screen(error)
         now = time.monotonic()
         if self._can_animate():
             self._display.update(to_layout(screen, now), refresh=True)
@@ -129,6 +160,9 @@ class _RichLiveSession(LiveSession):
                 return await self._read_answer(question)
             finally:
                 self._console.clear()
+                # The question took the screen with it: the next frame is new
+                # again, however much it looks like the one before the question.
+                self._last_frame = ""
                 self._display.start(refresh=False)
                 self._suspended = False
 

@@ -36,9 +36,9 @@ _STYLES: Final[dict[Color, str]] = {
 def to_renderable(component: Component, now: float) -> RenderableType:
     """Render `component` as of `now`. Pure: same inputs, same frame."""
     text = _to_text(component, now)
-    if "\n" not in text.plain:
-        text.rstrip()  # a single-line frame is itself the line
-    return text
+    if "\n" in text.plain:
+        return text
+    return _rstripped(text)  # a single-line frame is itself the line
 
 
 def line_count(component: Component, now: float) -> int:
@@ -78,7 +78,15 @@ def _row_to_text(row: Row, now: float) -> RichText:
 
 def _line_to_text(component: Component, now: float) -> RichText:
     """Render a component that ends a line, so trailing whitespace is dropped."""
-    text = _to_text(component, now)
+    return _rstripped(_to_text(component, now))
+
+
+def _rstripped(text: RichText) -> RichText:
+    """The same text, with trailing whitespace dropped.
+
+    `RichText.rstrip()` edits in place and returns `None`, so calling it bare
+    reads like a discarded result. Returning the text says what is meant.
+    """
     text.rstrip()
     return text
 
