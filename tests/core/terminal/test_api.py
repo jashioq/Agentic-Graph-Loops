@@ -34,6 +34,7 @@ def test_colors_cover_the_documented_palette() -> None:
         "BOLD_RED",
         "DIM_GREEN",
         "DIM_GREY",
+        "DIM_RED",
     }
 
 

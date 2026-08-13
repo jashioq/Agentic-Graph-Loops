@@ -189,7 +189,7 @@ def test_nothing_was_left_uncommitted(flow: Flow) -> None:
 
 def test_the_merge_was_clean(flow: Flow) -> None:
     assert flow.merged.clean is True
-    assert flow.merged.conflicts == ()
+    assert flow.merged.conflicted == ()
     assert flow.merged.sha is not None
 
 

@@ -61,6 +61,7 @@ class Color(Enum):
     BOLD_RED = "bold_red"
     DIM_GREEN = "dim_green"
     DIM_GREY = "dim_grey"
+    DIM_RED = "dim_red"
 
 
 @dataclass(frozen=True)

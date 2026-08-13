@@ -8,8 +8,6 @@ import pytest
 
 from agl.core.vcs import (
     BranchExistsError,
-    Conflict,
-    ConflictHunk,
     DirtyWorktreeError,
     FileStatus,
     MergeResult,
@@ -38,7 +36,6 @@ DIFFS = {"diff", "changed_files"}
 MERGES = {
     "merge",
     "merge_in_progress",
-    "conflicts",
     "unmerged_paths",
     "abort_merge",
     "commit_merge",
@@ -103,9 +100,7 @@ def test_file_status_carries_a_path_and_a_porcelain_code() -> None:
     assert (status.path, status.code) == ("src/a.py", "M")
 
 
-@pytest.mark.parametrize(
-    "kind", [Worktree, FileStatus, ConflictHunk, Conflict, MergeResult]
-)
+@pytest.mark.parametrize("kind", [Worktree, FileStatus, MergeResult])
 def test_the_data_types_are_frozen_dataclasses(kind: type) -> None:
     assert dataclasses.is_dataclass(kind)
     assert kind.__dataclass_params__.frozen  # type: ignore[attr-defined]
@@ -115,28 +110,14 @@ def test_worktrees_compare_by_value() -> None:
     assert Worktree(Path("/a"), "main") == Worktree(Path("/a"), "main")
 
 
-def test_a_two_way_hunk_has_no_base() -> None:
-    hunk = ConflictHunk(ours=("ours",), theirs=("theirs",), base=None)
-    assert hunk.base is None
+def test_a_clean_merge_result_has_a_sha_and_nothing_conflicted() -> None:
+    result = MergeResult(clean=True, conflicted=(), sha="abc123")
+    assert (result.clean, result.conflicted, result.sha) == (True, (), "abc123")
 
 
-def test_a_three_way_hunk_carries_the_base() -> None:
-    hunk = ConflictHunk(ours=("a",), theirs=("b",), base=("original",))
-    assert hunk.base == ("original",)
-
-
-def test_a_conflict_carries_a_path_and_its_hunks() -> None:
-    hunk = ConflictHunk(ours=(), theirs=(), base=None)
-    conflict = Conflict(path="src/a.py", hunks=(hunk,))
-    assert (conflict.path, conflict.hunks) == ("src/a.py", (hunk,))
-
-
-def test_a_clean_merge_result_has_a_sha_and_no_conflicts() -> None:
-    result = MergeResult(clean=True, conflicts=(), sha="abc123")
-    assert (result.clean, result.conflicts, result.sha) == (True, (), "abc123")
-
-
-def test_a_conflicted_merge_result_has_no_sha() -> None:
-    result = MergeResult(clean=False, conflicts=(Conflict("a.py", ()),), sha=None)
+def test_a_conflicted_merge_result_names_the_paths_and_has_no_sha() -> None:
+    # Self-describing on purpose: what failed is in the result, so a caller
+    # writing a halt banner does not have to go back and ask.
+    result = MergeResult(clean=False, conflicted=("a.py", "b.py"), sha=None)
     assert result.sha is None
-    assert result.conflicts[0].path == "a.py"
+    assert result.conflicted == ("a.py", "b.py")

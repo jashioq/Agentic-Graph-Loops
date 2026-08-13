@@ -224,6 +224,35 @@ def test_a_long_bug_title_is_cut_to_the_room_the_indent_leaves() -> None:
     assert status_column(screen, "T-01-bug-1") == status_column(screen, "T-01")
 
 
+def test_a_bug_row_is_red_so_it_does_not_read_as_a_feature_row() -> None:
+    # Indentation alone made a bug look like a feature ticket one column over.
+    state, live = run_with_bugs(1)
+    screen = render(state, live, NOW)
+    assert [text.color for text in texts(row_of(screen, "T-01-bug-1"))[:2]] == [
+        Color.RED,
+        Color.DIM_RED,
+    ]
+
+
+def test_a_feature_row_keeps_the_colours_it_had() -> None:
+    state, live = run_with_bugs(1)
+    screen = render(state, live, NOW)
+    assert [text.color for text in texts(row_of(screen, "T-01"))[:2]] == [
+        Color.WHITE,
+        Color.GREY,
+    ]
+
+
+def test_a_merged_bug_row_dims_like_any_other_merged_row() -> None:
+    state, live = run_with_bugs(1)
+    walk_to(state, live, "T-01-bug-1", Status.MERGED)
+    screen = render(state, live, NOW)
+    assert [text.color for text in texts(row_of(screen, "T-01-bug-1"))[:2]] == [
+        Color.DIM_RED,
+        Color.DIM_GREY,
+    ]
+
+
 def test_a_merged_row_is_dimmed_rather_than_dropped() -> None:
     state, live = new_run(feature("T-01"), feature("T-02"))
     walk_to(state, live, "T-01", Status.MERGED)
@@ -402,6 +431,82 @@ def test_activity_on_a_status_with_no_timer_still_renders() -> None:
     screen = render(state, live, NOW)
     assert timers(row_of(screen, "T-01")) == []
     assert activity_of(screen, "T-01") == "Waiting on an answer"
+
+
+# -- activity with a role label on it -------------------------------------
+#
+# Three reviewers write to one row's `activity` during review, so phase 4
+# prefixes each one's messages with its role — `quality · Read Auth.kt` — and
+# the label belongs to whoever writes the string, not to `render`. Nothing here
+# had to change for that; these tests are what keeps it true, and they pin how
+# much room a label has before the row stops fitting.
+
+LABELLED = "quality · Read AuthRepository.kt"
+
+
+def in_review_with(activity: str) -> tuple[RunState, Live]:
+    """`T-01` under review reporting `activity`, with `T-02` on the row below."""
+    state, live = new_run(feature("T-01"), feature("T-02"))
+    walk_to(state, live, "T-01", Status.IN_REVIEW, at=NOW - 72.0)
+    live.activity["T-01"] = activity
+    return state, live
+
+
+def drawn_row(screen: Screen, ticket_id: str, now: float = NOW) -> tuple[list[str], int]:
+    """Every line of the frame, and the index of the one `ticket_id` is drawn on."""
+    drawn = lines(screen, now)
+    index = next(i for i, line in enumerate(drawn) if line.startswith(f"{ticket_id} "))
+    return drawn, index
+
+
+def test_a_labelled_activity_is_drawn_whole_and_moves_nothing() -> None:
+    state, live = in_review_with(LABELLED)
+    screen = render(state, live, NOW)
+
+    assert activity_of(screen, "T-01") == LABELLED
+    drawn, index = drawn_row(screen, "T-01")
+    assert drawn[index].endswith(LABELLED)  # in full: no eliding, no wrapping
+    assert drawn[index + 1].startswith("T-02")  # nothing was pushed down a line
+
+
+def test_a_label_does_not_move_the_activity_column() -> None:
+    # The label is part of the string, so it starts where any activity starts:
+    # a labelled row and an unlabelled one stay aligned down the screen.
+    labelled, live = in_review_with(LABELLED)
+    walk_to(labelled, live, "T-02", Status.IN_REVIEW, at=NOW - 72.0)
+    live.activity["T-02"] = "Read AuthRepository.kt"
+    drawn = lines(render(labelled, live, NOW))
+    rows = [line for line in drawn if line.startswith(("T-01 ", "T-02 "))]
+    assert rows[0].index(LABELLED) == rows[1].index("Read AuthRepository.kt")
+
+
+def test_the_room_a_labelled_activity_has_is_what_the_screen_leaves() -> None:
+    """`render` never cuts an activity string, so the terminal width is the limit.
+
+    Titles are elided to keep the status column still; activity is the last
+    thing on the line and has nothing to hold in place, so it is passed through
+    as it was written. What that costs is stated here rather than left to be
+    discovered: one column too many and the row wraps onto a second line,
+    pushing everything below it down.
+    """
+    state, live = in_review_with("x")
+    _, index = drawn_row(render(state, live, NOW), "T-01")
+    column = len(lines(render(state, live, NOW))[index]) - 1
+    room = WIDTH - column
+    assert (column, room) == (63, 37)
+
+    fits, over = "q" * room, "q" * (room + 1)
+    state, live = in_review_with(fits)
+    drawn, index = drawn_row(render(state, live, NOW), "T-01")
+    assert drawn[index].endswith(fits) and drawn[index + 1].startswith("T-02")
+
+    state, live = in_review_with(over)
+    drawn, index = drawn_row(render(state, live, NOW), "T-01")
+    # Rich wraps at a word boundary, so one column too many does not trail off
+    # the end of the line — the whole string leaves the row it belongs to.
+    assert over not in drawn[index]
+    assert drawn[index + 1].strip() == over
+    assert drawn[index + 2].startswith("T-02")
 
 
 def test_an_empty_live_renders_every_row() -> None:

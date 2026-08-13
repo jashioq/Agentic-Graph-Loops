@@ -2,11 +2,11 @@
 
 Layer: core. `MergeOps` is not usable on its own; it is the group of operations
 `Git` inherits, split out because one file holding all of git was over the size
-this project allows. Conflict marker parsing lives in `conflicts.py`, so this
-file reads files and runs commands and never looks at a `<<<<<<<` itself.
+this project allows. It runs commands and reports what git said; it never opens
+a conflicted file, and nothing here has an opinion about what a `<<<<<<<` means.
 
-A conflicted merge is deliberately left in progress. The caller inspects the
-conflicts, resolves them in the worktree, and calls `commit_merge` — which
+A conflicted merge is deliberately left in progress. The caller looks at the
+paths it named, resolves them in the worktree, and calls `commit_merge` — which
 stages what the merge had left unmerged — or `abort_merge`. Nothing here
 silently unwinds a merge on the caller's behalf.
 
@@ -22,9 +22,8 @@ conflict halt leaves the markers where someone looking to resolve them would go.
 from pathlib import Path
 
 from agl.core._exec import ExecResult
-from agl.core.vcs.api import Conflict, MergeResult, VcsError
+from agl.core.vcs.api import MergeResult, VcsError
 from agl.core.vcs.impl._runner import GitRunner
-from agl.core.vcs.impl.conflicts import parse_conflicts
 
 __all__ = ["MergeOps"]
 
@@ -64,23 +63,18 @@ class MergeOps(GitRunner):
         argv = ["merge", "--no-edit", "--no-ff" if no_ff else "--ff", "--", source]
         result = self._run(argv, cwd, check=False)
         if result.code == 0:
-            return MergeResult(clean=True, conflicts=(), sha=self._head(cwd))
-        if self.unmerged_paths(cwd):
+            return MergeResult(clean=True, conflicted=(), sha=self._head(cwd))
+        unmerged = self.unmerged_paths(cwd)
+        if unmerged:
             # Left in progress on purpose: the caller resolves and commits, or
             # aborts. There is no third state where the merge quietly vanished.
-            return MergeResult(clean=False, conflicts=self.conflicts(cwd), sha=None)
+            return MergeResult(clean=False, conflicted=unmerged, sha=None)
         self._require_refs(source)
         raise VcsError(f"cannot merge {source} into {cwd}: {self._reason(result)}")
 
     def merge_in_progress(self, cwd: Path) -> bool:
         result = self._run(["rev-parse", "-q", "--verify", "MERGE_HEAD"], cwd, check=False)
         return result.code == 0
-
-    def conflicts(self, cwd: Path) -> tuple[Conflict, ...]:
-        return tuple(
-            Conflict(path=path, hunks=parse_conflicts(self._read(cwd / path)))
-            for path in self.unmerged_paths(cwd)
-        )
 
     def unmerged_paths(self, cwd: Path) -> tuple[str, ...]:
         result = self._run(["diff", "--name-only", "--diff-filter=U", "-z"], cwd)

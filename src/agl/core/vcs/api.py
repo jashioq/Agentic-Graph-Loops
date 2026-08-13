@@ -1,8 +1,14 @@
 """Vcs API: git, as structured data.
 
-Layer: core. Worktrees, branches, commits, diffs, merges, and the contents of a
-conflict. It takes paths and ref names and hands back dataclasses; it has never
-heard of a work item, an agent, or a run.
+Layer: core. Worktrees, branches, commits, diffs, and merges. It takes paths and
+ref names and hands back dataclasses; it has never heard of a work item, an
+agent, or a run.
+
+A conflicted merge is reported as the paths that conflicted, and nothing more.
+There is no classifier here deciding which conflicts are trivial, and the shape
+of what a classifier would need — three-way output, the base text — is
+deliberately absent rather than half-provided: a caller resolves in the worktree
+or halts for a person.
 
 The API is synchronous. Git operations are milliseconds, a sync call is far
 easier to test and reason about, and a sync call made from an async task
@@ -21,8 +27,6 @@ from pathlib import Path
 
 __all__ = [
     "BranchExistsError",
-    "Conflict",
-    "ConflictHunk",
     "DirtyWorktreeError",
     "FileStatus",
     "MergeResult",
@@ -50,33 +54,16 @@ class FileStatus:
 
 
 @dataclass(frozen=True)
-class ConflictHunk:
-    """One `<<<<<<<`-marked region: the two sides, and the base between them.
+class MergeResult:
+    """What a merge did: committed, or stopped with files to look at.
 
-    `base` is populated only under the `diff3` and `zdiff3` conflict styles,
-    which is a per-repository setting a caller does not control. Code that
-    wants the original text has to cope with it being absent.
+    Self-describing on purpose. `conflicted` is what `unmerged_paths` would say
+    at the moment the merge stopped, carried along so a caller writing a halt
+    banner does not have to go back and ask.
     """
 
-    ours: tuple[str, ...]
-    theirs: tuple[str, ...]
-    base: tuple[str, ...] | None
-
-
-@dataclass(frozen=True)
-class Conflict:
-    """Every unresolved region in one file."""
-
-    path: str
-    hunks: tuple[ConflictHunk, ...]
-
-
-@dataclass(frozen=True)
-class MergeResult:
-    """What a merge did: committed, or stopped with conflicts to look at."""
-
     clean: bool
-    conflicts: tuple[Conflict, ...]
+    conflicted: tuple[str, ...]  # paths, empty when clean
     sha: str | None
 
 
@@ -237,7 +224,7 @@ class Vcs(ABC):
         """Merge `source` into whatever `cwd` has checked out.
 
         A clean merge commits and comes back with `clean=True` and the new sha.
-        A conflicted one comes back with `clean=False`, the parsed conflicts,
+        A conflicted one comes back with `clean=False`, the conflicting paths,
         and no sha, leaving the merge *in progress* on purpose: the caller
         inspects, resolves, and then calls `commit_merge` — or `abort_merge`.
         There is no third, silent state.
@@ -251,15 +238,13 @@ class Vcs(ABC):
         """Whether this tree is sitting in an unfinished merge."""
 
     @abstractmethod
-    def conflicts(self, cwd: Path) -> tuple[Conflict, ...]:
-        """Every conflicted file with its hunks parsed, sorted by path.
-
-        Only meaningful during a merge in progress; otherwise empty.
-        """
-
-    @abstractmethod
     def unmerged_paths(self, cwd: Path) -> tuple[str, ...]:
-        """Paths git considers unresolved, sorted."""
+        """Paths git considers unresolved, sorted.
+
+        Only meaningful during a merge in progress; otherwise empty. This is
+        what tells a conflicted merge from a hard failure, and what a halt
+        banner names.
+        """
 
     @abstractmethod
     def abort_merge(self, cwd: Path) -> None:

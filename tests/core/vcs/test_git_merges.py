@@ -29,7 +29,7 @@ def test_a_clean_merge_reports_clean(repo: Path, vcs: Git) -> None:
     git(repo, "checkout", "-q", "main")
     result = vcs.merge(repo, "feat")
     assert result.clean is True
-    assert result.conflicts == ()
+    assert result.conflicted == ()
 
 
 def test_a_clean_merge_returns_the_new_sha(repo: Path, vcs: Git) -> None:
@@ -46,7 +46,7 @@ def test_nothing_is_in_progress_after_a_clean_merge(repo: Path, vcs: Git) -> Non
     git(repo, "checkout", "-q", "main")
     vcs.merge(repo, "feat")
     assert vcs.merge_in_progress(repo) is False
-    assert vcs.conflicts(repo) == ()
+    assert vcs.unmerged_paths(repo) == ()
     assert vcs.has_changes(repo) is False
 
 
@@ -155,32 +155,28 @@ def test_a_conflicting_merge_lists_the_unmerged_path(
     assert vcs.unmerged_paths(repo) == ("a.txt",)
 
 
-def test_a_conflicting_merge_returns_the_parsed_conflict(
+def test_a_conflicting_merge_names_the_conflicted_path_in_its_result(
+    repo: Path, vcs: Git, diverged: Diverged
+) -> None:
+    # The result says what failed, so a caller writing a halt banner does not
+    # have to make a second call to find out.
+    result = vcs.merge(repo, diverged.theirs)
+    assert result.conflicted == ("a.txt",)
+
+
+def test_the_result_names_what_git_still_calls_unmerged(
     repo: Path, vcs: Git, diverged: Diverged
 ) -> None:
     result = vcs.merge(repo, diverged.theirs)
-    assert len(result.conflicts) == 1
-    conflict = result.conflicts[0]
-    assert conflict.path == "a.txt"
-    assert len(conflict.hunks) == 1
-    assert conflict.hunks[0].ours == ("ours",)
-    assert conflict.hunks[0].theirs == ("theirs",)
+    assert result.conflicted == vcs.unmerged_paths(repo)
 
 
-def test_conflicts_can_be_asked_for_again_afterwards(
-    repo: Path, vcs: Git, diverged: Diverged
-) -> None:
-    result = vcs.merge(repo, diverged.theirs)
-    assert vcs.conflicts(repo) == result.conflicts
-
-
-def test_conflicts_outside_a_merge_are_empty(repo: Path, vcs: Git) -> None:
-    assert vcs.conflicts(repo) == ()
+def test_nothing_is_unmerged_outside_a_merge(repo: Path, vcs: Git) -> None:
     assert vcs.unmerged_paths(repo) == ()
     assert vcs.merge_in_progress(repo) is False
 
 
-def test_two_conflicting_files_produce_two_conflicts(repo: Path, vcs: Git) -> None:
+def test_two_conflicting_files_are_both_named(repo: Path, vcs: Git) -> None:
     commit_file(repo, "a.txt", "base a\n", "add a")
     commit_file(repo, "b.txt", "base b\n", "add b")
     git(repo, "checkout", "-q", "-b", "theirs")
@@ -191,26 +187,23 @@ def test_two_conflicting_files_produce_two_conflicts(repo: Path, vcs: Git) -> No
     commit_file(repo, "b.txt", "ours b\n", "our b")
 
     result = vcs.merge(repo, "theirs")
-    assert [conflict.path for conflict in result.conflicts] == ["a.txt", "b.txt"]
+    assert result.conflicted == ("a.txt", "b.txt")
     assert vcs.unmerged_paths(repo) == ("a.txt", "b.txt")
 
 
-def test_two_regions_in_one_file_produce_two_hunks(repo: Path, vcs: Git) -> None:
+def test_two_conflicting_regions_in_one_file_are_one_path(repo: Path, vcs: Git) -> None:
+    # A path is named once however many regions inside it collided: the unit is
+    # the file someone has to open.
     base = "one\n" + "filler\n" * 20 + "two\n"
     ours = "ONE\n" + "filler\n" * 20 + "TWO\n"
     theirs = "1\n" + "filler\n" * 20 + "2\n"
     diverged = make_diverged(repo, "a.txt", base, ours, theirs)
 
-    result = vcs.merge(repo, diverged.theirs)
-    assert len(result.conflicts) == 1
-    hunks = result.conflicts[0].hunks
-    assert len(hunks) == 2
-    assert hunks[0].ours == ("ONE",)
-    assert hunks[1].ours == ("TWO",)
+    assert vcs.merge(repo, diverged.theirs).conflicted == ("a.txt",)
 
 
-def test_a_modify_delete_conflict_is_reported_without_hunks(repo: Path, vcs: Git) -> None:
-    # Git leaves no markers in the file, but the path is still unresolved.
+def test_a_modify_delete_conflict_names_the_path(repo: Path, vcs: Git) -> None:
+    # Git leaves no markers, and no file at all, but the path is still unresolved.
     commit_file(repo, "a.txt", "base\n", "add a")
     git(repo, "checkout", "-q", "-b", "theirs")
     git(repo, "rm", "-q", "a.txt")
@@ -220,8 +213,7 @@ def test_a_modify_delete_conflict_is_reported_without_hunks(repo: Path, vcs: Git
 
     result = vcs.merge(repo, "theirs")
     assert result.clean is False
-    assert [conflict.path for conflict in result.conflicts] == ["a.txt"]
-    assert result.conflicts[0].hunks == ()
+    assert result.conflicted == ("a.txt",)
 
 
 def test_a_conflict_shows_up_in_status_as_unmerged(
@@ -239,14 +231,14 @@ def test_the_conflicted_file_holds_both_sides_on_disk(
     assert "<<<<<<<" in content and "ours" in content and "theirs" in content
 
 
-def test_a_three_way_conflict_style_is_parsed_with_its_base(
+def test_the_conflict_style_does_not_change_the_answer(
     repo: Path, vcs: Git, diverged: Diverged
 ) -> None:
-    # A developer's `merge.conflictStyle = diff3` must not change the shape of
-    # the answer, only fill in the base.
+    # `merge.conflictStyle` is the repository's to set and writes different
+    # markers into the file. What comes back is paths either way.
     git(repo, "config", "merge.conflictStyle", "diff3")
     result = vcs.merge(repo, diverged.theirs)
-    assert result.conflicts[0].hunks[0].base == ("base",)
+    assert (result.clean, result.conflicted, result.sha) == (False, ("a.txt",), None)
 
 
 # -- aborting -------------------------------------------------------------

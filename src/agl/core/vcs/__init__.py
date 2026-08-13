@@ -5,8 +5,6 @@ Workflows import from here. Only `cli.py` may reach into `impl`.
 
 from agl.core.vcs.api import (
     BranchExistsError,
-    Conflict,
-    ConflictHunk,
     DirtyWorktreeError,
     FileStatus,
     MergeResult,
@@ -18,8 +16,6 @@ from agl.core.vcs.api import (
 
 __all__ = [
     "BranchExistsError",
-    "Conflict",
-    "ConflictHunk",
     "DirtyWorktreeError",
     "FileStatus",
     "MergeResult",

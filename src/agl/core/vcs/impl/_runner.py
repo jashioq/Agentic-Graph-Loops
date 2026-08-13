@@ -111,16 +111,3 @@ class GitRunner:
                 next(fields, None)
             entries.append(FileStatus(path=path, code=code.strip()))
         return tuple(entries)
-
-    @staticmethod
-    def _read(path: Path) -> str:
-        """A conflicted file's text, or empty if there is nothing to read.
-
-        A modify/delete conflict leaves no file at all, and a binary conflict
-        leaves bytes that are not text; neither is a reason to fail, so both
-        come back as a `Conflict` with no hunks.
-        """
-        try:
-            return path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return ""

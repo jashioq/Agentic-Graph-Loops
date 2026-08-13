@@ -97,6 +97,14 @@ def _waiting_marker(state: RunState) -> Text | None:
 
     The one state a person has to act on, so it is said twice: on the row and
     again up here, where it is visible without reading the list.
+
+    You will hardly ever see it, and that is expected rather than a bug. Asking
+    stops `Live` and takes the whole screen, and a second question queues on a
+    lock and takes the screen the moment the first is answered — so the
+    dashboard is visible exactly when no question is pending, which is exactly
+    when there is no marker to draw. It is kept because it is correct in the
+    moment it does show, it costs nothing, and it becomes load-bearing the day a
+    question can be skipped and left waiting while the run carries on.
     """
     waiting = [t.id for t in state.tickets.values() if t.status is Status.AWAITING_INPUT]
     if not waiting:
@@ -140,9 +148,14 @@ def _row(state: RunState, live: Live, ticket: Ticket) -> Row:
 def _label(ticket: Ticket) -> tuple[Component, ...]:
     """The id and title block. Bug rows are indented under the ticket they fix.
 
+    A bug row is red as well as indented. Indentation alone made one read as a
+    feature ticket a column over, and a bug is the row on the screen most worth
+    noticing: something the run found wrong with work it had already done.
+
     Merged rows are dimmed rather than dropped: a list that shrinks as work
     finishes takes the record of what was done off the screen, and every row
-    below it jumps.
+    below it jumps. A merged bug keeps a dimmer red on its id, so the finished
+    row still says what kind of row it was.
 
     The title takes whatever the id left of the block and is cut to fit it.
     Titles are written by an agent and one will eventually be long enough to
@@ -154,11 +167,14 @@ def _label(ticket: Ticket) -> tuple[Component, ...]:
     dim = ticket.status is Status.MERGED
     indent = INDENT if ticket.is_bug else 0
     title_width = max(1, LABEL_WIDTH - indent - len(ticket.id) - GAP)
-    title = Text(_fit(ticket.title, title_width), Color.DIM_GREY if dim else Color.GREY)
+    fitted = _fit(ticket.title, title_width)
     if not ticket.is_bug:
         label = Text(ticket.id, Color.DIM_GREY if dim else Color.WHITE)
+        title = Text(fitted, Color.DIM_GREY if dim else Color.GREY)
         return (label, Spacer(GAP), title)
-    return (Spacer(INDENT), Text(ticket.id, Color.DIM_GREY), Spacer(GAP), title)
+    label = Text(ticket.id, Color.DIM_RED if dim else Color.RED)
+    title = Text(fitted, Color.DIM_GREY if dim else Color.DIM_RED)
+    return (Spacer(INDENT), label, Spacer(GAP), title)
 
 
 def _fit(content: str, width: int) -> str:

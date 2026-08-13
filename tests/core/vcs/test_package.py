@@ -9,8 +9,6 @@ import agl.core.vcs as vcs
 def test_root_exports_exactly_the_api() -> None:
     assert set(vcs.__all__) == {
         "BranchExistsError",
-        "Conflict",
-        "ConflictHunk",
         "DirtyWorktreeError",
         "FileStatus",
         "MergeResult",

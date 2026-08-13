@@ -30,6 +30,7 @@ _STYLES: Final[dict[Color, str]] = {
     Color.BOLD_RED: "bold red",
     Color.DIM_GREEN: "dim green",
     Color.DIM_GREY: "dim grey58",
+    Color.DIM_RED: "dim red",
 }
 
 
