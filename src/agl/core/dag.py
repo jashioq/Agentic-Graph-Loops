@@ -10,12 +10,13 @@ cannot start until `blocker` is `DONE`. Every mutation validates before it
 touches anything, so a raising mutation leaves the graph exactly as it was.
 
 Mutating a graph that is already running has one load-bearing ordering. When
-work discovered mid-run must block a node that is already claimed — a review
-finding bugs in the ticket it was reviewing — the sequence is: **add the new
-nodes, add the edges, then release the parent.** Releasing first leaves the
-parent ready for a beat, and a scheduler that happens to look in that window
-claims it out from under the work meant to block it. Adding an edge to a
-still-`CLAIMED` node is legal by design, which is what makes edges-first safe.
+work discovered mid-run must block a node that is already claimed — the claimed
+node turning out to depend on something nobody knew about when it started — the
+sequence is: **add the new nodes, add the edges, then release the claimed one.**
+Releasing first leaves it ready for a beat, and a scheduler that happens to look
+in that window claims it out from under the work meant to block it. Adding an
+edge to a still-`CLAIMED` node is legal by design, which is what makes
+edges-first safe.
 """
 
 from collections.abc import Callable, Iterable
@@ -134,8 +135,8 @@ class Dag:
         Synchronous, and that is the whole point: reading the ready set and
         claiming out of it is one step no caller can separate. A scheduler that
         called `ready()`, awaited, and only then called `claim()` would hand the
-        same node to two workers — which in a run means two agents in one
-        worktree. Priority ordering is `ready()`'s.
+        same node to two workers, which is the one thing a claim exists to
+        prevent. Priority ordering is `ready()`'s.
         """
         ready = self.ready()
         if not ready:
@@ -207,7 +208,7 @@ class Dag:
         pending = [
             node_id
             for node_id, state in self._states.items()
-            if state is NodeState.PENDING and not self.unsatisfied_blockers(node_id)
+            if state is NodeState.PENDING and not self._is_blocked(node_id)
         ]
         if self._priority is None:
             return tuple(pending)
@@ -256,6 +257,17 @@ class Dag:
                 f"expected {expected.value}"
             )
         self._states[node_id] = target
+
+    def _is_blocked(self, node_id: NodeId) -> bool:
+        """Whether anything still holds `node_id` back.
+
+        `unsatisfied_blockers` answers the same question, but builds and orders
+        the whole list — a pass over every node — to say whether one exists.
+        `ready()` asks this of every node, which is linear against quadratic.
+        """
+        return any(
+            self._states[b] is not NodeState.DONE for b in self._blockers[node_id]
+        )
 
     def _require(self, node_id: NodeId) -> None:
         """Raise `UnknownNodeError` unless the graph holds `node_id`."""

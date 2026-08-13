@@ -2,7 +2,7 @@
 
 Layer: core. Worktrees, branches, commits, diffs, merges, and the contents of a
 conflict. It takes paths and ref names and hands back dataclasses; it has never
-heard of a ticket, an agent, or a run.
+heard of a work item, an agent, or a run.
 
 The API is synchronous. Git operations are milliseconds, a sync call is far
 easier to test and reason about, and a sync call made from an async task
@@ -207,8 +207,8 @@ class Vcs(ABC):
         """Stage everything, including untracked files, commit, return the sha.
 
         Returns `None` when there was nothing to commit, rather than raising:
-        an agent that decided no change was needed is an ordinary outcome the
-        workflow handles, not an error. Raises `VcsError` if the commit fails.
+        a tree that ended up unchanged is an ordinary outcome for the caller to
+        handle, not an error. Raises `VcsError` if the commit fails.
         """
 
     # -- diffs ------------------------------------------------------------
@@ -218,8 +218,9 @@ class Vcs(ABC):
         """Unified diff of what `head` added since it diverged from `base`.
 
         This is the merge-base diff — `base...head` — so commits made on `base`
-        after the divergence do not appear. A review of one ticket's work has
-        to show that ticket's work and nothing else. Raises `UnknownRefError`.
+        after the divergence do not appear: what `head` did is `head`'s, and
+        nothing that landed elsewhere meanwhile belongs in it. Raises
+        `UnknownRefError`.
         """
 
     @abstractmethod

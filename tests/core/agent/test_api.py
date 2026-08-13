@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from agl.core.agent import (
+    NO_PARAMS,
     AgentBudgetError,
     AgentError,
     AgentOption,
@@ -73,7 +74,6 @@ def test_a_spec_needs_a_prompt_a_cwd_and_a_role_and_nothing_else() -> None:
     assert spec.tools == ()
     assert spec.system_prompt_append is None
     assert spec.add_dirs == ()
-    assert spec.allowed_tools == ()
     assert spec.disallowed_tools == ()
     assert spec.permission_mode == "default"
     assert spec.model is None
@@ -91,7 +91,6 @@ def test_a_result_carries_the_text_and_what_the_run_cost() -> None:
         num_turns=4,
         duration_ms=1200,
         terminal_reason="completed",
-        is_error=False,
     )
 
     assert result.text == "done"
@@ -101,7 +100,18 @@ def test_a_result_carries_the_text_and_what_the_run_cost() -> None:
     assert result.num_turns == 4
     assert result.duration_ms == 1200
     assert result.terminal_reason == "completed"
-    assert result.is_error is False
+
+
+def test_a_result_carries_no_error_flag() -> None:
+    # A run that could not be completed raises. There is no such thing as a
+    # result that came back saying it failed, so there is no field for it.
+    assert "is_error" not in {field.name for field in dataclasses.fields(AgentResult)}
+
+
+def test_a_spec_has_no_allowed_tools() -> None:
+    # The permission callback allows every non-question tool, so pre-allowing
+    # one bought nothing and allowing `AskUserQuestion` silently disabled asking.
+    assert "allowed_tools" not in {field.name for field in dataclasses.fields(AgentSpec)}
 
 
 def test_a_question_is_a_title_and_its_options() -> None:
@@ -130,3 +140,21 @@ def test_the_question_type_is_this_modules_own() -> None:
 def test_budget_exhaustion_is_an_agent_error() -> None:
     assert issubclass(AgentBudgetError, AgentError)
     assert issubclass(AgentError, Exception)
+
+
+# -- the no-argument schema -----------------------------------------------
+
+
+def test_no_params_is_a_closed_object_schema_with_no_properties() -> None:
+    # The canonical shape for a scoped tool: everything it may touch was closed
+    # over at construction, so there is nothing for the model to widen.
+    assert NO_PARAMS == {"type": "object", "properties": {}, "additionalProperties": False}
+
+
+async def test_a_tool_can_be_built_on_no_params() -> None:
+    async def handler(arguments: dict[str, Any]) -> str:
+        return "the document"
+
+    tool = Tool(name="read_it", description="Read it", schema=NO_PARAMS, handler=handler)
+
+    assert await tool.handler({}) == "the document"

@@ -4,6 +4,12 @@ Layer: core. Everything a workflow needs to drive the terminal lives here.
 A screen is data — a tree of components — and rendering is a pure function of
 that tree plus the current time, so timers tick without anything pushing
 updates. This module holds no I/O and knows nothing about Rich.
+
+`TerminalError` is the module's one failure. A terminal is never the interesting
+part of a run, so the rule is that it must not be the reason one fails: bad
+input is re-prompted, not raised on. What is left is the case where there is no
+answer to be had at all — stdin exhausted or closed — and that is what the error
+is for.
 """
 
 from abc import ABC, abstractmethod
@@ -24,9 +30,20 @@ __all__ = [
     "Screen",
     "Spacer",
     "Terminal",
+    "TerminalError",
     "Text",
     "Timer",
 ]
+
+
+class TerminalError(Exception):
+    """Raised when the terminal cannot do what was asked of it.
+
+    In practice that is one thing: a question with nobody able to answer it,
+    because stdin is exhausted or closed. Deliberately not an `EOFError` —
+    a caller catching this is catching a terminal failure, not adopting a
+    built-in whose meaning is wider.
+    """
 
 
 class Color(Enum):
@@ -94,11 +111,16 @@ type Component = Text | Timer | Spacer | Row | Rows
 
 @dataclass(frozen=True)
 class Screen:
-    """Three sticky regions: header on top, footer on the bottom, content between."""
+    """Three sticky regions: header on top, footer on the bottom, content between.
 
-    header: Row | Rows | None
+    Content comes first because it is the only one a screen must have; most
+    frames are content alone, and saying so twice over at every call site added
+    nothing.
+    """
+
     content: Rows
-    footer: Row | Rows | None
+    header: Row | Rows | None = None
+    footer: Row | Rows | None = None
 
 
 @dataclass(frozen=True)
@@ -133,7 +155,12 @@ class Terminal(ABC):
     def live(
         self, build: Callable[[], Screen], fps: int = 4
     ) -> AbstractAsyncContextManager["LiveSession"]:
-        """Repaint `build()` at `fps` until the context exits."""
+        """Repaint `build()` at `fps` until the context exits.
+
+        `fps` is frames per second and must be positive; a non-positive value
+        raises `ValueError` here rather than becoming a division inside the
+        repaint loop.
+        """
 
 
 class LiveSession(ABC):
@@ -141,4 +168,14 @@ class LiveSession(ABC):
 
     @abstractmethod
     async def ask(self, question: Question) -> Answer:
-        """Take over the screen to ask. Concurrent callers queue FIFO."""
+        """Take over the screen to ask. Concurrent callers queue FIFO.
+
+        Input that means nothing — blank, or a number outside the offered range
+        — is re-prompted rather than raised on or taken at face value. Anything
+        that is not a plain decimal number is the user's own words and comes
+        back as free text.
+
+        Raises `TerminalError` when there is no answer to be had: stdin
+        exhausted or closed, which is what a run on piped input meets at its
+        first question.
+        """

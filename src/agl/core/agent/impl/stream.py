@@ -7,6 +7,12 @@ a broken dashboard can never fail an agent run.
 Token counts on assistant messages cover the top-level loop only and exclude
 anything a subagent spent, so they understate a run that delegated. `cost_usd`
 comes from the result message and is the number to trust.
+
+A result the SDK marked as an error is raised, not returned: `AgentResult` has
+no way to say "this failed", and a caller handed one as a success would never
+send it back round the retry ladder. Exhaustion is the exception — it is not
+retryable, and the caller has a distinct error and a better message for it — so
+an exhausted run comes back as an ordinary result for the caller to classify.
 """
 
 import json
@@ -16,10 +22,15 @@ from typing import Any
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
 from agl.core.agent.api import AgentError, AgentResult
+from agl.core.agent.impl.tools import MCP_PREFIX
 
-__all__ = ["fold", "summarise_tool_use"]
+__all__ = ["EXHAUSTED", "fold", "summarize_tool_use"]
 
-MCP_PREFIX = "mcp__agl__"
+# `terminal_reason` values that mean the run hit a ceiling rather than went
+# wrong. `max_turns` is the SDK's own wording; the `error_max_` pair is what a
+# result message reports as its subtype.
+EXHAUSTED = frozenset({"max_turns", "error_max_turns", "error_max_budget_usd"})
+
 SUMMARY_WIDTH = 60
 
 # In priority order: the first one present is what the tool is doing *to*.
@@ -36,7 +47,7 @@ SUBJECT_KEYS = (
 )
 
 
-def summarise_tool_use(tool: str, tool_input: Mapping[str, Any]) -> str:
+def summarize_tool_use(tool: str, tool_input: Mapping[str, Any]) -> str:
     """A short one-line description of a tool call, for a status footer.
 
     `Edit src/auth/TokenStore.kt`, `Bash ./gradlew build`, `Read README.md`. An
@@ -71,8 +82,9 @@ async def fold(
     """Consume the stream and return what the run produced.
 
     Raises `AgentError` if the stream ends without a result message — a run that
-    never resolved is not a result with fields missing — or if `expect_json` was
-    asked for and the final text does not parse.
+    never resolved is not a result with fields missing — if the result reports
+    an error that is not exhaustion, or if `expect_json` was asked for and the
+    final text does not parse.
     """
     text = ""
     session_id: str | None = None
@@ -96,6 +108,15 @@ async def fold(
     if outcome is None:
         raise AgentError("the message stream ended without a result")
 
+    reason = _terminal_reason(outcome)
+    if outcome.is_error and reason not in EXHAUSTED:
+        detail = (outcome.result or text).strip()
+        raise AgentError(
+            f"the run reported an error ({outcome.subtype}) after "
+            f"{outcome.num_turns} turns and ${outcome.total_cost_usd or 0.0:.2f}"
+            + (f": {detail}" if detail else "")
+        )
+
     return AgentResult(
         text=text,
         structured=_parse(text) if expect_json else None,
@@ -103,8 +124,7 @@ async def fold(
         cost_usd=outcome.total_cost_usd or 0.0,
         num_turns=outcome.num_turns,
         duration_ms=outcome.duration_ms,
-        terminal_reason=_terminal_reason(outcome),
-        is_error=outcome.is_error,
+        terminal_reason=reason,
     )
 
 
@@ -113,7 +133,7 @@ def _report(on_activity: Callable[[str], None] | None, block: ToolUseBlock) -> N
     if on_activity is None:
         return
     try:
-        on_activity(summarise_tool_use(block.name, block.input))
+        on_activity(summarize_tool_use(block.name, block.input))
     except Exception:  # noqa: BLE001 - a footer is not worth an agent run
         pass
 

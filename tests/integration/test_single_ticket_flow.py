@@ -23,7 +23,7 @@ from typing import Any
 import pytest
 
 from agl.core import paths
-from agl.core.agent import AgentResult, AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentResult, AgentSpec, Tool
 from agl.core.dag import Dag, NodeState
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
@@ -37,8 +37,6 @@ TICKET = "T-01"
 
 SPEC = "# Add auth\n\nA token check, in the file the ticket names.\n"
 SOURCE = f"# {TICKET}\nTOKEN = 'set'\n"
-
-NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 
 # -- the tools the run is given -------------------------------------------
@@ -114,7 +112,7 @@ async def drive(repo: Path, home: Path, trees: Path) -> Flow:
     assert dag.ready() == (TICKET,)
     dag.claim(TICKET)
 
-    branch = paths.ticket_branch(LABEL, TICKET)
+    branch = paths.branch(LABEL, TICKET)
     worktree = vcs.add_worktree(paths.worktree_dir(trees, PROJECT, LABEL, TICKET), branch, "main")
 
     runner = FakeAgentRunner(
@@ -177,7 +175,6 @@ def test_a_tool_handed_to_the_agent_reached_the_store(flow: Flow) -> None:
 
 def test_the_agent_returned_what_it_was_scripted_to(flow: Flow) -> None:
     assert flow.result.text == "done"
-    assert flow.result.is_error is False
 
 
 def test_the_commit_came_back_with_a_sha(flow: Flow) -> None:

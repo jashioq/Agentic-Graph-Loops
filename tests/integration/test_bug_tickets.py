@@ -8,9 +8,10 @@ that already exists.
 
 That last part is the one real git is here for. A ref is a file, so
 `agl/add-auth/T-01` existing rules out `agl/add-auth/T-01/bug-1` ever existing —
-`paths.bug_branch` hyphenates for exactly this reason, and the test at the
-bottom of this file is what proves the rule holds against git rather than
-against a docstring.
+a bug id is composed by hyphenating onto its parent for exactly this reason, and
+`paths.validate_node_id` refusing the `/` that would nest it is what enforces
+that. The test at the bottom of this file proves the rule holds against git
+rather than against a docstring.
 
 The whole flow runs once for the module; the assertions read what it recorded.
 """
@@ -23,7 +24,7 @@ from typing import Any
 import pytest
 
 from agl.core import paths
-from agl.core.agent import AgentResult, AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentResult, AgentSpec, Tool
 from agl.core.dag import Dag, NodeId, NodeState
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
@@ -34,8 +35,6 @@ from tests.integration.conftest import PROJECT, copy_repo
 
 LABEL = "add-auth"
 PARENT = "T-01"
-
-NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 BUGS = [
     {"id": f"{PARENT}-bug-1", "n": 1, "file": "fix-1.txt", "title": "Token never expires"},
@@ -50,7 +49,6 @@ FOUND_BUGS = AgentResult(
     num_turns=3,
     duration_ms=0,
     terminal_reason="completed",
-    is_error=False,
 )
 
 
@@ -114,7 +112,7 @@ async def drive(repo: Path, home: Path, trees: Path) -> Ran:
         }
     )
 
-    parent_branch = paths.ticket_branch(LABEL, PARENT)
+    parent_branch = paths.branch(LABEL, PARENT)
     parent = vcs.add_worktree(
         paths.worktree_dir(trees, PROJECT, LABEL, PARENT), parent_branch, "main"
     )
@@ -154,7 +152,7 @@ async def drive(repo: Path, home: Path, trees: Path) -> Ran:
 
     # Both bug worktrees are cut from the parent branch at the same commit, so
     # the second merge is a real merge and not a fast-forward of the first.
-    branches = tuple(paths.bug_branch(LABEL, PARENT, bug["n"]) for bug in bugs)
+    branches = tuple(paths.branch(LABEL, str(bug["id"])) for bug in bugs)
     trees_for_bugs = [
         vcs.add_worktree(
             paths.worktree_dir(trees, PROJECT, LABEL, bug["id"]), branch, parent_branch
@@ -301,8 +299,8 @@ def test_all_the_worktrees_are_gone(ran: Ran) -> None:
 
 
 def test_the_parent_ref_is_a_file_on_disk(ran: Ran) -> None:
-    # Which is the whole reason `bug_branch` hyphenates: this path cannot also
-    # be a directory holding `bug-1`.
+    # Which is the whole reason a bug id hyphenates onto its parent: this path
+    # cannot also be a directory holding `bug-1`.
     assert (ran.repo / ".git" / "refs" / "heads" / ran.parent_branch).is_file()
 
 
@@ -313,6 +311,6 @@ def test_a_path_child_of_the_parent_branch_cannot_exist(ran: Ran) -> None:
 
 
 def test_the_sibling_name_is_the_one_git_accepts(ran: Ran) -> None:
-    ran.vcs.create_branch(paths.bug_branch(LABEL, PARENT, 3), "main")
+    ran.vcs.create_branch(paths.branch(LABEL, f"{PARENT}-bug-3"), "main")
     assert ran.vcs.branch_exists(f"agl/{LABEL}/{PARENT}-bug-3") is True
     ran.vcs.delete_branch(f"agl/{LABEL}/{PARENT}-bug-3", force=True)

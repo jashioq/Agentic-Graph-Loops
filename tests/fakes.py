@@ -170,7 +170,6 @@ class ScriptedRun:
             num_turns=1,
             duration_ms=0,
             terminal_reason="completed",
-            is_error=False,
         )
 
 

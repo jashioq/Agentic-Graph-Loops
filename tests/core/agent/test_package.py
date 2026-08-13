@@ -8,6 +8,7 @@ import agl.core.agent as agent
 
 def test_root_exports_exactly_the_api() -> None:
     assert set(agent.__all__) == {
+        "NO_PARAMS",
         "AgentBudgetError",
         "AgentError",
         "AgentOption",

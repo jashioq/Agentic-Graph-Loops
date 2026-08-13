@@ -15,6 +15,7 @@ from agl.core.terminal.api import (
     Screen,
     Spacer,
     Terminal,
+    TerminalError,
     Text,
     Timer,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "Screen",
     "Spacer",
     "Terminal",
+    "TerminalError",
     "Text",
     "Timer",
 ]

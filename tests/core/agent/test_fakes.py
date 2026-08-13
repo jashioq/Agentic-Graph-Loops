@@ -53,7 +53,6 @@ async def test_a_bare_string_is_the_text_the_run_produced() -> None:
     result = await runner.run(spec())
 
     assert result.text == "the patch"
-    assert result.is_error is False
 
 
 async def test_a_full_result_is_returned_as_given() -> None:
@@ -65,7 +64,6 @@ async def test_a_full_result_is_returned_as_given() -> None:
         num_turns=7,
         duration_ms=99,
         terminal_reason="completed",
-        is_error=False,
     )
     runner = FakeAgentRunner({"implement": scripted})
 
@@ -166,7 +164,6 @@ async def test_a_raising_handler_becomes_a_result_and_the_run_carries_on() -> No
     result = await runner.run(spec("implement", failing_tool(), add_tool()))
 
     assert result.text == "finished anyway"
-    assert result.is_error is False
     assert runner.tool_results[0].is_error is True
 
 

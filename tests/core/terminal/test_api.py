@@ -69,7 +69,7 @@ def test_empty_row_and_rows_are_allowed() -> None:
         Spacer(1),
         Row(Text("a")),
         Rows(Row(Text("a"))),
-        Screen(header=None, content=Rows(), footer=None),
+        Screen(content=Rows()),
         Option("label", "description"),
         Question("header", "title", ()),
         Answer("text", was_free_text=False),
@@ -93,6 +93,17 @@ def test_screen_holds_the_three_regions() -> None:
     footer = Rows(Row(Text("f")))
     screen = Screen(header=header, content=content, footer=footer)
     assert (screen.header, screen.content, screen.footer) == (header, content, footer)
+
+
+def test_a_screen_needs_only_its_content() -> None:
+    # Most screens have neither a header nor a footer, and repeating
+    # `header=None, footer=None` at every call site says nothing.
+    content = Rows(Row(Text("c")))
+    screen = Screen(content)
+
+    assert screen.content == content
+    assert screen.header is None
+    assert screen.footer is None
 
 
 def test_question_carries_options() -> None:

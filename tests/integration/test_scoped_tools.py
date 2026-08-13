@@ -18,12 +18,10 @@ from typing import Any
 
 import pytest
 
-from agl.core.agent import AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentSpec, Tool
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
 from tests.fakes import FakeAgentRunner, ScriptedRun, ToolResult
-
-NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 TEXT_ONLY: dict[str, Any] = {
     "type": "object",
@@ -208,7 +206,6 @@ async def test_a_failure_is_visible_and_the_run_survives(tmp_path: Path) -> None
         ToolResult("FileNotFoundError: standards.md", is_error=True)
     ]
     assert result.text == "finished anyway"
-    assert result.is_error is False
 
 
 async def test_a_failed_tool_does_not_reach_past_its_own_call(

@@ -19,6 +19,7 @@ def test_root_exports_exactly_the_api() -> None:
         "Screen",
         "Spacer",
         "Terminal",
+        "TerminalError",
         "Text",
         "Timer",
     }

@@ -166,6 +166,78 @@ def test_a_markdown_underline_outside_a_conflict_is_not_a_separator() -> None:
     assert parse_conflicts("Heading\n=======\ntext\n") == ()
 
 
+# -- markers are exactly seven characters ---------------------------------
+
+
+def test_a_longer_run_of_equals_inside_a_side_is_content_not_a_separator() -> None:
+    # A reStructuredText heading underline, an ASCII divider, a comment rule.
+    # Read as a separator it flips the parser to "theirs" and mis-attributes
+    # every line after it — and a classifying agent acts on that parse.
+    content = (
+        "<<<<<<< HEAD\n"
+        "Heading\n"
+        "========\n"
+        "still ours\n"
+        "=======\n"
+        "theirs\n"
+        ">>>>>>> feature\n"
+    )
+    assert parse_conflicts(content) == (
+        ConflictHunk(ours=("Heading", "========", "still ours"), theirs=("theirs",), base=None),
+    )
+
+
+def test_a_very_long_run_of_equals_is_content_too() -> None:
+    content = "<<<<<<< HEAD\n" + "=" * 40 + "\n=======\ntheirs\n>>>>>>> x\n"
+    assert parse_conflicts(content)[0].ours == ("=" * 40,)
+
+
+def test_eight_angle_brackets_are_content_not_a_start_marker() -> None:
+    content = "<<<<<<< HEAD\n<<<<<<<<\nours\n=======\ntheirs\n>>>>>>> x\n"
+    assert parse_conflicts(content) == (
+        ConflictHunk(ours=("<<<<<<<<", "ours"), theirs=("theirs",), base=None),
+    )
+
+
+def test_eight_angle_brackets_outside_a_conflict_start_nothing() -> None:
+    assert parse_conflicts("<<<<<<<<\nours\n=======\ntheirs\n>>>>>>>>\n") == ()
+
+
+def test_a_longer_end_marker_does_not_close_a_hunk() -> None:
+    assert parse_conflicts("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>>> x\n") == ()
+
+
+def test_a_marker_followed_by_its_label_still_parses() -> None:
+    content = (
+        "<<<<<<< HEAD\n"
+        "ours\n"
+        "||||||| merged common ancestors\n"
+        "base\n"
+        "=======\n"
+        "theirs\n"
+        ">>>>>>> feature/some-branch\n"
+    )
+    assert parse_conflicts(content) == (
+        ConflictHunk(ours=("ours",), theirs=("theirs",), base=("base",)),
+    )
+
+
+def test_bare_markers_with_nothing_after_them_still_parse() -> None:
+    # `git merge-file` writes unlabelled markers, and the separator never
+    # carries a label under any style.
+    content = "<<<<<<<\nours\n|||||||\nbase\n=======\ntheirs\n>>>>>>>\n"
+    assert parse_conflicts(content) == (
+        ConflictHunk(ours=("ours",), theirs=("theirs",), base=("base",)),
+    )
+
+
+def test_a_marker_run_glued_to_a_label_is_content() -> None:
+    # Seven characters then a non-space is not a marker; git always separates
+    # a marker from its label with one space.
+    content = "<<<<<<< HEAD\n>>>>>>>x\nours\n=======\ntheirs\n>>>>>>> x\n"
+    assert parse_conflicts(content)[0].ours == (">>>>>>>x", "ours")
+
+
 # -- shapes the parser must survive ---------------------------------------
 
 
@@ -199,14 +271,6 @@ def test_crlf_line_endings_are_recognised_as_markers() -> None:
     hunks = parse_conflicts(content)
     assert len(hunks) == 1
     assert [line.rstrip("\r") for line in hunks[0].ours] == ["ours"]
-
-
-def test_markers_longer_than_seven_characters_are_still_markers() -> None:
-    # Git pads markers out when the conflicting content contains marker-like lines.
-    content = "<<<<<<<< HEAD\nours\n========\ntheirs\n>>>>>>>> x\n"
-    assert parse_conflicts(content) == (
-        ConflictHunk(ours=("ours",), theirs=("theirs",), base=None),
-    )
 
 
 def test_parsing_does_not_mutate_or_lose_leading_whitespace() -> None:

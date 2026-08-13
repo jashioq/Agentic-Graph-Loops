@@ -98,6 +98,68 @@ def test_delete_on_a_missing_key_raises(store: FileStore) -> None:
         store.delete("nope.md")
 
 
+def test_delete_on_a_key_that_is_a_directory_raises_missing(store: FileStore) -> None:
+    # No document is stored under that key, whatever the filesystem calls the
+    # refusal — `unlink` on a directory is `EISDIR` on Linux and `EPERM` on
+    # macOS, and neither may reach a caller.
+    store.write("reviews/T-03.md", "x")
+    with pytest.raises(MissingKeyError):
+        store.delete("reviews")
+
+
+def test_delete_lets_a_real_permission_error_through(store: FileStore) -> None:
+    # A file that exists and cannot be removed is not a missing key, and a
+    # caller told otherwise would carry on as though the delete had happened.
+    store.write("locked/spec.md", "x")
+    directory = store.root / "locked"
+    directory.chmod(0o500)
+    try:
+        with pytest.raises(PermissionError):
+            store.delete("locked/spec.md")
+    finally:
+        directory.chmod(0o700)
+
+
+# -- keys that collide with each other ------------------------------------
+
+
+def test_writing_over_a_key_another_key_made_a_directory_is_refused(
+    store: FileStore,
+) -> None:
+    store.write("reviews/T-03.md", "x")
+    with pytest.raises(InvalidKeyError):
+        store.write("reviews", "the whole lot")
+
+
+def test_writing_under_a_key_that_is_already_a_document_is_refused(
+    store: FileStore,
+) -> None:
+    store.write("reviews", "the whole lot")
+    with pytest.raises(InvalidKeyError):
+        store.write("reviews/T-03.md", "x")
+
+
+def test_a_collision_several_levels_up_is_still_refused(store: FileStore) -> None:
+    store.write("reviews", "the whole lot")
+    with pytest.raises(InvalidKeyError):
+        store.write("reviews/round-1/T-03.md", "x")
+
+
+def test_a_refused_write_leaves_the_store_as_it_was(store: FileStore) -> None:
+    store.write("reviews/T-03.md", "kept")
+    with pytest.raises(InvalidKeyError):
+        store.write("reviews", "the whole lot")
+
+    assert store.read("reviews/T-03.md") == "kept"
+    assert store.list() == ("reviews/T-03.md",)
+
+
+def test_the_collision_error_names_both_keys(store: FileStore) -> None:
+    store.write("reviews/T-03.md", "x")
+    with pytest.raises(InvalidKeyError, match="reviews"):
+        store.write("reviews", "the whole lot")
+
+
 # -- exists ---------------------------------------------------------------
 
 
@@ -133,6 +195,15 @@ def test_list_filters_by_prefix(store: FileStore) -> None:
     assert store.list("reviews/") == ("reviews/T-01.md", "reviews/T-03.md")
     assert store.list("spec") == ("spec.md",)
     assert store.list("nothing") == ()
+
+
+def test_list_matches_a_string_prefix_not_a_path_segment(store: FileStore) -> None:
+    # Documented as such on the ABC: `list("T-1")` finds `T-10.md`, and a
+    # caller that wants a directory asks for one by ending the prefix in `/`.
+    for key in ("T-1.md", "T-10.md", "T-2.md"):
+        store.write(key, "x")
+
+    assert store.list("T-1") == ("T-1.md", "T-10.md")
 
 
 def test_list_returns_keys_not_paths(store: FileStore) -> None:

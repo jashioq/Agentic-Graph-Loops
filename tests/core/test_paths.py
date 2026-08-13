@@ -5,16 +5,17 @@ from pathlib import Path
 import pytest
 
 from agl.core.paths import (
-    InvalidLabelError,
+    BRANCH_PREFIX,
+    InvalidNameError,
+    branch,
     branch_namespace,
-    bug_branch,
     project_config,
     project_dir,
-    project_standards,
     run_dir,
-    ticket_branch,
     trees_dir,
     validate_label,
+    validate_node_id,
+    validate_project,
     worktree_dir,
 )
 
@@ -31,10 +32,6 @@ def test_project_dir() -> None:
 
 def test_project_config_is_config_toml_in_the_project_dir() -> None:
     assert project_config(HOME, "acme-api") == project_dir(HOME, "acme-api") / "config.toml"
-
-
-def test_project_standards_is_standards_md_in_the_project_dir() -> None:
-    assert project_standards(HOME, "acme-api") == project_dir(HOME, "acme-api") / "standards.md"
 
 
 def test_run_dir() -> None:
@@ -68,7 +65,7 @@ def test_worktree_dir() -> None:
     )
 
 
-def test_two_tickets_get_different_worktrees_under_the_same_trees_dir() -> None:
+def test_two_nodes_get_different_worktrees_under_the_same_trees_dir() -> None:
     first = worktree_dir(TREES, "acme-api", "add-auth", "T-03")
     second = worktree_dir(TREES, "acme-api", "add-auth", "T-04")
     assert first != second
@@ -94,45 +91,38 @@ def test_worktrees_live_under_the_trees_root_not_the_agl_home() -> None:
 # -- branches -------------------------------------------------------------
 
 
-def test_ticket_branch() -> None:
-    assert ticket_branch("add-auth", "T-03") == "agl/add-auth/T-03"
+def test_branch() -> None:
+    assert branch("add-auth", "T-03") == "agl/add-auth/T-03"
 
 
-def test_bug_branch() -> None:
-    assert bug_branch("add-auth", "T-03", 1) == "agl/add-auth/T-03-bug-1"
+def test_branch_prefix_is_exported_and_starts_every_namespace() -> None:
+    assert BRANCH_PREFIX == "agl"
+    assert branch_namespace("add-auth").startswith(BRANCH_PREFIX + "/")
 
 
-def test_a_bug_branch_is_not_a_path_child_of_its_parent_branch() -> None:
+def test_a_composed_node_id_is_a_sibling_not_a_path_child() -> None:
     # Git stores refs as files: `agl/add-auth/T-03` being a file means nothing
-    # can live at `agl/add-auth/T-03/...`. Bug branches are siblings for that
-    # reason, and this test is the guard on it.
-    parent = ticket_branch("add-auth", "T-03")
-    for n in (1, 2, 17):
-        assert not bug_branch("add-auth", "T-03", n).startswith(parent + "/")
+    # can live at `agl/add-auth/T-03/...`. A workflow composing a derived id
+    # hyphenates for that reason, and node-id validation — which refuses `/` —
+    # is what keeps the composed branch flat. This test is the guard on it.
+    parent = branch("add-auth", "T-03")
+    for composed in ("T-03-bug-1", "T-03-bug-2", "T-03-followup"):
+        assert not branch("add-auth", composed).startswith(parent + "/")
+        assert branch("add-auth", composed).count("/") == parent.count("/")
 
 
-def test_bug_branches_are_flat_below_the_label() -> None:
-    assert bug_branch("add-auth", "T-03", 1).count("/") == ticket_branch("add-auth", "T-03").count(
-        "/"
-    )
-
-
-def test_bug_branch_numbers_are_distinct() -> None:
-    assert bug_branch("add-auth", "T-03", 1) != bug_branch("add-auth", "T-03", 2)
-
-
-def test_bug_branches_of_different_tickets_differ() -> None:
-    assert bug_branch("add-auth", "T-03", 1) != bug_branch("add-auth", "T-04", 1)
+def test_two_node_ids_get_different_branches() -> None:
+    assert branch("add-auth", "T-03") != branch("add-auth", "T-04")
 
 
 def test_branch_namespace() -> None:
     assert branch_namespace("add-auth") == "agl/add-auth"
 
 
-def test_branch_namespace_is_a_prefix_of_both_branch_kinds() -> None:
+def test_branch_namespace_is_a_prefix_of_every_branch() -> None:
     namespace = branch_namespace("add-auth")
-    assert ticket_branch("add-auth", "T-03").startswith(namespace + "/")
-    assert bug_branch("add-auth", "T-03", 1).startswith(namespace + "/")
+    for node_id in ("T-03", "T-03-bug-1"):
+        assert branch("add-auth", node_id).startswith(namespace + "/")
 
 
 def test_the_agl_prefix_keeps_a_user_branch_named_like_the_label_clear() -> None:
@@ -145,14 +135,15 @@ def test_two_labels_get_different_namespaces() -> None:
     assert branch_namespace("add-auth") != branch_namespace("add-billing")
 
 
-# -- label validation -----------------------------------------------------
+# -- validation -----------------------------------------------------------
 
 VALID_LABELS = ["a", "add-auth", "t3", "0", "add-auth-2", "a-b-c-d"]
 
-INVALID_LABELS = [
+# Every one of these is illegal for a label, a project, and a node id alike:
+# each would either escape its directory, nest a ref, or arrive at git as
+# syntax rather than as a name.
+INVALID_NAMES = [
     "",
-    "Add-Auth",
-    "ADDAUTH",
     "-add-auth",
     "add auth",
     "add/auth",
@@ -171,25 +162,85 @@ INVALID_LABELS = [
     "add-auth\n",
 ]
 
+# Uppercase is refused for the two names a person supplies, because a
+# case-insensitive filesystem would fold `Add-Auth` onto `add-auth` and hand
+# two runs the same directory. A node id is composed by a workflow from one
+# scheme, so `T-03` is a name and not a collision.
+UPPERCASE_NAMES = ["Add-Auth", "ADDAUTH"]
+
 
 @pytest.mark.parametrize("label", VALID_LABELS)
 def test_valid_labels_pass(label: str) -> None:
     assert validate_label(label) is None
 
 
-@pytest.mark.parametrize("label", INVALID_LABELS)
-def test_invalid_labels_raise(label: str) -> None:
-    with pytest.raises(InvalidLabelError):
-        validate_label(label)
+@pytest.mark.parametrize("name", INVALID_NAMES)
+def test_an_illegal_name_raises_for_every_kind(name: str) -> None:
+    for validate in (validate_label, validate_project, validate_node_id):
+        with pytest.raises(InvalidNameError):
+            validate(name)
 
 
-def test_invalid_label_error_is_an_exception() -> None:
-    assert issubclass(InvalidLabelError, Exception)
+@pytest.mark.parametrize("name", UPPERCASE_NAMES)
+def test_uppercase_is_refused_for_labels_and_projects(name: str) -> None:
+    for validate in (validate_label, validate_project):
+        with pytest.raises(InvalidNameError):
+            validate(name)
 
 
-def test_the_error_names_the_label() -> None:
-    with pytest.raises(InvalidLabelError, match="Add-Auth"):
+@pytest.mark.parametrize("node_id", ["T-03", "T-03-bug-1", "t-03", "0", "N1"])
+def test_valid_node_ids_pass(node_id: str) -> None:
+    assert validate_node_id(node_id) is None
+
+
+def test_invalid_name_error_is_an_exception() -> None:
+    assert issubclass(InvalidNameError, Exception)
+
+
+def test_the_error_names_the_offending_value() -> None:
+    with pytest.raises(InvalidNameError, match="Add-Auth"):
         validate_label("Add-Auth")
+
+
+def test_the_error_names_which_kind_was_wrong() -> None:
+    with pytest.raises(InvalidNameError, match="node id"):
+        validate_node_id("T 03")
+    with pytest.raises(InvalidNameError, match="project"):
+        validate_project("acme/api")
+
+
+# -- every function that takes a name validates it -------------------------
+
+
+def test_a_label_is_validated_wherever_it_is_taken() -> None:
+    for call in (
+        lambda: run_dir(HOME, "../escape"),
+        lambda: trees_dir(TREES, "acme-api", "../escape"),
+        lambda: worktree_dir(TREES, "acme-api", "../escape", "T-03"),
+        lambda: branch_namespace("../escape"),
+        lambda: branch("../escape", "T-03"),
+    ):
+        with pytest.raises(InvalidNameError):
+            call()
+
+
+def test_a_project_is_validated_wherever_it_is_taken() -> None:
+    for call in (
+        lambda: project_dir(HOME, "../escape"),
+        lambda: project_config(HOME, "../escape"),
+        lambda: trees_dir(TREES, "../escape", "add-auth"),
+        lambda: worktree_dir(TREES, "../escape", "add-auth", "T-03"),
+    ):
+        with pytest.raises(InvalidNameError):
+            call()
+
+
+def test_a_node_id_is_validated_wherever_it_is_taken() -> None:
+    for node_id in ("../escape", "T-03/bug-1", ".."):
+        with pytest.raises(InvalidNameError):
+            worktree_dir(TREES, "acme-api", "add-auth", node_id)
+        with pytest.raises(InvalidNameError):
+            branch("add-auth", node_id)
 
 
 # -- purity ---------------------------------------------------------------
@@ -201,7 +252,6 @@ def test_path_functions_are_repeatable_and_create_nothing(tmp_path: Path) -> Non
     calls = [
         lambda: project_dir(home, "acme-api"),
         lambda: project_config(home, "acme-api"),
-        lambda: project_standards(home, "acme-api"),
         lambda: run_dir(home, "add-auth"),
         lambda: trees_dir(trees, "acme-api", "add-auth"),
         lambda: worktree_dir(trees, "acme-api", "add-auth", "T-03"),
@@ -218,3 +268,11 @@ def test_the_module_does_no_io() -> None:
     source = Path(str(paths.__file__)).read_text(encoding="utf-8")
     for forbidden in ("open(", "mkdir", "exists(", "os.", "shutil"):
         assert forbidden not in source
+
+
+def test_the_module_speaks_no_workflow_vocabulary() -> None:
+    import agl.core.paths as paths
+
+    source = Path(str(paths.__file__)).read_text(encoding="utf-8").lower()
+    for word in ("ticket", "bug", "spec", "standards"):
+        assert word not in source, f"{word!r} leaked into paths.py"

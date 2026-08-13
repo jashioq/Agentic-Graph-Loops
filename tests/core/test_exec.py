@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agl.core._exec import ExecError, ExecResult, run
+from agl.core._exec import TIMEOUT_CODE, ExecError, ExecResult, run
 
 
 def python(source: str) -> list[str]:
@@ -176,6 +176,24 @@ def test_the_timeout_bounds_the_wall_clock(tmp_path: Path) -> None:
     started = time.monotonic()
     run(_sleep(30), cwd=tmp_path, check=False, timeout=0.2)
     assert time.monotonic() - started < 5
+
+
+def test_a_signal_killed_child_can_report_the_timeout_code_without_timing_out(
+    tmp_path: Path,
+) -> None:
+    # A child killed by a signal exits `-signum`, and SIGHUP is 1. The code a
+    # timeout reports is therefore not unique to a timeout, and `timed_out` is
+    # the only thing that tells the two apart — which is what the contract now
+    # says, instead of claiming no real process can produce it.
+    result = run(
+        python("import os, signal; os.kill(os.getpid(), signal.SIGHUP)"),
+        cwd=tmp_path,
+        check=False,
+        timeout=30,
+    )
+
+    assert result.code == TIMEOUT_CODE
+    assert result.timed_out is False
 
 
 # -- decoding -------------------------------------------------------------

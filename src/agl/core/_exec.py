@@ -23,8 +23,13 @@ from pathlib import Path
 __all__ = ["TIMEOUT_CODE", "ExecError", "ExecResult", "run"]
 
 TIMEOUT_CODE = -1
-"""The `code` a timed-out command is reported with. Non-zero, and not an exit
-status any process can produce, so `code == TIMEOUT_CODE` and `timed_out` agree."""
+"""The `code` a timed-out command is reported with. Non-zero, so a caller
+checking only for success still sees a failure.
+
+It is **not** unique to a timeout, and nothing here pretends otherwise: a child
+killed by a signal reports `-signum`, and SIGHUP is signal 1. `timed_out` is the
+only thing that distinguishes a hang from a command that died some other way,
+and it is what a caller reads. `code == TIMEOUT_CODE` proves nothing."""
 
 
 @dataclass(frozen=True)
@@ -68,8 +73,12 @@ def run(
     `timeout` is a wall-clock limit in seconds; `None` means wait forever. On
     expiry the child is killed and the call reports `timed_out=True` with
     `code=TIMEOUT_CODE` (-1) and whatever output was captured before the kill,
-    raising `ExecError` under `check=True` like any other failure. Reading
-    `timed_out` is how a caller tells a hang from a command that merely failed.
+    raising `ExecError` under `check=True` like any other failure.
+
+    `timed_out` is the only signal that a timeout happened, and the only one a
+    caller should read for it. The code is not: a child killed by SIGHUP exits
+    `-1` too, so `code == TIMEOUT_CODE` on a result whose `timed_out` is false
+    means a signal, not a hang.
 
     The kill reaches the direct child only, not its descendants: a build tool
     that spawns a daemon can leave one running. Process-group handling is a

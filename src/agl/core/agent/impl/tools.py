@@ -5,9 +5,9 @@ and not a subprocess: handlers keep whatever they closed over, which is how a
 caller scopes what a run can reach.
 
 One server holds all of them, named `agl`, so the model sees `mcp__agl__<name>`.
-The names are handed back alongside the server because the options builder has
-to allow every one of them — a registered tool the model may not call is a
-silent dead end.
+`MCP_PREFIX` is that namespace, derived from the server name rather than spelled
+out a second time, and the names the model will see are handed back alongside
+the server so a caller never has to reconstruct them.
 
 Two failure modes are treated as different things:
 
@@ -30,9 +30,12 @@ from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
 
 from agl.core.agent.api import Tool
 
-__all__ = ["SERVER_NAME", "build_keepalive_server", "build_tool_server"]
+__all__ = ["MCP_PREFIX", "SERVER_NAME", "build_keepalive_server", "build_tool_server"]
 
 SERVER_NAME = "agl"
+
+MCP_PREFIX = f"mcp__{SERVER_NAME}__"
+"""What MCP puts in front of every tool name this server registers."""
 
 
 def build_tool_server(
@@ -56,7 +59,7 @@ def build_tool_server(
     server = create_sdk_mcp_server(
         name=SERVER_NAME, tools=[_register(tool) for tool in tools]
     )
-    names = tuple(f"mcp__{SERVER_NAME}__{tool.name}" for tool in tools)
+    names = tuple(f"{MCP_PREFIX}{tool.name}" for tool in tools)
     return {SERVER_NAME: server}, names
 
 

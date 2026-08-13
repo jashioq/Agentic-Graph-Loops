@@ -22,6 +22,13 @@ Lines come back without their terminator, and otherwise exactly as they were:
 indentation, blank lines, and any stray `\\r` are the caller's to deal with.
 A region that never closes is dropped rather than half-reported, so a truncated
 file cannot turn into a hunk that claims text it does not have.
+
+**A marker is exactly seven characters**, and matched as such. Git writes seven
+and puts any label after a single space, so an eighth character means the line
+is content: a reStructuredText heading underline, an ASCII divider, a row of
+`=` in a comment. Matching on a prefix, one line of `========` inside the
+"ours" side flips the parser to "theirs" and mis-attributes the rest of the
+hunk — and that parse is what a conflict-classifying caller acts on.
 """
 
 from agl.core.vcs.api import ConflictHunk
@@ -44,16 +51,18 @@ def parse_conflicts(content: str) -> tuple[ConflictHunk, ...]:
 
     for line in content.split("\n"):
         marker = line.rstrip("\r")
-        if marker.startswith(START):
+        if _labeled(marker, START):
             # A second start inside a region means the first never closed.
             ours, theirs, base, section = [], [], None, "ours"
         elif not section:
             continue
-        elif marker.startswith(BASE):
+        elif _labeled(marker, BASE):
             base, section = [], "base"
-        elif marker.startswith(SEPARATOR):
+        elif marker == SEPARATOR:
+            # The separator never carries a label under any conflict style, so
+            # the whole line has to be the seven characters and nothing else.
             section = "theirs"
-        elif marker.startswith(END):
+        elif _labeled(marker, END):
             # Only a region that reached its separator has two sides to report;
             # anything else is a marker left behind by hand-editing.
             if section == "theirs":
@@ -73,3 +82,13 @@ def parse_conflicts(content: str) -> tuple[ConflictHunk, ...]:
             theirs.append(line)
 
     return tuple(hunks)
+
+
+def _labeled(line: str, marker: str) -> bool:
+    """Whether `line` is exactly `marker`, optionally followed by a label.
+
+    Git separates a marker from its label with one space, so seven characters
+    then end-of-line or a space is a marker and anything else is content — an
+    eighth `<` included.
+    """
+    return line.startswith(marker) and line[len(marker) : len(marker) + 1] in ("", " ")

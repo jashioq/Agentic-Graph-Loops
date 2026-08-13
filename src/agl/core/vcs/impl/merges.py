@@ -9,6 +9,14 @@ A conflicted merge is deliberately left in progress. The caller inspects the
 conflicts, resolves them in the worktree, and calls `commit_merge` — which
 stages what the merge had left unmerged — or `abort_merge`. Nothing here
 silently unwinds a merge on the caller's behalf.
+
+`merge` takes the tree to merge *into* as `cwd`, and for a caller that fans work
+out across worktrees the answer is the main repository root — not a worktree
+kept for merging. Git refuses to check out a branch another worktree already
+holds, so once the root has the base branch checked out no other tree can, and a
+merge worktree could never hold the branch being merged into. The root is
+already on the base branch, the working trees are untouched either way, and a
+conflict halt leaves the markers where someone looking to resolve them would go.
 """
 
 from pathlib import Path
@@ -22,7 +30,7 @@ __all__ = ["MergeOps"]
 
 
 class MergeOps(GitRunner):
-    """Committing an agent's work, diffing it, and merging it back."""
+    """Committing what a tree holds, diffing it, and merging it back."""
 
     # -- commits ----------------------------------------------------------
 
@@ -32,7 +40,7 @@ class MergeOps(GitRunner):
     def commit_all(self, cwd: Path, message: str) -> str | None:
         if not self.has_changes(cwd):
             # Asked first rather than letting `git commit` fail on an empty
-            # commit: "the agent changed nothing" is an answer, not a failure.
+            # commit: "nothing changed in this tree" is an answer, not a failure.
             return None
         self._run(["add", "-A"], cwd)
         result = self._run(["commit", "-m", message], cwd, check=False)

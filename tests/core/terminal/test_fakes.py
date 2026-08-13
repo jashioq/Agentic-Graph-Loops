@@ -103,7 +103,7 @@ async def test_frames_track_changing_state() -> None:
     status = "pending"
 
     def build() -> Screen:
-        return Screen(header=None, content=Rows(Row(Text(status))), footer=None)
+        return Screen(Rows(Row(Text(status))))
 
     terminal = HeadlessTerminal(clock=lambda: 0.0)
     async with terminal.live(build) as session:

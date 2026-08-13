@@ -5,6 +5,7 @@ reproducible, and the target project must contribute source code and nothing
 else. Each assertion here is one way that could quietly stop being true.
 """
 
+from dataclasses import fields
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,6 @@ FULL = AgentSpec(
     role="implement",
     system_prompt_append="House rules go here.",
     add_dirs=(Path("/other"), Path("/third")),
-    allowed_tools=("Read", "Edit"),
     disallowed_tools=("WebFetch",),
     permission_mode="acceptEdits",
     model="claude-sonnet-4-5",
@@ -33,11 +33,10 @@ FULL = AgentSpec(
 
 
 def build(spec: AgentSpec = MINIMAL, **overrides: Any) -> ClaudeAgentOptions:
-    """`build_options` with the three arguments a test is not exercising defaulted."""
+    """`build_options` with the two arguments a test is not exercising defaulted."""
     arguments: dict[str, Any] = {
         "settings_path": None,
         "mcp_servers": {},
-        "tool_names": (),
     }
     arguments.update(overrides)
     return build_options(spec, **arguments)
@@ -121,26 +120,30 @@ def test_the_settings_path_is_passed_as_an_absolute_string() -> None:
 # -- tools -----------------------------------------------------------------
 
 
-def test_custom_tool_names_are_merged_into_allowed_tools() -> None:
-    spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", allowed_tools=("Read",))
-    options = build(spec, tool_names=("mcp__agl__add", "mcp__agl__echo"))
-
-    assert options.allowed_tools == ["Read", "mcp__agl__add", "mcp__agl__echo"]
-
-
-def test_a_registered_tool_the_model_may_not_call_is_a_silent_dead_end() -> None:
-    # So every registered name is allowed even when the spec listed none.
-    options = build(MINIMAL, tool_names=("mcp__agl__add",))
-    assert options.allowed_tools == ["mcp__agl__add"]
+def test_nothing_is_ever_pre_allowed() -> None:
+    # `can_use_tool` allows every tool that is not the question tool, so an
+    # allow rule only skips a round trip — and for `AskUserQuestion` it skips
+    # the callback that carries the answers.
+    assert build(MINIMAL).allowed_tools == []
+    assert build(FULL).allowed_tools == []
 
 
-def test_no_tools_does_not_read_as_allow_nothing() -> None:
-    options = build(MINIMAL, tool_names=())
-
-    assert options.allowed_tools == []
+def test_leaving_allowed_tools_empty_does_not_read_as_allow_nothing() -> None:
     # `tools` is what restricts the built-in set; leaving it unset keeps the
     # Claude Code defaults, whereas `[]` would strip every built-in tool.
-    assert options.tools is None
+    assert build(MINIMAL).tools is None
+
+
+def test_disallowed_tools_are_kept() -> None:
+    # Deny rules resolve ahead of the callback and hold even under
+    # `bypassPermissions`, and their pattern language is the CLI's.
+    spec = AgentSpec(
+        prompt="p",
+        cwd=Path("/repo"),
+        role="r",
+        disallowed_tools=("WebFetch", "Bash(git commit:*)"),
+    )
+    assert build(spec).disallowed_tools == ["WebFetch", "Bash(git commit:*)"]
 
 
 def test_the_server_mapping_is_passed_through_untouched() -> None:
@@ -167,51 +170,13 @@ def test_an_unknown_permission_mode_is_refused_here() -> None:
         build(spec)
 
 
-# -- allowing the question tool outright is refused ------------------------
+# -- the question tool cannot be pre-allowed by accident -------------------
 
 
-def allowing(*entries: str) -> AgentSpec:
-    return AgentSpec(prompt="p", cwd=Path("/repo"), role="r", allowed_tools=entries)
-
-
-@pytest.mark.parametrize(
-    "entry", ["AskUserQuestion", "AskUserQuestion()", "AskUserQuestion(*)"]
-)
-def test_allowing_the_question_tool_as_a_whole_is_refused(entry: str) -> None:
-    # An allow rule is matched before the permission callback is consulted, and
-    # the callback is the only thing that injects the answers. Allowing the tool
-    # gets it approved with nothing in it, silently.
-    with pytest.raises(ValueError, match="AskUserQuestion"):
-        build(allowing(entry))
-
-
-def test_the_refusal_says_what_allowing_it_would_cost() -> None:
-    with pytest.raises(ValueError) as raised:
-        build(allowing("AskUserQuestion"))
-
-    message = str(raised.value)
-    assert "AskUserQuestion" in message
-    # Why, not just what: the callback never fires, and the answers ride on it.
-    assert "callback" in message
-    assert "answers" in message
-
-
-def test_it_is_found_wherever_it_sits_in_the_list() -> None:
-    with pytest.raises(ValueError, match="AskUserQuestion"):
-        build(allowing("Read", "Edit", "AskUserQuestion"))
-
-
-def test_allowing_any_other_tool_as_a_whole_is_left_alone() -> None:
-    # This is only about the one tool whose answers ride on the callback.
-    assert build(allowing("Read")).allowed_tools == ["Read"]
-
-
-def test_a_narrowed_entry_is_not_a_whole_tool_allow() -> None:
-    # A specifier leaves non-matching calls falling through to the callback, so
-    # it does not disable asking.
-    entry = "Bash(AskUserQuestion:*)"
-    assert build(allowing(entry)).allowed_tools == [entry]
-
-
-def test_a_spec_that_allows_nothing_is_fine() -> None:
-    assert build(MINIMAL).allowed_tools == []
+def test_there_is_no_way_to_allow_the_question_tool() -> None:
+    # Allowing `AskUserQuestion` outright would approve the call with no answers
+    # in it — an allow rule resolves before `can_use_tool`, and the callback is
+    # what injects them. There is no allow list to put it on, so the footgun is
+    # unreachable rather than guarded.
+    assert "allowed_tools" not in {field.name for field in fields(AgentSpec)}
+    assert build(FULL).allowed_tools == []

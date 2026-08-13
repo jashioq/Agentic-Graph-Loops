@@ -19,7 +19,16 @@ from collections.abc import Iterator
 import pytest
 from rich.console import Console
 
-from agl.core.terminal import Answer, Option, Question, Row, Rows, Screen, Text
+from agl.core.terminal import (
+    Answer,
+    Option,
+    Question,
+    Row,
+    Rows,
+    Screen,
+    TerminalError,
+    Text,
+)
 from agl.core.terminal.impl.rich_terminal import RichTerminal
 
 _TIMEOUT = 5.0
@@ -71,7 +80,7 @@ def make_terminal_from(stdin: Iterator[str]) -> tuple[RichTerminal, io.StringIO]
 
 
 def build_screen() -> Screen:
-    return Screen(header=None, content=Rows(Row(Text("dashboard"))), footer=None)
+    return Screen(Rows(Row(Text("dashboard"))))
 
 
 async def drain_ready_tasks() -> None:
@@ -98,8 +107,32 @@ async def test_surrounding_whitespace_is_ignored() -> None:
     assert await ask("  2  ") == Answer("In-memory only", was_free_text=False)
 
 
-async def test_an_out_of_range_number_is_taken_as_free_text() -> None:
-    assert await ask("9") == Answer("9", was_free_text=True)
+async def test_an_out_of_range_number_reprompts_rather_than_becoming_an_answer() -> None:
+    # With three options, `9` is a mistyped selection, not a considered reply.
+    # Handing "9" to an agent as the user's own words is worse than asking again.
+    assert await ask("9", "2") == Answer("In-memory only", was_free_text=False)
+
+
+async def test_zero_reprompts_too() -> None:
+    assert await ask("0", "1") == Answer("DataStore", was_free_text=False)
+
+
+async def test_the_reprompt_says_what_would_be_accepted() -> None:
+    terminal, buffer = make_terminal("9", "1")
+    async with terminal.live(build_screen) as session:
+        await session.ask(QUESTION)
+
+    assert "between 1 and 4" in buffer.getvalue()
+
+
+@pytest.mark.parametrize("reply", ["²", "³", "½", "Ⅳ"])
+async def test_a_digit_character_int_cannot_parse_is_free_text_not_a_crash(
+    reply: str,
+) -> None:
+    # `str.isdigit` says yes to superscripts and other numerics that `int`
+    # refuses, so the check has to be `isdecimal`. Anything outside it is just
+    # something the user typed.
+    assert await ask(reply) == Answer(reply, was_free_text=True)
 
 
 async def test_the_other_entry_reprompts_for_text() -> None:
@@ -232,7 +265,7 @@ async def test_a_changed_frame_is_printed_again() -> None:
             # Set before the frame is written, but a waiter cannot resume until
             # `paint` returns: nothing between here and the write awaits.
             rebuilt.set()
-        return Screen(header=None, content=Rows(Row(Text(status))), footer=None)
+        return Screen(Rows(Row(Text(status))))
 
     terminal, buffer = make_terminal()
     async with terminal.live(build, fps=100):
@@ -354,6 +387,36 @@ async def test_the_dashboard_resumes_after_a_question() -> None:
         assert calls > before
 
 
-async def test_exhausted_scripted_input_raises() -> None:
-    with pytest.raises(EOFError):
+async def test_exhausted_stdin_raises_the_modules_own_error() -> None:
+    # A run on piped stdin dies at its first question. That it dies is the
+    # contract; what it must not do is die with an exception the ABC never
+    # mentioned, from a module that had no typed error at all.
+    with pytest.raises(TerminalError):
         await ask()
+
+
+async def test_exhausted_stdin_during_a_free_text_reprompt_raises_too() -> None:
+    with pytest.raises(TerminalError):
+        await ask("4")
+
+
+async def test_the_error_is_not_an_eof_error_escaping_by_another_name() -> None:
+    assert not issubclass(TerminalError, EOFError)
+
+
+@pytest.mark.parametrize("fps", [0, -1])
+async def test_a_non_positive_fps_is_refused_rather_than_dividing_by_zero(
+    fps: int,
+) -> None:
+    terminal, _ = make_terminal()
+    with pytest.raises(ValueError, match="fps"):
+        terminal.live(build_screen, fps=fps)
+
+
+async def test_a_screen_with_only_content_paints() -> None:
+    terminal, buffer = make_terminal()
+
+    async with terminal.live(lambda: Screen(Rows(Row(Text("bare"))))):
+        pass
+
+    assert "bare" in buffer.getvalue()

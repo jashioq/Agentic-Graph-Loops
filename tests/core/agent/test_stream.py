@@ -10,8 +10,8 @@ from typing import Any
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent import AgentError
-from agl.core.agent.impl.stream import fold, summarise_tool_use
+from agl.core.agent import AgentBudgetError, AgentError
+from agl.core.agent.impl.stream import fold, summarize_tool_use
 
 
 def assistant(*blocks: Any, session_id: str | None = None) -> AssistantMessage:
@@ -134,7 +134,6 @@ async def test_the_result_fields_map_onto_the_agent_result() -> None:
     assert folded.num_turns == 3
     assert folded.duration_ms == 1200
     assert folded.terminal_reason == "completed"
-    assert folded.is_error is False
 
 
 async def test_a_missing_cost_reads_as_nothing_spent() -> None:
@@ -142,22 +141,46 @@ async def test_a_missing_cost_reads_as_nothing_spent() -> None:
     assert folded.cost_usd == 0.0
 
 
-async def test_an_error_result_is_carried_through_rather_than_raised() -> None:
-    # Deciding what an error means is the caller's, and a result that reports a
-    # failure still carries what it cost.
-    folded = await fold(
-        stream(said("nope"), result(is_error=True, subtype="error_during_execution")),
-        None,
-        False,
-    )
-
-    assert folded.is_error is True
-    assert folded.text == "nope"
+async def test_an_error_result_raises_rather_than_coming_back_as_a_success() -> None:
+    # An execution error is the most common way an SDK run fails. Handing it
+    # back as a result is what let it past the retry ladder.
+    with pytest.raises(AgentError, match="error_during_execution"):
+        await fold(
+            stream(said("nope"), result(is_error=True, subtype="error_during_execution")),
+            None,
+            False,
+        )
 
 
-async def test_an_exhaustion_subtype_becomes_the_terminal_reason() -> None:
+async def test_the_error_carries_whatever_the_result_said_went_wrong() -> None:
+    with pytest.raises(AgentError, match="the tool call blew up"):
+        await fold(
+            stream(
+                result(
+                    is_error=True,
+                    subtype="error_during_execution",
+                    result="the tool call blew up",
+                )
+            ),
+            None,
+            False,
+        )
+
+
+async def test_an_error_result_is_not_a_budget_error() -> None:
+    with pytest.raises(AgentError) as raised:
+        await fold(
+            stream(result(is_error=True, subtype="error_during_execution")), None, False
+        )
+
+    assert not isinstance(raised.value, AgentBudgetError)
+
+
+async def test_an_exhaustion_result_is_left_for_the_caller_to_classify() -> None:
     # `terminal_reason` is absent on older CLIs and says nothing about budget on
     # newer ones, so the subtype is the specific answer when it names a limit.
+    # Exhaustion is not retryable and the caller says so with its own error, so
+    # it comes back as a result rather than being raised here.
     folded = await fold(
         stream(said("…"), result(is_error=True, subtype="error_max_budget_usd")),
         None,
@@ -165,6 +188,14 @@ async def test_an_exhaustion_subtype_becomes_the_terminal_reason() -> None:
     )
 
     assert folded.terminal_reason == "error_max_budget_usd"
+
+
+async def test_a_turn_limit_result_is_left_alone_too() -> None:
+    folded = await fold(
+        stream(said("…"), result(is_error=True, subtype="error_max_turns")), None, False
+    )
+
+    assert folded.terminal_reason == "error_max_turns"
 
 
 async def test_an_ordinary_subtype_leaves_the_terminal_reason_alone() -> None:
@@ -214,7 +245,7 @@ async def test_a_stream_that_ends_without_a_result_raises() -> None:
         await fold(stream(said("half a thought")), None, False)
 
 
-# -- summarise_tool_use ----------------------------------------------------
+# -- summarize_tool_use ----------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -233,30 +264,30 @@ async def test_a_stream_that_ends_without_a_result_raises() -> None:
 def test_each_common_tool_gets_its_subject(
     name: str, tool_input: dict[str, Any], expected: str
 ) -> None:
-    assert summarise_tool_use(name, tool_input) == expected
+    assert summarize_tool_use(name, tool_input) == expected
 
 
 def test_a_custom_tool_loses_the_namespace() -> None:
-    assert summarise_tool_use("mcp__agl__echo", {"text": "hello"}) == "echo hello"
+    assert summarize_tool_use("mcp__agl__echo", {"text": "hello"}) == "echo hello"
 
 
 def test_a_custom_tool_with_no_parameters_is_just_its_name() -> None:
-    assert summarise_tool_use("mcp__agl__get_document", {}) == "get_document"
+    assert summarize_tool_use("mcp__agl__get_document", {}) == "get_document"
 
 
 def test_an_input_with_no_obvious_subject_falls_back_to_the_bare_name() -> None:
-    assert summarise_tool_use("TodoWrite", {"todos": [1, 2, 3]}) == "TodoWrite"
+    assert summarize_tool_use("TodoWrite", {"todos": [1, 2, 3]}) == "TodoWrite"
 
 
 def test_a_multi_line_command_stays_on_one_line() -> None:
-    summary = summarise_tool_use("Bash", {"command": "cd src\nmake test"})
+    summary = summarize_tool_use("Bash", {"command": "cd src\nmake test"})
     assert "\n" not in summary
     assert summary == "Bash cd src make test"
 
 
 def test_a_long_path_is_truncated_in_the_middle_so_the_filename_survives() -> None:
     path = "src/main/kotlin/com/example/deeply/nested/package/TokenStoreImpl.kt"
-    summary = summarise_tool_use("Edit", {"file_path": path})
+    summary = summarize_tool_use("Edit", {"file_path": path})
 
     assert len(summary) <= 60
     assert summary.startswith("Edit src/")

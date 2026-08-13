@@ -6,19 +6,26 @@ repaint task calls `build()` at `1/fps` and renders whatever it returns, so a
 
 A question takes the whole screen: the live display stops, the question is
 printed, stdin is read on a worker thread so the event loop keeps running, and
-the display is restored. A lock serialises concurrent askers into a FIFO queue.
+the display is restored. A lock serializes concurrent askers into a FIFO queue.
 
 When the console cannot animate — piped output, a dumb terminal — there is no
 display to update, so frames are printed as they change instead.
 
 A `build()` that raises becomes an error frame rather than a dead repaint task:
 the display keeps moving, the failure is on screen, and the next tick retries.
+
+Nothing about reading an answer is allowed to fail a run. Blank input and a
+number outside the offered range are re-prompted; anything that is not a plain
+decimal number is taken as the user's own words. The one thing that cannot be
+recovered from is stdin having nothing left in it, and that raises
+`TerminalError` — the module's only exception, and not the `EOFError` that used
+to escape from here undocumented.
 """
 
 import asyncio
 import time
 from collections.abc import AsyncIterator, Callable, Iterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 from rich.console import Console
 from rich.live import Live
@@ -33,6 +40,7 @@ from agl.core.terminal.api import (
     Rows,
     Screen,
     Terminal,
+    TerminalError,
     Text,
 )
 from agl.core.terminal.impl.render import to_renderable
@@ -46,7 +54,7 @@ _OTHER_LABEL = "Other… (type your answer)"
 def _error_screen(error: Exception) -> Screen:
     """The frame shown in place of one `build()` failed to produce."""
     message = Text(f"frame failed: {type(error).__name__}: {error}", Color.BOLD_RED)
-    return Screen(header=None, content=Rows(Row(message)), footer=None)
+    return Screen(Rows(Row(message)))
 
 
 class RichTerminal(Terminal):
@@ -57,11 +65,22 @@ class RichTerminal(Terminal):
         self._console = console if console is not None else Console()
         self._stdin = stdin
 
-    @asynccontextmanager
-    async def live(
+    def live(
         self, build: Callable[[], Screen], fps: int = 4
+    ) -> AbstractAsyncContextManager[LiveSession]:
+        """Repaint `build()` at `fps` for as long as the context is open.
+
+        Checked here rather than inside the context manager's body, so a caller
+        that passes nonsense hears about it at the call and not on entry.
+        """
+        if fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
+        return self._live(build, fps)
+
+    @asynccontextmanager
+    async def _live(
+        self, build: Callable[[], Screen], fps: int
     ) -> AsyncIterator[LiveSession]:
-        """Repaint `build()` at `fps` for as long as the context is open."""
         # Not transient: the last frame of a run is worth keeping on screen.
         display = Live(console=self._console, auto_refresh=False, transient=False)
         session = _RichLiveSession(display, self._console, self._read_line)
@@ -179,18 +198,32 @@ class _RichLiveSession(LiveSession):
         self._console.print()
 
     async def _read_answer(self, question: Question) -> Answer:
-        """Loop until the input means something. Empty input re-prompts."""
+        """Loop until the input means something.
+
+        Blank input re-prompts, and so does a number outside the range on
+        screen: with three options, `9` is a slip, and returning `Answer("9")`
+        would hand an agent a digit as though the user had meant to say it.
+
+        `isdecimal` rather than `isdigit`, because `isdigit` says yes to
+        superscripts and other numerics that `int` then refuses — `"²"` used to
+        get a `ValueError` out of here. Anything that is not a plain decimal
+        number is what the user typed, and comes straight back.
+        """
         while True:
             reply = await self._read()
             if not reply:
                 continue
-            if reply.isdigit():
-                number = int(reply)
-                if 1 <= number <= len(question.options):
-                    return Answer(question.options[number - 1].label, was_free_text=False)
-                if number == self._other_number(question):
-                    return Answer(await self._read_free_text(), was_free_text=True)
-            return Answer(reply, was_free_text=True)
+            if not reply.isdecimal():
+                return Answer(reply, was_free_text=True)
+
+            number = int(reply)
+            if 1 <= number <= len(question.options):
+                return Answer(question.options[number - 1].label, was_free_text=False)
+            if number == self._other_number(question):
+                return Answer(await self._read_free_text(), was_free_text=True)
+            self._console.print(
+                RichText(f"Please enter a number between 1 and {self._other_number(question)}.")
+            )
 
     async def _read_free_text(self) -> str:
         self._console.print(RichText("Your answer:"))
@@ -200,9 +233,21 @@ class _RichLiveSession(LiveSession):
                 return reply
 
     async def _read(self) -> str:
-        """Read one line off the event loop, so the rest of the run keeps going."""
+        """Read one line off the event loop, so the rest of the run keeps going.
+
+        Raises `TerminalError` when there is nothing left to read. Both sources
+        report that as `EOFError` — `input()` on a closed stdin, and the
+        scripted iterator when it runs out — and it is the one thing here a
+        re-prompt cannot fix.
+        """
         loop = asyncio.get_running_loop()
-        return (await loop.run_in_executor(None, self._read_line)).strip()
+        try:
+            line = await loop.run_in_executor(None, self._read_line)
+        except EOFError as error:
+            raise TerminalError(
+                "cannot read an answer: standard input is exhausted or closed"
+            ) from error
+        return line.strip()
 
     @staticmethod
     def _other_number(question: Question) -> int:

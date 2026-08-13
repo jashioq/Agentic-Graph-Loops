@@ -24,9 +24,9 @@ from claude_agent_sdk import (
 
 # Private, and imported on purpose: it is the function the SDK itself calls to
 # decide whether to warn about a shadowed callback, so a test that calls it
-# tests the real emission rather than a guess at its wording. If the SDK renames
-# it, the message our filter matches has very likely changed too, and this
-# failing is how we find out.
+# tests the real emission rather than a guess at it. Nothing is pre-allowed any
+# more, and this is what proves there is genuinely nothing to warn about rather
+# than a warning being swallowed somewhere.
 from claude_agent_sdk.types import _warn_if_can_use_tool_shadowed
 
 from agl.core.agent import (
@@ -179,7 +179,38 @@ async def test_a_spec_with_tools_produces_options_carrying_the_server() -> None:
 
     (options,) = query.options
     assert set(options.mcp_servers) == {"agl"}
-    assert options.allowed_tools == ["mcp__agl__add"]
+
+
+async def test_a_custom_tool_is_callable_without_being_pre_allowed() -> None:
+    # Nothing goes into `allowed_tools` any more. The permission callback allows
+    # every tool that is not the question tool, so a registered tool is callable
+    # by the only route that decides: one round trip, and yes.
+    query = StubQuery(messages())
+    spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", tools=(adding(),))
+
+    await ClaudeRunner(query_fn=query).run(spec)
+
+    (options,) = query.options
+    assert options.allowed_tools == []
+    decision = await ask(options, "mcp__agl__add", {"a": 1, "b": 2})
+    assert isinstance(decision, PermissionResultAllow)
+
+
+async def test_disallowed_tools_still_reach_the_options() -> None:
+    # The asymmetry is deliberate: a deny rule resolves ahead of the callback
+    # and holds even under `bypassPermissions`, and its pattern language is the
+    # CLI's, not something worth rebuilding in Python.
+    query = StubQuery(messages())
+    spec = AgentSpec(
+        prompt="p",
+        cwd=Path("/repo"),
+        role="r",
+        disallowed_tools=("WebFetch", "Bash(git commit:*)"),
+    )
+
+    await ClaudeRunner(query_fn=query).run(spec)
+
+    assert query.options[0].disallowed_tools == ["WebFetch", "Bash(git commit:*)"]
 
 
 async def test_a_spec_with_no_tools_still_gets_a_server() -> None:
@@ -203,12 +234,32 @@ async def test_the_settings_path_reaches_the_options() -> None:
     assert query.options[0].settings == "/etc/agl.json"
 
 
-# -- the shadowing warning -------------------------------------------------
-#
-# Our own MCP tools are in `allowed_tools`, which auto-approves them ahead of
-# `can_use_tool` — the SDK calls that shadowing and says so on stderr. For our
-# tools it is deliberate; the warning is not, because stderr belongs to
-# `rich.Live` once a dashboard is up.
+async def test_a_relative_settings_path_reaches_the_options_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `cwd` is the target repository. A relative settings path would resolve
+    # inside it, so the module whose job is sealing that repo out would read
+    # its settings from it.
+    monkeypatch.chdir(tmp_path)
+    query = StubQuery(messages())
+
+    await ClaudeRunner(settings_path=Path("agl-settings.json"), query_fn=query).run(SPEC)
+
+    settings = query.options[0].settings
+    assert settings is not None
+    assert Path(settings).is_absolute()
+    assert Path(settings).parent == Path.cwd()
+    assert Path(settings).name == "agl-settings.json"
+
+
+# -- no global state is touched --------------------------------------------
+
+
+def adding() -> Tool:
+    async def handler(arguments: dict[str, Any]) -> str:
+        return "4"
+
+    return Tool(name="add", description="Add", schema={}, handler=handler)
 
 
 class WarningQuery(StubQuery):
@@ -224,74 +275,41 @@ class WarningQuery(StubQuery):
         return super().__call__(prompt=prompt, options=options)
 
 
-def adding() -> Tool:
-    async def handler(arguments: dict[str, Any]) -> str:
-        return "4"
-
-    return Tool(name="add", description="Add", schema={}, handler=handler)
-
-
-async def test_shadowing_by_our_own_tools_is_not_reported() -> None:
+async def test_a_run_warns_about_nothing_because_it_shadows_nothing() -> None:
+    # Nothing is pre-allowed any more, so the SDK has no shadowing to report and
+    # there is no warning to suppress.
     spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", tools=(adding(),))
 
     with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         await ClaudeRunner(query_fn=WarningQuery(messages())).run(spec)
 
     assert [w for w in caught if issubclass(w.category, CanUseToolShadowedWarning)] == []
 
 
-async def test_a_run_with_no_tools_reports_nothing_either() -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        await ClaudeRunner(query_fn=WarningQuery(messages())).run(SPEC)
+async def test_a_run_installs_no_process_wide_warning_filter() -> None:
+    # The filters are global and agent runs overlap. A module that mutates them
+    # for the lifetime of a run is hiding warnings nobody asked it to hide.
+    spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", tools=(adding(),))
+    before = list(warnings.filters)
 
-    assert [w for w in caught if issubclass(w.category, CanUseToolShadowedWarning)] == []
+    await ClaudeRunner(query_fn=StubQuery(messages())).run(spec)
 
-
-async def test_shadowing_by_a_tool_we_did_not_register_is_still_reported() -> None:
-    # The suppression is matched on the message, not the category: a spec that
-    # allows `Read` outright really has disabled the callback for `Read`, and
-    # that is information we did not have before.
-    spec = AgentSpec(
-        prompt="p", cwd=Path("/repo"), role="r", allowed_tools=("Read",), tools=(adding(),)
-    )
-
-    with warnings.catch_warnings(record=True) as caught:
-        await ClaudeRunner(query_fn=WarningQuery(messages())).run(spec)
-
-    shadowing = [w for w in caught if issubclass(w.category, CanUseToolShadowedWarning)]
-    assert len(shadowing) == 1
-    assert "Read" in str(shadowing[0].message)
+    assert list(warnings.filters) == before
 
 
 async def test_bypass_permissions_is_still_reported() -> None:
-    # A different message, and a real problem: under `bypassPermissions` the
+    # A real problem, and the SDK's to report: under `bypassPermissions` the
     # callback never fires for anything, so the run cannot ask a question at all.
     spec = AgentSpec(
         prompt="p", cwd=Path("/repo"), role="r", permission_mode="bypassPermissions"
     )
 
     with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         await ClaudeRunner(query_fn=WarningQuery(messages())).run(spec)
 
     assert [w for w in caught if issubclass(w.category, CanUseToolShadowedWarning)]
-
-
-async def test_the_suppression_does_not_outlive_what_it_was_for() -> None:
-    # Anyone else's shadowing warning, after a run has installed the filter, is
-    # still shown.
-    spec = AgentSpec(prompt="p", cwd=Path("/repo"), role="r", tools=(adding(),))
-
-    with warnings.catch_warnings(record=True) as caught:
-        await ClaudeRunner(query_fn=WarningQuery(messages())).run(spec)
-        warnings.warn(
-            "can_use_tool will not be invoked for: SomeoneElsesTool.",
-            CanUseToolShadowedWarning,
-            stacklevel=1,
-        )
-
-    assert [str(w.message) for w in caught] == [
-        "can_use_tool will not be invoked for: SomeoneElsesTool."
-    ]
 
 
 # -- questions -------------------------------------------------------------
@@ -439,7 +457,7 @@ async def test_no_handler_denies_rather_than_hanging() -> None:
     decision = await ask(query.options[0], "AskUserQuestion", QUESTION_INPUT)
 
     assert isinstance(decision, PermissionResultDeny)
-    assert "judgement" in decision.message
+    assert "judgment" in decision.message
     assert decision.interrupt is False
 
 
@@ -542,10 +560,38 @@ async def test_the_budget_error_says_which_limit_was_hit() -> None:
         await ClaudeRunner(query_fn=query).run(SPEC)
 
 
-async def test_an_ordinary_error_result_is_returned_not_raised() -> None:
-    query = StubQuery(messages(subtype="error_during_execution", is_error=True))
+# -- an error result is a failure, and failures are retried -----------------
+
+
+async def test_an_error_result_is_retried_rather_than_returned() -> None:
+    # The most common SDK failure class. Returning it as a success is the ABC
+    # breaking its own promise to raise when a run could not be completed.
+    query = StubQuery(
+        messages(subtype="error_during_execution", is_error=True), messages("second time")
+    )
 
     result = await ClaudeRunner(query_fn=query).run(SPEC)
 
-    assert result.is_error is True
-    assert query.calls == 1
+    assert result.text == "second time"
+    assert query.calls == 2
+
+
+async def test_three_error_results_exhaust_the_attempts() -> None:
+    query = StubQuery(messages(subtype="error_during_execution", is_error=True))
+
+    with pytest.raises(AgentError) as raised:
+        await ClaudeRunner(query_fn=query).run(SPEC)
+
+    assert query.calls == 3
+    assert "error_during_execution" in str(raised.value)
+
+
+async def test_the_error_raised_for_an_error_result_is_not_a_budget_error() -> None:
+    # Retryability is the whole distinction, and `AgentBudgetError` is the one
+    # thing the ladder refuses to retry.
+    query = StubQuery(messages(subtype="error_during_execution", is_error=True))
+
+    with pytest.raises(AgentError) as raised:
+        await ClaudeRunner(max_attempts=1, query_fn=query).run(SPEC)
+
+    assert not isinstance(raised.value, AgentBudgetError)

@@ -65,7 +65,7 @@ def collide(root: Path, template: Path, base: str, ours: str, theirs: str) -> Co
 
     branches = []
     for ticket, content in (("T-01", ours), ("T-02", theirs)):
-        branch = paths.ticket_branch(LABEL, ticket)
+        branch = paths.branch(LABEL, ticket)
         tree = vcs.add_worktree(
             paths.worktree_dir(root / "trees", PROJECT, LABEL, ticket), branch, "main"
         )

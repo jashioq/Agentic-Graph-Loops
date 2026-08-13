@@ -7,61 +7,72 @@ is what keeps `store` and `vcs` free of any config knowledge.
 
 The layout::
 
-    <home>/projects/<project>/                    project config and standards
-    <home>/runs/<label>/                          run artifacts
-    <trees_root>/<project>/<label>/<ticket_id>/   one worktree per ticket
+    <home>/projects/<project>/                  AGL's own settings for a project
+    <home>/runs/<label>/                        one run's artifacts
+    <trees_root>/<project>/<label>/<node_id>/   one worktree per node
 
 Worktrees sit outside both the orchestrator repo and the target repo, and the
 trees root is supplied by the caller rather than derived from the home, so it
 stays configurable.
 
-There is no merge worktree here, and that is a decision rather than an omission:
-merges happen in the main repository root. Git refuses to check out a branch
-that another worktree already holds, and the base branch is checked out in the
-main repository, so a merge worktree could never hold the branch being merged
-into. The root is already on the base branch, ticket worktrees are untouched
-either way, and a conflict halt leaves the markers where someone looking to
-resolve them would go.
+Branches are `agl/<label>/<node_id>` — exactly one level below the namespace,
+never deeper. Git stores refs as files, so `agl/add-auth/N-03` existing as a
+file rules out anything at `agl/add-auth/N-03/…`; one path cannot be both a
+file and a directory. A workflow that derives a node from another one composes
+the id itself, hyphenated, and node-id validation refusing `/` is what keeps the
+derived branch a sibling rather than an impossible child. Filesystem paths carry
+no such constraint and nest freely. The `agl/` prefix keeps a user's own branch
+named exactly the label clear of everything this tool creates and deletes.
 
-Branches are `agl/<label>/<ticket_id>`, with bug branches as hyphenated
-siblings: `agl/<label>/<ticket_id>-bug-<n>`. Git stores refs as files, so
-`agl/add-auth/T-03` being a file rules out `agl/add-auth/T-03/bug-1` — one path
-cannot be both a file and a directory. Filesystem paths carry no such
-constraint and nest freely. The `agl/` prefix keeps a user's own branch named
-exactly the label clear of everything this tool creates and deletes.
+Three names reach both a filesystem path and a git ref: `label`, `project`, and
+`node_id`. Each is validated by every function that takes it, so a name that
+would escape its directory or nest a ref is refused here rather than discovered
+as a git error several steps later.
 """
 
 import re
 from pathlib import Path
 
 __all__ = [
-    "InvalidLabelError",
+    "BRANCH_PREFIX",
+    "InvalidNameError",
+    "branch",
     "branch_namespace",
-    "bug_branch",
     "project_config",
     "project_dir",
-    "project_standards",
     "run_dir",
-    "ticket_branch",
     "trees_dir",
     "validate_label",
+    "validate_node_id",
+    "validate_project",
     "worktree_dir",
 ]
 
 BRANCH_PREFIX = "agl"
 
-_LABEL = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
+# One shape, two character sets. Both refuse everything that would escape a
+# directory or nest a ref; they differ only on case, and only because a label
+# and a project are typed by a person — on a case-insensitive filesystem
+# `Add-Auth` and `add-auth` are one directory, and two runs would share it. A
+# node id is composed by a workflow from a single scheme, so it never produces
+# both spellings of one id and keeps its capitals.
+_SUPPLIED = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
+_COMPOSED = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*\Z")
+
+_LOWER_ONLY = "lowercase letters, digits, and hyphens"
+_ANY_CASE = "letters, digits, and hyphens"
 
 
-class InvalidLabelError(Exception):
-    """Raised when a run label would be illegal as a path segment or a git ref."""
+class InvalidNameError(Exception):
+    """Raised when a name would be illegal as a path segment or a git ref."""
 
 
 # -- the home layout ------------------------------------------------------
 
 
 def project_dir(home: Path, project: str) -> Path:
-    """The directory holding one project's configuration and standards."""
+    """The directory holding AGL's own configuration for one project."""
+    validate_project(project)
     return home / "projects" / project
 
 
@@ -70,13 +81,9 @@ def project_config(home: Path, project: str) -> Path:
     return project_dir(home, project) / "config.toml"
 
 
-def project_standards(home: Path, project: str) -> Path:
-    """The project's `standards.md`, handed to agents as context."""
-    return project_dir(home, project) / "standards.md"
-
-
 def run_dir(home: Path, label: str) -> Path:
-    """The directory holding one run's artifacts — `spec.md`, `tickets.json`."""
+    """The directory holding one run's artifacts, whatever a workflow puts there."""
+    validate_label(label)
     return home / "runs" / label
 
 
@@ -85,12 +92,15 @@ def run_dir(home: Path, label: str) -> Path:
 
 def trees_dir(trees_root: Path, project: str, label: str) -> Path:
     """The directory holding every worktree for one run of one project."""
+    validate_project(project)
+    validate_label(label)
     return trees_root / project / label
 
 
-def worktree_dir(trees_root: Path, project: str, label: str, ticket_id: str) -> Path:
-    """The worktree a single ticket is worked in."""
-    return trees_dir(trees_root, project, label) / ticket_id
+def worktree_dir(trees_root: Path, project: str, label: str, node_id: str) -> Path:
+    """The worktree one node's work is done in."""
+    validate_node_id(node_id)
+    return trees_dir(trees_root, project, label) / node_id
 
 
 # -- branches -------------------------------------------------------------
@@ -98,34 +108,42 @@ def worktree_dir(trees_root: Path, project: str, label: str, ticket_id: str) -> 
 
 def branch_namespace(label: str) -> str:
     """`agl/<label>` — the prefix a clean deletes, and nothing outside it."""
+    validate_label(label)
     return f"{BRANCH_PREFIX}/{label}"
 
 
-def ticket_branch(label: str, ticket_id: str) -> str:
-    """The branch a ticket's work lands on: `agl/<label>/<ticket_id>`."""
-    return f"{branch_namespace(label)}/{ticket_id}"
-
-
-def bug_branch(label: str, parent_ticket_id: str, n: int) -> str:
-    """The nth bug branch off a ticket: `agl/<label>/<ticket_id>-bug-<n>`.
-
-    A sibling of its parent branch rather than a child of it, because a git ref
-    that exists as a file cannot also be a directory.
-    """
-    return f"{branch_namespace(label)}/{parent_ticket_id}-bug-{n}"
+def branch(label: str, node_id: str) -> str:
+    """The branch one node's work lands on: `agl/<label>/<node_id>`."""
+    validate_node_id(node_id)
+    return f"{branch_namespace(label)}/{node_id}"
 
 
 # -- validation -----------------------------------------------------------
 
 
 def validate_label(label: str) -> None:
-    """Raise `InvalidLabelError` unless `label` matches `[a-z0-9][a-z0-9-]*`.
+    """Raise `InvalidNameError` unless `label` matches `[a-z0-9][a-z0-9-]*`."""
+    _validate("run label", label, _SUPPLIED, _LOWER_ONLY)
 
-    A label becomes both a path segment and part of a git ref, so it is checked
-    once up front instead of being discovered as a git error several steps in.
+
+def validate_project(project: str) -> None:
+    """Raise `InvalidNameError` unless `project` matches `[a-z0-9][a-z0-9-]*`."""
+    _validate("project", project, _SUPPLIED, _LOWER_ONLY)
+
+
+def validate_node_id(node_id: str) -> None:
+    """Raise `InvalidNameError` unless `node_id` matches `[A-Za-z0-9][A-Za-z0-9-]*`.
+
+    The refusal of `/` is load-bearing: it is what makes a derived id a sibling
+    branch of the one it came from instead of a ref nested under a file.
     """
-    if not _LABEL.fullmatch(label):
-        raise InvalidLabelError(
-            f"invalid run label {label!r}: expected lowercase letters, digits, and hyphens, "
+    _validate("node id", node_id, _COMPOSED, _ANY_CASE)
+
+
+def _validate(kind: str, value: str, pattern: re.Pattern[str], allowed: str) -> None:
+    """One policy, one message. `kind` is what the caller called the value."""
+    if not pattern.fullmatch(value):
+        raise InvalidNameError(
+            f"invalid {kind} {value!r}: expected {allowed}, "
             "starting with a letter or digit"
         )

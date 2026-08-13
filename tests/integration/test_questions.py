@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from agl.core.agent import AgentOption, AgentQuestion, AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentOption, AgentQuestion, AgentSpec, Tool
 from agl.core.terminal import (
     Answer,
     LiveSession,
@@ -34,8 +34,6 @@ type OnQuestion = Callable[[AgentQuestion], Awaitable[str]]
 
 LABEL = "add-auth"
 TIMEOUT = 5.0
-
-NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 STORAGE = AgentQuestion(
     title="Which storage layer?",

@@ -48,7 +48,9 @@ class Git(MergeOps, Vcs):
 
     def rev_parse(self, ref: str) -> str:
         # `^{commit}` so a ref that exists but names no commit is not a sha.
-        result = self._run(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], None, False)
+        result = self._run(
+            ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], None, check=False
+        )
         if result.code != 0 or not result.stdout.strip():
             raise UnknownRefError(ref)
         return result.stdout.strip()
@@ -170,6 +172,6 @@ class Git(MergeOps, Vcs):
 
 
 def _short_branch(ref: str) -> str:
-    """`refs/heads/agl/x/T-03` -> `agl/x/T-03`."""
+    """`refs/heads/topic/one` -> `topic/one`."""
     prefix = "refs/heads/"
     return ref[len(prefix) :] if ref.startswith(prefix) else ref

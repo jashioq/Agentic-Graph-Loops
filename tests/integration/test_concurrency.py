@@ -29,7 +29,7 @@ from typing import Any
 import pytest
 
 from agl.core import paths
-from agl.core.agent import AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentSpec, Tool
 from agl.core.dag import Dag, NodeId
 from agl.core.vcs.impl.git import Git
 from tests.fakes import FakeAgentRunner, ScriptedRun
@@ -38,8 +38,6 @@ from tests.integration.conftest import PROJECT, copy_repo
 LABEL = "wide"
 CAP = 3
 TIMEOUT = 10.0
-
-NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 
 ROOTS = ("T1", "T2", "T3", "T4", "T5")
 BLOCKED: dict[NodeId, tuple[NodeId, ...]] = {
@@ -209,7 +207,7 @@ async def drive(repo: Path, trees: Path) -> Ran:
 
     async def work(node: NodeId) -> None:
         observer.enter(node)
-        branch = paths.ticket_branch(LABEL, node)
+        branch = paths.branch(LABEL, node)
         tree = vcs.add_worktree(paths.worktree_dir(trees, PROJECT, LABEL, node), branch, "main")
         observer.note_worktrees(len(vcs.list_worktrees()) - 1)
         await runner.run(
@@ -325,7 +323,7 @@ def test_worktrees_track_the_cap(ran: Ran) -> None:
 
 def test_each_running_node_is_on_its_own_branch(ran: Ran) -> None:
     assert ran.held_worktree_branches == tuple(
-        paths.ticket_branch(LABEL, node) for node in ran.held_running
+        paths.branch(LABEL, node) for node in ran.held_running
     )
 
 

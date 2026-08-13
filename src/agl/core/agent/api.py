@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "NO_PARAMS",
     "AgentBudgetError",
     "AgentError",
     "AgentOption",
@@ -38,13 +39,20 @@ __all__ = [
     "Tool",
 ]
 
+NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
+"""The schema for a tool that takes no arguments — the canonical scoped shape.
+
+Everything such a tool may reach was closed over when it was built, so there is
+nothing left for the model to pass and nothing for it to widen. Read-only by
+convention: hand it to a `Tool` rather than mutating it."""
+
 
 @dataclass(frozen=True)
 class Tool:
     """A callable the model may invoke during a run.
 
     Opaque to this module: a name, a description, a JSON schema for its
-    parameters, and a handler. Whether it reads a ticket, saves a document, or
+    parameters, and a handler. Whether it reads something, saves something, or
     does something else entirely is the caller's business.
     """
 
@@ -60,11 +68,19 @@ class AgentSpec:
 
     prompt: str
     cwd: Path
-    role: str  # "implement", "review-quality", …
+    # What the caller is calling this run. Opaque here, and used only to name
+    # the run in an error message; a caller with several kinds of call tells
+    # them apart with it.
+    role: str
     tools: tuple[Tool, ...] = ()
     system_prompt_append: str | None = None
     add_dirs: tuple[Path, ...] = ()
-    allowed_tools: tuple[str, ...] = ()
+    # Deny rules only. There is no allow list: the permission callback allows
+    # every tool that is not the question tool, so an allow rule would buy one
+    # skipped round trip — and for the question tool it would skip the callback
+    # that carries the answers. Denials are kept because they resolve ahead of
+    # the callback, hold even under `bypassPermissions`, and speak the CLI's own
+    # pattern language (`Bash(git commit:*)`).
     disallowed_tools: tuple[str, ...] = ()
     permission_mode: str = "default"  # "default" | "plan" | …
     model: str | None = None
@@ -75,7 +91,11 @@ class AgentSpec:
 
 @dataclass(frozen=True)
 class AgentResult:
-    """What one call produced, and what it cost to produce it."""
+    """What one call produced, and what it cost to produce it.
+
+    There is no error flag. A run that could not be completed raises, so every
+    result that reaches a caller is one that finished.
+    """
 
     text: str  # the final assistant text
     structured: Any | None  # parsed JSON when output_schema was set
@@ -84,7 +104,6 @@ class AgentResult:
     num_turns: int
     duration_ms: int
     terminal_reason: str | None
-    is_error: bool
 
 
 @dataclass(frozen=True)
@@ -133,7 +152,7 @@ class AgentRunner(ABC):
 
         `on_question` is awaited when the model asks the user something, and
         returns the chosen label or the user's free text. When it is `None` the
-        question is refused and the model is told to use its own judgement.
+        question is refused and the model is told to use its own judgment.
 
         Raises `AgentBudgetError` when the run exhausted its budget or turns,
         and `AgentError` when it could not be completed for any other reason.
