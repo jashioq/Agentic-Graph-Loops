@@ -1,5 +1,6 @@
 """Documents on disk, against a real filesystem in `tmp_path`."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -107,6 +108,10 @@ def test_delete_on_a_key_that_is_a_directory_raises_missing(store: FileStore) ->
         store.delete("reviews")
 
 
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: -1)() == 0,
+    reason="root bypasses permission bits, so the delete succeeds and nothing raises",
+)
 def test_delete_lets_a_real_permission_error_through(store: FileStore) -> None:
     # A file that exists and cannot be removed is not a missing key, and a
     # caller told otherwise would carry on as though the delete had happened.
