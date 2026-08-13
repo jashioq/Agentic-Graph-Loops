@@ -71,7 +71,7 @@ def repo(tmp_path: Path, _template_repo: Path) -> Path:
 def git(cwd: Path, *args: str) -> str:
     """Run a git command in `cwd` and return its stdout, raising on failure.
 
-    Deliberately not `agl.core._exec.run`: a fixture that shares the code under
+    Deliberately not `agl.core.command.run`: a fixture that shares the code under
     test can only ever agree with it.
     """
     completed = subprocess.run(

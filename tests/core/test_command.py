@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agl.core._exec import TIMEOUT_CODE, ExecError, ExecResult, run
+from agl.core.command import TIMEOUT_CODE, ExecError, ExecResult, run
 
 
 def python(source: str) -> list[str]:
@@ -47,6 +47,14 @@ def test_the_result_is_a_frozen_dataclass(tmp_path: Path) -> None:
     result = run(["true"], cwd=tmp_path)
     with pytest.raises(AttributeError):
         result.code = 1  # type: ignore[misc]
+
+
+def test_ok_is_true_for_a_successful_command(tmp_path: Path) -> None:
+    assert run(["true"], cwd=tmp_path).ok is True
+
+
+def test_ok_is_false_for_a_failing_command(tmp_path: Path) -> None:
+    assert run(["false"], cwd=tmp_path, check=False).ok is False
 
 
 # -- failure --------------------------------------------------------------
@@ -154,6 +162,10 @@ def test_the_timeout_error_message_says_it_timed_out_and_after_how_long(tmp_path
     message = str(caught.value)
     assert "timed out" in message
     assert "0.25" in message
+
+
+def test_a_timed_out_result_is_not_ok(tmp_path: Path) -> None:
+    assert run(_sleep(30), cwd=tmp_path, check=False, timeout=0.2).ok is False
 
 
 def test_a_plain_failure_is_not_reported_as_a_timeout(tmp_path: Path) -> None:

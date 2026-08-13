@@ -21,7 +21,7 @@ conflict halt leaves the markers where someone looking to resolve them would go.
 
 from pathlib import Path
 
-from agl.core._exec import ExecResult
+from agl.core.command import ExecResult
 from agl.core.vcs.api import MergeResult, VcsError
 from agl.core.vcs.impl._runner import GitRunner
 

@@ -1,9 +1,11 @@
 """Running an external command and getting its output back.
 
-Layer: core, but not a core module — a private helper shared by the modules that
-shell out. It is exempt from the independence
-contract for that reason, and it stays exempt by knowing nothing about git,
-agents, or anything else above it.
+Layer: core. A shared helper rather than a module in its own right: `vcs` runs
+git through it and the merge gate runs a project's build through it. It is
+outside the independence contract for that reason, and it stays outside by
+knowing nothing about git, builds, agents, or anything else above it. Two
+callers sharing one subprocess runner is what the helper is for; the contract
+exists to stop `vcs` reaching into `store`.
 
 Never `shell=True`: arguments are passed as a list so a ref or a filename can
 never be read as syntax. Both streams are captured and decoded as UTF-8 with
@@ -41,6 +43,13 @@ class ExecResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """Whether the command succeeded. Reads better than `code == 0` at a
+        call site asking a yes-or-no question of a build or a git plumbing
+        command."""
+        return self.code == 0
 
 
 class ExecError(Exception):

@@ -5,7 +5,7 @@ lock, and the handful of things every group needs — running git somewhere,
 reading a porcelain status, naming a failure. `merges.py` and `git.py` build on
 it, and nothing outside `impl/` touches it.
 
-Every operation is a subprocess call through `agl.core._exec`, with refs and
+Every operation is a subprocess call through `agl.core.command`, with refs and
 paths passed as arguments so nothing is ever interpolated into a shell string,
 and machine-readable output only — `--porcelain`, `-z`, `for-each-ref
 --format` — because the human-readable forms are explicitly not an interface.
@@ -20,7 +20,7 @@ implementation ask what was wrong.
 import threading
 from pathlib import Path
 
-from agl.core._exec import ExecError, ExecResult, run
+from agl.core.command import ExecError, ExecResult, run
 from agl.core.vcs.api import FileStatus, UnknownRefError, VcsError
 
 __all__ = ["GitRunner"]
