@@ -6,13 +6,15 @@ on `printf` escapes among other things; the interpreter running the tests is the
 one portable program we are guaranteed to have.
 """
 
+import asyncio
+import os
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
-from agl.core.command import TIMEOUT_CODE, ExecError, ExecResult, run
+from agl.core.command import TIMEOUT_CODE, ExecError, ExecResult, run, run_async
 
 
 def python(source: str) -> list[str]:
@@ -221,3 +223,157 @@ def test_invalid_utf8_is_replaced_rather_than_raising(tmp_path: Path) -> None:
         cwd=tmp_path,
     )
     assert result.stdout == "��"
+
+
+# -- run_async: same contract, a real process handle underneath -----------
+#
+# `run` is exercised above against real trivial commands; `run_async` mirrors
+# the same results, failure, and timeout behaviour. What only `run_async` can
+# be asked is what happens to the child when the *caller* is cancelled —
+# `subprocess.run` gives no handle to kill, `create_subprocess_exec` does.
+
+
+async def test_async_a_successful_command_reports_code_zero(tmp_path: Path) -> None:
+    result = await run_async(["true"], cwd=tmp_path)
+    assert result.code == 0
+
+
+async def test_async_stdout_is_captured(tmp_path: Path) -> None:
+    assert (await run_async(["echo", "hello"], cwd=tmp_path)).stdout == "hello\n"
+
+
+async def test_async_stderr_is_captured(tmp_path: Path) -> None:
+    result = await run_async(python("import sys; print('oops', file=sys.stderr)"), cwd=tmp_path)
+    assert result.stderr == "oops\n"
+    assert result.stdout == ""
+
+
+async def test_async_the_result_carries_the_argv_it_ran(tmp_path: Path) -> None:
+    result = await run_async(["echo", "hello"], cwd=tmp_path)
+    assert result.argv == ("echo", "hello")
+
+
+async def test_async_ok_is_true_for_a_successful_command(tmp_path: Path) -> None:
+    assert (await run_async(["true"], cwd=tmp_path)).ok is True
+
+
+async def test_async_ok_is_false_for_a_failing_command(tmp_path: Path) -> None:
+    assert (await run_async(["false"], cwd=tmp_path, check=False)).ok is False
+
+
+async def test_async_a_failing_command_raises_by_default(tmp_path: Path) -> None:
+    with pytest.raises(ExecError):
+        await run_async(["false"], cwd=tmp_path)
+
+
+async def test_async_check_false_returns_the_failure_instead_of_raising(tmp_path: Path) -> None:
+    result = await run_async(["false"], cwd=tmp_path, check=False)
+    assert result.code != 0
+
+
+async def test_async_check_false_still_returns_output(tmp_path: Path) -> None:
+    result = await run_async(
+        python("import sys; print('out'); print('err', file=sys.stderr); sys.exit(7)"),
+        cwd=tmp_path,
+        check=False,
+    )
+    assert (result.code, result.stdout, result.stderr) == (7, "out\n", "err\n")
+
+
+async def test_async_the_command_runs_in_the_given_directory(tmp_path: Path) -> None:
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "marker.txt").write_text("here\n", encoding="utf-8")
+    assert (await run_async(["cat", "marker.txt"], cwd=work)).stdout == "here\n"
+
+
+async def test_async_arguments_are_not_interpreted_by_a_shell(tmp_path: Path) -> None:
+    assert (await run_async(["echo", "$HOME"], cwd=tmp_path)).stdout == "$HOME\n"
+
+
+async def test_async_no_timeout_means_no_timeout(tmp_path: Path) -> None:
+    result = await run_async(["echo", "hello"], cwd=tmp_path, timeout=None)
+    assert (result.stdout, result.timed_out) == ("hello\n", False)
+
+
+async def test_async_a_hanging_command_comes_back_as_a_timed_out_result(tmp_path: Path) -> None:
+    result = await run_async(_sleep(30), cwd=tmp_path, check=False, timeout=0.2)
+    assert result.timed_out is True
+    assert result.code != 0
+
+
+async def test_async_a_timeout_under_check_raises(tmp_path: Path) -> None:
+    with pytest.raises(ExecError) as caught:
+        await run_async(_sleep(30), cwd=tmp_path, timeout=0.2)
+    assert caught.value.result.timed_out is True
+
+
+async def test_async_utf8_output_is_decoded(tmp_path: Path) -> None:
+    assert (await run_async(["echo", "café ✅"], cwd=tmp_path)).stdout == "café ✅\n"
+
+
+async def test_async_invalid_utf8_is_replaced_rather_than_raising(tmp_path: Path) -> None:
+    result = await run_async(
+        python("import sys; sys.stdout.buffer.write(b'\\xff\\xfe')"),
+        cwd=tmp_path,
+    )
+    assert result.stdout == "��"
+
+
+# -- a real process handle: what `run` cannot offer -----------------------
+
+
+def _write_pid_then_sleep(pid_file: Path, seconds: float = 30) -> list[str]:
+    return python(
+        "import os, time; "
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid())); "
+        f"time.sleep({seconds})"
+    )
+
+
+async def _wait_for_pid(pid_file: Path) -> int:
+    async with asyncio.timeout(5.0):
+        while not pid_file.exists():
+            await asyncio.sleep(0.01)
+        return int(pid_file.read_text())
+
+
+def _process_is_gone(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+async def test_cancelling_a_run_async_call_kills_the_child(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    task = asyncio.create_task(
+        run_async(_write_pid_then_sleep(pid_file), cwd=tmp_path, check=False)
+    )
+    pid = await _wait_for_pid(pid_file)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        async with asyncio.timeout(5.0):
+            await task
+
+    async with asyncio.timeout(5.0):
+        while not _process_is_gone(pid):
+            await asyncio.sleep(0.01)
+
+
+async def test_a_timeout_kills_the_child_rather_than_orphaning_it(tmp_path: Path) -> None:
+    pid_file = tmp_path / "pid"
+    task = asyncio.create_task(
+        run_async(_write_pid_then_sleep(pid_file), cwd=tmp_path, check=False, timeout=0.2)
+    )
+    pid = await _wait_for_pid(pid_file)
+
+    async with asyncio.timeout(5.0):
+        result = await task
+    assert result.timed_out is True
+
+    async with asyncio.timeout(5.0):
+        while not _process_is_gone(pid):
+            await asyncio.sleep(0.01)

@@ -50,10 +50,20 @@ __all__ = [
 
 @dataclass(frozen=True)
 class Halt:
-    """Why a run stopped early, in the words the user is going to read."""
+    """Why a run stopped early, in the words the user is going to read.
+
+    `resumable` is whether pressing enter can plausibly help. A merge conflict
+    or a failing build are true of the repository right now, and a person
+    fixing the repository changes the answer. An exception that escaped the
+    workflow closed over broken state before the run started — a build
+    callable pointed at a command that does not exist, say — and no amount of
+    editing the repository changes what that callable does; the process has to
+    restart. Defaults to `True` because most halts are the resumable kind.
+    """
 
     reason: str
     detail: str = ""
+    resumable: bool = True
 
 
 @dataclass

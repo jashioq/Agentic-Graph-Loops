@@ -24,15 +24,18 @@ about to change.
 **What runs where.** Git calls stay on the event loop: they are milliseconds, and
 leaving them there means no other task can interleave a git command between this
 one's merge and the questions it asks about the result. The build is the one
-thing here that runs for minutes, so it goes to a thread — a build that blocked
-the loop would freeze the dashboard for its whole duration.
+thing here that runs for minutes, so it is a coroutine built on
+`command.run_async` — a real subprocess handle, awaited directly rather than
+run in a thread, so `stop` can cancel it and kill the child instead of waiting
+out however long is left.
 """
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from agl.core.command import ExecResult
 from agl.core.vcs import Vcs, VcsError
@@ -67,7 +70,7 @@ class MergeQueue:
         vcs: Vcs,
         repo: Path,
         base_branch: str,
-        build: Callable[[], ExecResult] | None,
+        build: Callable[[], Awaitable[ExecResult]] | None,
         on_merged: Callable[[str], None],
         on_halt: Callable[[Halt], None],
         on_abandoned: Callable[[str], None],
@@ -77,8 +80,8 @@ class MergeQueue:
         `build` is a callable rather than a command line so the queue never has
         to know what a build looks like; `None` means no build gate. In
         production it closes over the project's command and calls
-        `command.run(..., check=False, timeout=...)` — `check=False` because a
-        failing build is the answer to the question, not an error.
+        `command.run_async(..., check=False, timeout=...)` — `check=False`
+        because a failing build is the answer to the question, not an error.
 
         `on_abandoned` is the third outcome the other two cannot say: a person
         who resolves a halt by aborting the merge has ended that ticket's
@@ -98,6 +101,9 @@ class MergeQueue:
         self._resume_asked = False
         self._stopping = False
         self._running = False
+        # The task running the current `_attempt`/`_resume_current`, so `stop`
+        # has something to cancel instead of only something to wait out.
+        self._inflight: asyncio.Task[None] | None = None
         # One event for every reason the consumer might have to look again:
         # new work, a resume, or a stop. Set by the sync methods, cleared only
         # by the consumer, so a wake-up cannot be lost between the two.
@@ -117,7 +123,9 @@ class MergeQueue:
         Says nothing about *how*: the consumer goes and looks at git rather
         than trusting a protocol. Does no work itself, because the look may end
         in a build, and this is called from the event loop. A resume with
-        nothing halted is ignored.
+        nothing halted is ignored, and so is one on a halt that is not
+        resumable — the consumer checks `Halt.resumable` itself rather than
+        trusting a caller not to offer the button.
         """
         self._resume_asked = True
         self._wake.set()
@@ -137,26 +145,53 @@ class MergeQueue:
                     return
                 if self._resume_asked:
                     self._resume_asked = False
-                    if self._halt is not None:
-                        await self._resume_current()
+                    if self._halt is not None and self._halt.resumable:
+                        if not await self._perform(self._resume_current()):
+                            return
                 while self._halt is None and self._pending and not self._stopping:
-                    await self._attempt(self._pending.popleft())
+                    if not await self._perform(self._attempt(self._pending.popleft())):
+                        return
         finally:
             self._running = False
             self._stopped.set()
 
     async def stop(self) -> None:
-        """End the consumer once whatever is in flight has finished.
+        """End the consumer once whatever is in flight has finished — or cancel it.
 
-        Whatever is still queued stays queued and is never started. Returns as
-        soon as the consumer has left `run`, or immediately if none is going —
-        a stopped queue stays stopped, so `run` returns at once if called
-        after this.
+        Whatever is still queued stays queued and is never started. A merge
+        already committed by git is not unwound; a build still running is
+        cancelled rather than awaited, which is the whole reason `_gate` holds
+        a real process handle instead of a thread nothing can reach. Cancelling
+        mid-build kills the child and leaves the repository exactly as git left
+        it — the merge stays in progress if one was underway, the same state a
+        person would find after a conflict halt. Returns as soon as the
+        consumer has left `run`, or immediately if none is going — a stopped
+        queue stays stopped, so `run` returns at once if called after this.
         """
         self._stopping = True
         self._wake.set()
+        if self._inflight is not None:
+            self._inflight.cancel()
         if self._running:
             await self._stopped.wait()
+
+    async def _perform(self, attempt: Coroutine[Any, Any, None]) -> bool:
+        """Run one `_attempt`/`_resume_current` as its own task, so `stop` can
+        reach in and cancel it instead of only being able to wait it out.
+
+        Returns `False` when `stop` cancelled it out from under the loop —
+        `run` returns immediately rather than looping back to look at state a
+        cancelled attempt never finished updating.
+        """
+        task = asyncio.ensure_future(attempt)
+        self._inflight = task
+        try:
+            await task
+            return True
+        except asyncio.CancelledError:
+            return False
+        finally:
+            self._inflight = None
 
     # -- one request ------------------------------------------------------
 
@@ -164,27 +199,42 @@ class MergeQueue:
         """Merge one branch, and either gate it on the build or halt."""
         self._current = request
         try:
-            result = self._vcs.merge(self._repo, request.branch)
-        except VcsError as error:
-            # Not a conflict — a branch that does not resolve, or a git that
-            # refused for its own reasons. It halts rather than escaping,
-            # because an exception out of `run` would end the consumer and take
-            # every queued merge with it.
-            self._halt_with(Halt(f"{request.ticket_id} cannot be merged", str(error)))
-            return
-        if not result.clean:
-            # Left in progress on purpose: the markers are in the root, which is
-            # where a person resolving them would go.
-            self._halt_with(_conflict(request, result.conflicted))
-            return
-        await self._gate(request)
+            try:
+                result = self._vcs.merge(self._repo, request.branch)
+            except VcsError as error:
+                # Not a conflict — a branch that does not resolve, or a git
+                # that refused for its own reasons. It halts rather than
+                # escaping, because an exception out of `run` would end the
+                # consumer and take every queued merge with it.
+                self._halt_with(_vcs_halt(request, error))
+                return
+            if not result.clean:
+                # Left in progress on purpose: the markers are in the root,
+                # which is where a person resolving them would go.
+                self._halt_with(_conflict(request, result.conflicted))
+                return
+            await self._gate(request)
+        except Exception as error:
+            # The backstop under the `VcsError` handling above: a build gate
+            # that raises something else entirely — a missing executable, a
+            # bad config — or a workflow callback (`on_merged`, `on_abandoned`)
+            # that raises on its way out of `_finish`/`_abandon`. Either one
+            # escaping `run` would end the single consumer and strand every
+            # queued merge behind it.
+            self._halt_with(_unexpected_halt(request, error))
 
     async def _gate(self, request: MergeRequest) -> None:
-        """The build, if there is one, standing between a merge and `on_merged`."""
+        """The build, if there is one, standing between a merge and `on_merged`.
+
+        Awaited directly rather than run in a thread: `build` closes over
+        `command.run_async`, which holds a real subprocess handle, so `stop`
+        cancelling this await kills the child instead of leaving a thread that
+        cannot be reached running behind it.
+        """
         if self._build is None:
             self._finish(request)
             return
-        result = await asyncio.to_thread(self._build)
+        result = await self._build()
         if result.ok:
             self._finish(request)
             return
@@ -211,21 +261,26 @@ class MergeQueue:
             self._halt = None
             return
         try:
-            unmerged = self._vcs.unmerged_paths(self._repo)
-            if unmerged:
-                self._halt_with(_conflict(request, unmerged))
+            try:
+                unmerged = self._vcs.unmerged_paths(self._repo)
+                if unmerged:
+                    self._halt_with(_conflict(request, unmerged))
+                    return
+                if self._vcs.merge_in_progress(self._repo):
+                    self._vcs.commit_merge(self._repo, _merge_message(request))
+                    await self._gate(request)
+                    return
+                if self._landed(request.branch):
+                    await self._gate(request)
+                    return
+            except VcsError as error:
+                self._halt_with(_vcs_halt(request, error))
                 return
-            if self._vcs.merge_in_progress(self._repo):
-                self._vcs.commit_merge(self._repo, _merge_message(request))
-                await self._gate(request)
-                return
-            if self._landed(request.branch):
-                await self._gate(request)
-                return
-        except VcsError as error:
-            self._halt_with(Halt(f"{request.ticket_id} cannot be merged", str(error)))
-            return
-        self._abandon(request)
+            self._abandon(request)
+        except Exception as error:
+            # Same backstop as `_attempt`: the build gate or a raising
+            # `on_merged`/`on_abandoned` must not take the consumer with it.
+            self._halt_with(_unexpected_halt(request, error))
 
     def _landed(self, branch: str) -> bool:
         """Whether `branch` is in the base branch now.
@@ -260,6 +315,30 @@ class MergeQueue:
 
 
 # -- pure ------------------------------------------------------------------
+
+
+def _vcs_halt(request: MergeRequest, error: VcsError) -> Halt:
+    """The halt for a `VcsError` that is not a conflict: git refused outright.
+
+    Not resumable: a branch that does not resolve, or a git that refuses for
+    its own reasons, is not something a person edits the repository to fix in
+    a way this queue would notice on a resume.
+    """
+    return Halt(f"{request.ticket_id} cannot be merged", str(error), resumable=False)
+
+
+def _unexpected_halt(request: MergeRequest, error: Exception) -> Halt:
+    """The halt for anything that escaped as an exception.
+
+    Not resumable: whatever raised closed over its broken state before this
+    run started, so retrying without restarting the process would fail
+    identically.
+    """
+    return Halt(
+        reason=f"{request.ticket_id} could not be processed: {error}",
+        detail=f"{type(error).__name__}: {error}",
+        resumable=False,
+    )
 
 
 def _conflict(request: MergeRequest, paths: tuple[str, ...]) -> Halt:

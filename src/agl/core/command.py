@@ -17,12 +17,13 @@ Output is never truncated. Which slice of a failed build matters is
 language-specific, so the caller that knows what it is running decides.
 """
 
+import asyncio
 import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["TIMEOUT_CODE", "ExecError", "ExecResult", "run"]
+__all__ = ["TIMEOUT_CODE", "ExecError", "ExecResult", "run", "run_async"]
 
 TIMEOUT_CODE = -1
 """The `code` a timed-out command is reported with. Non-zero, so a caller
@@ -122,6 +123,87 @@ def run(
     if check and result.code != 0:
         raise ExecError(result)
     return result
+
+
+async def run_async(
+    argv: Sequence[str],
+    cwd: Path,
+    check: bool = True,
+    timeout: float | None = None,
+) -> ExecResult:
+    """`run`, but with a real process handle a caller can kill.
+
+    Same `ExecResult`, `check`, and `timeout` semantics as `run` — the
+    difference is what happens when the *awaiting* coroutine is cancelled or
+    the timeout expires. `run` wraps `subprocess.run`, which blocks a thread
+    that cannot be cancelled: `asyncio.to_thread(run, ...)` leaves the thread
+    running the command underneath a cancelled await, and since that thread is
+    non-daemon, the interpreter will not exit until it finishes — a build that
+    takes minutes makes Ctrl-C look hung for exactly that long. `run_async` is
+    built on `asyncio.create_subprocess_exec` instead, so cancellation and a
+    timeout both reach the child: it is killed and awaited before the
+    cancellation or the timeout is allowed to propagate, so nothing is left
+    running behind a call that has already returned.
+
+    Killing `./gradlew` kills the client process, not the Gradle daemon it
+    talks to over a socket. That is correct, not a shortcut: the daemon is
+    meant to outlive any one build and be reused by the next one, and tearing
+    it down on every interrupt would trade a fast cancel for a slow cold start
+    on the next run.
+    """
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_task = asyncio.ensure_future(process.stdout.read())
+    stderr_task = asyncio.ensure_future(process.stderr.read())
+    try:
+        try:
+            await asyncio.wait_for(process.wait(), timeout)
+        except TimeoutError:
+            await _kill(process)
+            stdout, stderr = await _collect(stdout_task, stderr_task)
+            result = ExecResult(
+                argv=tuple(argv),
+                code=TIMEOUT_CODE,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=True,
+            )
+            if check:
+                raise ExecError(result, timeout) from None
+            return result
+    except asyncio.CancelledError:
+        await _kill(process)
+        stdout_task.cancel()
+        stderr_task.cancel()
+        raise
+
+    stdout, stderr = await _collect(stdout_task, stderr_task)
+    assert process.returncode is not None  # `wait()` above returned
+    result = ExecResult(argv=tuple(argv), code=process.returncode, stdout=stdout, stderr=stderr)
+    if check and result.code != 0:
+        raise ExecError(result)
+    return result
+
+
+async def _kill(process: asyncio.subprocess.Process) -> None:
+    """Kill the child if it is still running, and reap it before returning."""
+    if process.returncode is None:
+        process.kill()
+    await process.wait()
+
+
+async def _collect(
+    stdout_task: asyncio.Task[bytes], stderr_task: asyncio.Task[bytes]
+) -> tuple[str, str]:
+    """Both streams, decoded the same way `run` decodes them."""
+    stdout_bytes, stderr_bytes = await asyncio.gather(stdout_task, stderr_task)
+    return _decoded(stdout_bytes), _decoded(stderr_bytes)
 
 
 def _decoded(partial: str | bytes | None) -> str:

@@ -2,17 +2,18 @@
 
 Real git in `tmp_path`, and a stubbed build — running a real build command would
 test the project's build rather than the queue, and would be slow enough that
-nobody ran these. The stub is also where the timing lives: `Gate` blocks *inside*
-the build until the test lets it go, which turns "the second merge had not
-started yet" into an assertion about the queue instead of a bet on how fast the
-machine is. Nothing here sleeps to wait for the queue.
+nobody ran these. The stub is also where the timing lives: `Gate` suspends
+*inside* the build, awaiting an `asyncio.Event` on the test's own loop, which
+turns "the second merge had not started yet" into an assertion about the queue
+instead of a bet on how fast the machine is. Nothing here sleeps to wait for
+the queue.
 
 The four resume states are each built by hand, with plain git commands standing
 in for the person who went to the repository root and dealt with the halt.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -94,7 +95,7 @@ class StubBuild:
         self.probed: list[object] = []
         self.probe: Callable[[], object] | None = None
 
-    def __call__(self) -> ExecResult:
+    async def __call__(self) -> ExecResult:
         if self.probe is not None:
             self.probed.append(self.probe())
         result = self.results[min(self.calls, len(self.results) - 1)]
@@ -102,24 +103,49 @@ class StubBuild:
         return result
 
 
+class RaisingBuild:
+    """A build that raises instead of returning, until told the fix landed.
+
+    Stands in for a build callable closing over something wrong at startup —
+    a stale `config.toml`, a typo'd wrapper path — the case a `VcsError` catch
+    cannot see because it is not `vcs` raising at all.
+    """
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.ok = False
+        self.calls = 0
+
+    async def __call__(self) -> ExecResult:
+        self.calls += 1
+        if not self.ok:
+            raise self.error
+        return passed()
+
+
 class Gate:
     """A build that stops the queue mid-request, where a test can look at it.
 
-    The queue runs the build in a worker thread, so this blocks that thread on
-    an `asyncio.Event` belonging to the test's loop rather than on a sleep: the
-    loop stays free, and the test decides exactly when the build finishes.
+    Suspends on an `asyncio.Event` the test holds the other end of, so the
+    test decides exactly when the build finishes — and, for `stop`, whether it
+    ever does: cancelling the await is what a real build's process-kill stands
+    in for here.
     """
 
     def __init__(self) -> None:
-        self.loop = asyncio.get_running_loop()
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.calls = 0
+        self.cancelled = False
 
-    def __call__(self) -> ExecResult:
+    async def __call__(self) -> ExecResult:
         self.calls += 1
-        self.loop.call_soon_threadsafe(self.started.set)
-        asyncio.run_coroutine_threadsafe(self.release.wait(), self.loop).result()
+        self.started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         return passed()
 
 
@@ -175,7 +201,7 @@ class Harness:
 
 @asynccontextmanager
 async def running(
-    repo: Path, build: Callable[[], ExecResult] | None = None
+    repo: Path, build: Callable[[], Awaitable[ExecResult]] | None = None
 ) -> AsyncIterator[Harness]:
     """A queue with its consumer going, stopped and joined on the way out."""
     calls = Calls()
@@ -255,6 +281,7 @@ async def test_a_failing_build_halts_with_the_code_and_the_tail(repo: Path) -> N
         assert "line 199" in halt.detail
         assert "line 0\n" not in halt.detail
         assert h.calls.merged == []
+        assert halt.resumable is True
 
 
 async def test_a_failing_build_leaves_the_merge_commit_alone(repo: Path) -> None:
@@ -280,6 +307,7 @@ async def test_a_conflicting_merge_halts_naming_the_paths(repo: Path) -> None:
         assert TICKET in halt.reason
         assert FILE in halt.detail
         assert h.calls.merged == []
+        assert halt.resumable is True
 
 
 async def test_a_conflicting_merge_is_left_in_progress(repo: Path) -> None:
@@ -508,7 +536,7 @@ async def test_a_build_failure_still_blocks_what_is_behind_it(repo: Path) -> Non
 # -- a branch git cannot find ---------------------------------------------
 
 
-async def test_a_branch_that_does_not_resolve_halts_rather_than_killing_the_consumer(
+async def test_a_branch_that_does_not_resolve_halts_and_is_not_resumable(
     repo: Path,
 ) -> None:
     branch_with(repo, "t3", "other.py", "x\n")
@@ -517,13 +545,110 @@ async def test_a_branch_that_does_not_resolve_halts_rather_than_killing_the_cons
         await h.calls.until(lambda: len(h.calls.halts) == 1)
 
         assert TICKET in h.calls.halts[0].reason
+        assert h.calls.halts[0].resumable is False
 
-        # The consumer is still going. A branch that never resolves reads as
-        # abandoned on resume, and what was behind it lands.
+        # The consumer is still going, but nothing about a branch that does
+        # not exist is fixed by pressing enter, so resume does nothing and
+        # what is behind it stays queued rather than landing.
         h.queue.resume()
-        await h.calls.until(lambda: h.calls.abandoned == [TICKET])
+        await settle()
+        assert h.calls.abandoned == []
+        assert len(h.calls.halts) == 1
+
         h.queue.put(MergeRequest(ticket_id="T-02", branch="t3"))
-        await h.calls.until(lambda: h.calls.merged == ["T-02"])
+        await settle()
+        assert h.calls.merged == []
+
+
+# -- an exception escaping the build ---------------------------------------
+
+
+async def test_a_raising_build_halts_rather_than_killing_the_consumer(repo: Path) -> None:
+    branch_with(repo, "t1", "a.py", "a\n")
+    build = RaisingBuild(FileNotFoundError(2, "No such file or directory", "./gradlew-x"))
+    async with running(repo, build) as h:
+        h.queue.put(MergeRequest(ticket_id=TICKET, branch="t1"))
+        await h.calls.until(lambda: len(h.calls.halts) == 1)
+
+        assert TICKET in h.calls.halts[0].reason
+        assert h.calls.merged == []
+
+        # The consumer is still alive: `stop` is not left waiting on a dead
+        # task. A resume is refused outright rather than retried, because the
+        # build callable's brokenness is baked in until the process restarts.
+        h.queue.resume()
+        await settle()
+        assert len(h.calls.halts) == 1
+        assert h.calls.merged == []
+
+
+async def test_a_request_behind_a_raising_build_stays_queued(repo: Path) -> None:
+    branch_with(repo, "t1", "a.py", "a\n")
+    branch_with(repo, "t2", "b.py", "b\n")
+    build = RaisingBuild(FileNotFoundError(2, "No such file or directory", "./gradlew-x"))
+    async with running(repo, build) as h:
+        h.queue.put(MergeRequest(ticket_id="T-01", branch="t1"))
+        h.queue.put(MergeRequest(ticket_id="T-02", branch="t2"))
+        await h.calls.until(lambda: len(h.calls.halts) == 1)
+        await settle()
+
+        assert build.calls == 1
+        assert h.calls.merged == []
+        assert h.vcs.is_ancestor("t2", MAIN) is False
+
+
+async def test_a_raising_on_merged_halts_rather_than_killing_the_consumer(repo: Path) -> None:
+    branch_with(repo, "t1", "a.py", "a\n")
+    calls = Calls()
+
+    def on_merged(ticket_id: str) -> None:
+        raise RuntimeError("dashboard write failed")
+
+    queue = MergeQueue(
+        vcs=Git(repo),
+        repo=repo,
+        base_branch=MAIN,
+        build=None,
+        on_merged=on_merged,
+        on_halt=calls.on_halt,
+        on_abandoned=calls.on_abandoned,
+    )
+    task = asyncio.create_task(queue.run())
+    try:
+        queue.put(MergeRequest(ticket_id=TICKET, branch="t1"))
+        await calls.until(lambda: len(calls.halts) == 1)
+
+        assert TICKET in calls.halts[0].reason
+    finally:
+        await queue.stop()
+        await asyncio.wait_for(task, TIMEOUT)
+
+
+async def test_a_raising_build_halt_is_not_resumable(repo: Path) -> None:
+    branch_with(repo, "t1", "a.py", "a\n")
+    build = RaisingBuild(FileNotFoundError(2, "No such file or directory", "./gradlew-x"))
+    async with running(repo, build) as h:
+        h.queue.put(MergeRequest(ticket_id=TICKET, branch="t1"))
+        await h.calls.until(lambda: len(h.calls.halts) == 1)
+
+        assert h.calls.halts[0].resumable is False
+
+
+async def test_a_fixed_build_merges_the_ticket_after_the_process_restarts(repo: Path) -> None:
+    # Flipping the closed-over build mid-run does not help, because a
+    # non-resumable halt refuses to look again. What fixes it is what the halt
+    # says: restart the process. A fresh queue is that restart, and the merge
+    # `vcs.merge` already made when the build first raised is why the same
+    # request lands clean the second time round.
+    branch_with(repo, "t1", "a.py", "a\n")
+    build = RaisingBuild(FileNotFoundError(2, "No such file or directory", "./gradlew-x"))
+    async with running(repo, build) as h:
+        h.queue.put(MergeRequest(ticket_id=TICKET, branch="t1"))
+        await h.calls.until(lambda: len(h.calls.halts) == 1)
+
+    async with running(repo, StubBuild(passed())) as h2:
+        h2.queue.put(MergeRequest(ticket_id=TICKET, branch="t1"))
+        await h2.calls.until(lambda: h2.calls.merged == [TICKET])
 
 
 # -- stopping -------------------------------------------------------------
@@ -549,9 +674,11 @@ async def test_stop_ends_the_consumer_with_work_still_queued(repo: Path) -> None
     assert calls.merged == []
 
 
-async def test_stop_lets_the_request_in_flight_finish_and_starts_no_other(
+async def test_stop_cancels_an_in_flight_build_rather_than_waiting_for_it(
     repo: Path,
 ) -> None:
+    # `stop` used to let whatever was in flight finish; now it cancels it, so
+    # Ctrl-C during a slow build does not look hung for however long is left.
     branch_with(repo, "t1", "a.py", "a\n")
     branch_with(repo, "t2", "b.py", "b\n")
     gate = Gate()
@@ -570,13 +697,17 @@ async def test_stop_lets_the_request_in_flight_finish_and_starts_no_other(
     consumer = asyncio.create_task(queue.run())
 
     await asyncio.wait_for(gate.started.wait(), TIMEOUT)
-    stopping = asyncio.create_task(queue.stop())
-    gate.release.set()
+    await asyncio.wait_for(queue.stop(), TIMEOUT)
     await asyncio.wait_for(consumer, TIMEOUT)
-    await asyncio.wait_for(stopping, TIMEOUT)
 
-    assert calls.merged == ["T-01"]
     assert gate.calls == 1
+    assert gate.cancelled is True
+    assert calls.merged == []
+    assert calls.halts == []
+    # `stop` does not unwind what git already did: `t1`'s merge commit stands,
+    # only the build gate on top of it was cut short. `t2` was never reached.
+    assert Git(repo).is_ancestor("t1", MAIN) is True
+    assert Git(repo).is_ancestor("t2", MAIN) is False
 
 
 async def test_stop_returns_even_though_nothing_is_consuming(repo: Path) -> None:

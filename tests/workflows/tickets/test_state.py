@@ -555,3 +555,11 @@ def test_halt_carries_a_reason_and_a_detail() -> None:
     assert halt.reason == "budget"
     assert halt.detail == "ran out at $4.10"
     assert new_state().halt is None
+
+
+def test_halt_defaults_to_resumable() -> None:
+    assert Halt(reason="budget").resumable is True
+
+
+def test_halt_resumable_can_be_set_false() -> None:
+    assert Halt(reason="budget", resumable=False).resumable is False

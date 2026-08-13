@@ -20,7 +20,7 @@ legible at a glance.
 
 from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.state import Live, RunState, display_order
+from agl.workflows.tickets.state import Halt, Live, RunState, display_order
 
 __all__ = ["render"]
 
@@ -89,7 +89,7 @@ def _header(state: RunState) -> Rows:
     title = Row(label, waiting) if waiting is not None else Row(Text(state.label, Color.CYAN))
     if state.halt is None:
         return Rows(title, Row())
-    return Rows(title, _halt_banner(state.halt.reason, state.halt.detail), Row())
+    return Rows(title, *_halt_banner(state.halt), Row())
 
 
 def _waiting_marker(state: RunState) -> Text | None:
@@ -114,12 +114,26 @@ def _waiting_marker(state: RunState) -> Text | None:
     return Text(f"⏸ {len(waiting)} tickets need input", Color.BOLD_YELLOW)
 
 
-def _halt_banner(reason: str, detail: str) -> Row:
-    """Why the run stopped, in the words the halt was written in."""
-    banner = Text(f"■ halted: {reason}", Color.BOLD_RED)
-    if not detail:
-        return Row(banner)
-    return Row(banner, Spacer(GAP), Text(detail, Color.GREY))
+_RESUME_HINT = "fix it, then press enter to continue"
+_RESTART_HINT = "this cannot be resumed — stop the run and restart it"
+
+
+def _halt_banner(halt: Halt) -> tuple[Row, Row]:
+    """Why the run stopped, and what a person can do about it.
+
+    Two rows: the reason and its detail in the words the halt was written in,
+    then an instruction row that is the one thing distinguishing a halt a
+    person can work through from one that means the process has to restart.
+    Both stay `BOLD_RED` — this is the line on the screen most worth a person
+    not missing, whichever kind it is.
+    """
+    banner = Text(f"■ halted: {halt.reason}", Color.BOLD_RED)
+    if not halt.detail:
+        reason_row = Row(banner)
+    else:
+        reason_row = Row(banner, Spacer(GAP), Text(halt.detail, Color.GREY))
+    hint = _RESUME_HINT if halt.resumable else _RESTART_HINT
+    return reason_row, Row(Text(hint, Color.BOLD_RED))
 
 
 # -- one ticket -----------------------------------------------------------

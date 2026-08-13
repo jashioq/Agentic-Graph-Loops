@@ -561,6 +561,37 @@ def test_no_halt_means_no_banner() -> None:
     assert not [text for text in texts(render(state, live, NOW).header) if "halt" in text.content]
 
 
+def test_a_resumable_halt_tells_a_person_enter_continues() -> None:
+    state, live = one_at(Status.IN_PROGRESS)
+    state.halt = Halt(reason="merge conflict on T-01", resumable=True)
+    header = render(state, live, NOW).header
+    hint = [text for text in texts(header) if "enter" in text.content.lower()]
+    assert len(hint) == 1
+    assert hint[0].color is Color.BOLD_RED
+
+
+def test_a_non_resumable_halt_says_stop_and_restart() -> None:
+    state, live = one_at(Status.IN_PROGRESS)
+    state.halt = Halt(reason="build command not found", resumable=False)
+    header = render(state, live, NOW).header
+    hint = [text for text in texts(header) if "restart" in text.content.lower()]
+    assert len(hint) == 1
+    assert hint[0].color is Color.BOLD_RED
+    assert not [text for text in texts(header) if "enter" in text.content.lower()]
+
+
+def test_the_two_halt_banners_are_distinguishable() -> None:
+    resumable_state, resumable_live = one_at(Status.IN_PROGRESS)
+    resumable_state.halt = Halt(reason="x", resumable=True)
+    resumable_words = words(render(resumable_state, resumable_live, NOW).header)
+
+    stuck_state, stuck_live = one_at(Status.IN_PROGRESS)
+    stuck_state.halt = Halt(reason="x", resumable=False)
+    stuck_words = words(render(stuck_state, stuck_live, NOW).header)
+
+    assert resumable_words != stuck_words
+
+
 # -- purity ---------------------------------------------------------------
 
 
