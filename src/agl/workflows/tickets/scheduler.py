@@ -66,7 +66,11 @@ async def run(
     `on_error` with `None` in place of a ticket, rather than spinning forever.
 
     Cancelling the run cancels every in-flight `body` and propagates, the way
-    Ctrl-C now reaches a running build.
+    Ctrl-C now reaches a running build. A raising `on_error` is treated the
+    same way: it is the error-reporting channel, so a broken one has nowhere
+    quieter to go than the exception it raised, but every in-flight `body` is
+    still cancelled and awaited before that exception leaves `run` — a
+    caller sees a clean stop, never a set of orphaned tasks.
 
     The scheduler never mutates a ticket's status: `body` does that through
     `state.set_status`, the single writer. The one graph write here is
@@ -122,7 +126,13 @@ async def run(
             progress.clear()
             await progress.wait()
         await asyncio.gather(*tasks)
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
+        # Cancellation and a raising `on_error` land here alike: both call
+        # sites let their exception through unguarded, so a broken handler
+        # takes this path exactly as Ctrl-C does. Swallowing it would let a
+        # broken `on_error` masquerade as a run with no errors; this keeps
+        # the failure loud while still closing out every in-flight task
+        # first, so what a caller sees is a clean stop, never an orphan.
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

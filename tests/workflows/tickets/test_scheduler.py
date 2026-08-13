@@ -532,6 +532,109 @@ async def test_two_bodies_raising_at_once_are_both_reported() -> None:
 # -- cancellation -----------------------------------------------------------
 
 
+class RaisingErrors:
+    """An `on_error` that is itself broken: it records the call, then raises."""
+
+    def __init__(self, to_raise: BaseException) -> None:
+        self._to_raise = to_raise
+        self.calls: list[tuple[Ticket | None, BaseException]] = []
+
+    def __call__(self, ticket: Ticket | None, error: BaseException) -> None:
+        self.calls.append((ticket, error))
+        raise self._to_raise
+
+
+async def test_a_raising_on_error_on_a_body_failure_still_cancels_and_awaits_inflight() -> None:
+    # T1 fails immediately and its `on_error` call is what's broken; T2 has
+    # nothing gating it, so it is still in flight when that happens.
+    state = build_state([feature("T1"), feature("T2")])
+    observer = Observer()
+    cancelled: set[str] = set()
+    boom = RuntimeError("boom")
+    handler_boom = RuntimeError("on_error is broken")
+    errors = RaisingErrors(handler_boom)
+
+    async def body(ticket: Ticket) -> None:
+        observer.enter(ticket.id)
+        try:
+            if ticket.id == "T1":
+                raise boom
+            await asyncio.Event().wait()  # never completes on its own
+        except asyncio.CancelledError:
+            cancelled.add(ticket.id)
+            raise
+        finally:
+            observer.leave(ticket.id)
+
+    task = asyncio.create_task(run(state, body, 2, errors))
+    with pytest.raises(RuntimeError) as excinfo:
+        async with asyncio.timeout(TIMEOUT):
+            await task
+
+    # The run stays loud: the broken handler's own exception is what a
+    # caller sees, not the error it failed to report or a swallowed no-op.
+    assert excinfo.value is handler_boom
+    assert errors.calls == [(state.tickets["T1"], boom)]
+    # But it does not leave T2 behind: it is cancelled and awaited before
+    # `run` raises, not abandoned as an orphan nothing will ever collect.
+    assert cancelled == {"T2"}
+    assert observer.running == set()
+
+
+async def test_a_raising_on_error_on_a_stalled_graph_still_cancels_and_awaits_inflight() -> None:
+    # T1 is claimed by nobody the scheduler knows about, forcing a stall once
+    # nothing else is left ready. T3 is admitted alongside T2 so the loop
+    # takes a genuine suspension with both in flight; opening T3's gate is
+    # what frees the slot that lets the loop notice the stall, by which
+    # point T2 is still running and never gets released on its own.
+    dag = _AlwaysStalled()
+    for node_id in ("T1", "T2", "T3"):
+        dag.add_node(node_id)
+    dag.claim("T1")
+    state = RunState(
+        label="wide",
+        base_branch="main",
+        dag=dag,
+        tickets={node_id: feature(node_id) for node_id in ("T1", "T2", "T3")},
+    )
+    observer = Observer()
+    gates = Gates(("T2", "T3"))
+    cancelled: set[str] = set()
+    handler_boom = RuntimeError("on_error is broken")
+    errors = RaisingErrors(handler_boom)
+
+    async def body(ticket: Ticket) -> None:
+        observer.enter(ticket.id)
+        try:
+            if ticket.id == "T3":
+                await gates["T3"].wait()
+                state.dag.complete("T3")
+                return
+            try:
+                await asyncio.Event().wait()  # T2 never completes on its own
+            except asyncio.CancelledError:
+                cancelled.add(ticket.id)
+                raise
+        finally:
+            observer.leave(ticket.id)
+
+    task = asyncio.create_task(run(state, body, 2, errors))
+    await observer.until(lambda: observer.running == {"T2", "T3"}, task)
+
+    gates.open("T3")
+    with pytest.raises(RuntimeError) as excinfo:
+        async with asyncio.timeout(TIMEOUT):
+            await task
+
+    assert excinfo.value is handler_boom
+    assert len(errors.calls) == 1
+    ticket, error = errors.calls[0]
+    assert ticket is None
+    assert isinstance(error, StalledGraphError)
+    assert cancelled == {"T2"}
+    assert observer.running == set()
+
+
 async def test_cancelling_the_run_cancels_inflight_bodies_and_propagates() -> None:
     state = build_state([feature("T1"), feature("T2")])
     observer, errors = Observer(), Errors()
