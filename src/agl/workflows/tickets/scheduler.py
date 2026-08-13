@@ -144,7 +144,7 @@ def _pending(dag: Dag) -> tuple[NodeId, ...]:
     return tuple(node for node in dag.nodes() if dag.state(node) is NodeState.PENDING)
 
 
-def bugs_first(state: RunState) -> Callable[[NodeId], object]:
+def bugs_first(state: RunState) -> Callable[[NodeId], bool]:
     """A `Dag` priority key that puts every ready bug ahead of every ready feature.
 
     `Dag.ready()` sorts with this key using a stable sort, so ties — bug vs
@@ -156,7 +156,7 @@ def bugs_first(state: RunState) -> Callable[[NodeId], object]:
     what is already open takes priority over opening more.
     """
 
-    def priority(node_id: NodeId) -> object:
+    def priority(node_id: NodeId) -> bool:
         return not state.tickets[node_id].is_bug
 
     return priority
