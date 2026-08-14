@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from agl.config import ProjectConfig
+from agl.core import paths
 from agl.core.agent import AgentRunner
 from agl.core.command import ExecResult, run_async
 from agl.core.dag import Dag
@@ -112,7 +113,8 @@ class Run:
         branch = self.deps.vcs.current_branch()
         if branch in ("main", "master"):
             raise PreflightError(f"cannot run on {branch!r}; check out a feature branch first")
-        if self.deps.vcs.ref_exists(self.label) or self.deps.store.list():
+        namespace = paths.branch_namespace(self.label)
+        if self.deps.vcs.branches(namespace) or self.deps.store.list():
             raise PreflightError(
                 f"{self.label!r} is already in use; run `agl clean {self.label}` first"
             )

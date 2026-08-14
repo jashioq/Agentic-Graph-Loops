@@ -109,7 +109,7 @@ def test_resolves_the_config_from_a_repo_inside_a_known_project(
     setup(monkeypatch, repo, home, trees)
     created = stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
     assert created[0].deps.config.name == PROJECT
@@ -122,7 +122,7 @@ def test_fails_clearly_outside_a_repo(
     monkeypatch.setenv("AGL_HOME", str(home))
     monkeypatch.chdir(tmp_path)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code != 0
 
@@ -133,7 +133,7 @@ def test_a_missing_agl_home_exits_nonzero_with_a_message(
     monkeypatch.delenv("AGL_HOME", raising=False)
     monkeypatch.chdir(repo)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code != 0
     assert "AGL_HOME" in capsys.readouterr().err
@@ -143,19 +143,23 @@ def test_a_missing_agl_home_exits_nonzero_with_a_message(
 # -- label ---------------------------------------------------------------
 
 
-def test_label_defaults_to_the_current_branch_name(
-    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+def test_name_is_required(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    stub_run(monkeypatch)
 
     code = main(["run", "tickets", "Add auth"])
 
-    assert code == 0
-    assert created[0].label == "main"
+    assert code != 0
+    assert "--name" in capsys.readouterr().err
 
 
-def test_name_overrides_the_default_label(
+def test_name_sets_the_label(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
@@ -167,14 +171,25 @@ def test_name_overrides_the_default_label(
     assert created[0].label == "add-auth"
 
 
+def test_the_short_name_flag_sets_the_label(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    created = stub_run(monkeypatch)
+
+    code = main(["run", "tickets", "-n", "add-auth", "Add auth"])
+
+    assert code == 0
+    assert created[0].label == "add-auth"
+
+
 def test_an_invalid_label_is_rejected_before_anything_is_created(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
-    git(repo, "checkout", "-b", "Feature-X", "main")
     setup(monkeypatch, repo, home, trees)
     stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "Bad-Label", "Add auth"])
 
     assert code != 0
     assert not (home / "runs").exists()
@@ -194,7 +209,7 @@ def test_an_unknown_workflow_lists_the_available_ones(
 ) -> None:
     setup(monkeypatch, repo, home, trees)
 
-    code = main(["run", "no-such-workflow", "Add auth"])
+    code = main(["run", "no-such-workflow", "--name", "add-auth", "Add auth"])
 
     assert code != 0
     assert "tickets" in capsys.readouterr().err
@@ -209,7 +224,7 @@ def test_a_multi_word_description_arrives_intact(
     setup(monkeypatch, repo, home, trees)
     created = stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "Add", "a", "login", "page"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add", "a", "login", "page"])
 
     assert code == 0
     assert created[0].description == "Add a login page"
@@ -221,7 +236,7 @@ def test_a_double_dash_lets_the_description_start_with_a_dash(
     setup(monkeypatch, repo, home, trees)
     created = stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "--", "--fix", "things"])
+    code = main(["run", "tickets", "--name", "add-auth", "--", "--fix", "things"])
 
     assert code == 0
     assert created[0].description == "--fix things"
@@ -233,7 +248,7 @@ def test_max_concurrent_defaults_to_three(
     setup(monkeypatch, repo, home, trees)
     created = stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
     assert created[0].max_concurrent == 3
@@ -245,7 +260,7 @@ def test_max_concurrent_reaches_run(
     setup(monkeypatch, repo, home, trees)
     created = stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "--max-concurrent", "7", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "--max-concurrent", "7", "Add auth"])
 
     assert code == 0
     assert created[0].max_concurrent == 7
@@ -279,7 +294,7 @@ def test_piped_stdin_description_arrives_intact_including_newlines(
     stdin = _FakeStdin("Add auth\nwith OAuth\n", isatty=False)
     monkeypatch.setattr(sys, "stdin", stdin)
 
-    code = main(["run", "tickets"])
+    code = main(["run", "tickets", "--name", "add-auth"])
 
     assert code == 0
     assert created[0].description == "Add auth\nwith OAuth\n"
@@ -293,7 +308,7 @@ def test_a_positional_description_wins_and_stdin_is_untouched(
     stdin = _FakeStdin("should not be read", isatty=False)
     monkeypatch.setattr(sys, "stdin", stdin)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
     assert created[0].description == "Add auth"
@@ -312,7 +327,7 @@ def test_no_description_with_a_terminal_stdin_exits_nonzero_with_a_message(
     stdin = _FakeStdin("", isatty=True)
     monkeypatch.setattr(sys, "stdin", stdin)
 
-    code = main(["run", "tickets"])
+    code = main(["run", "tickets", "--name", "add-auth"])
 
     assert code != 0
     assert capsys.readouterr().err.strip()
@@ -325,7 +340,7 @@ def test_an_empty_positional_description_exits_nonzero(
     setup(monkeypatch, repo, home, trees)
     stub_run(monkeypatch)
 
-    code = main(["run", "tickets", "   "])
+    code = main(["run", "tickets", "--name", "add-auth", "   "])
 
     assert code != 0
 
@@ -338,7 +353,7 @@ def test_a_whitespace_only_piped_stdin_description_exits_nonzero(
     stdin = _FakeStdin("   \n  ", isatty=False)
     monkeypatch.setattr(sys, "stdin", stdin)
 
-    code = main(["run", "tickets"])
+    code = main(["run", "tickets", "--name", "add-auth"])
 
     assert code != 0
 
@@ -357,7 +372,7 @@ def test_a_preflight_refusal_exits_nonzero_with_the_reason_printed(
     (repo / "dirty.txt").write_text("oops\n", encoding="utf-8")
     setup(monkeypatch, repo, home, trees)
 
-    code = main(["run", "tickets", "Add auth"])
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code != 0
     err = capsys.readouterr().err

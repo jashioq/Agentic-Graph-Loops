@@ -307,6 +307,22 @@ def test_preflight_refuses_a_label_already_in_use(tmp_path: Path, repo: Path) ->
         run.preflight()
 
 
+def test_preflight_allows_a_label_that_matches_the_current_branch(
+    tmp_path: Path, repo: Path
+) -> None:
+    """A person may reasonably pass `--name` matching the branch they are
+    standing on, so the label can name a real ref: their own branch. That
+    must not read as "already in use" — only leftover `agl/<label>/*` branches
+    or run state should.
+    """
+    start(repo, name=LABEL)
+    home, trees = tmp_path / "home", tmp_path / "trees"
+    d = deps(repo, home, trees, FakeAgentRunner(), HeadlessTerminal())
+    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+
+    run.preflight()
+
+
 # -- four tickets, one dependency edge ---------------------------------------
 
 

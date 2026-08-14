@@ -1,8 +1,8 @@
 """`agl run`, `agl clean`, and `agl init` — the composition root.
 
 Layer: cli. This is the only file that constructs concrete `impl` classes;
-everything below it takes them injected. `run` resolves a project, picks a
-label, discovers a workflow by listing `agl.workflows`, and hands a built
+everything below it takes them injected. `run` resolves a project, takes a
+label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and hands a built
 `Deps` to that workflow's `Run`. `clean` removes what a label left behind —
 worktrees, branches, and its run directory — tolerating anything already gone.
 `init` writes the `config.toml` and `standards.md` a project needs before
@@ -66,7 +66,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser = sub.add_parser("run", help="start a run of a workflow")
     run_parser.add_argument("workflow", help="the workflow to run, e.g. 'tickets'")
     run_parser.add_argument(
-        "--name", help="the run's label; defaults to the current branch name"
+        "-n", "--name", required=True, help="the run's label"
     )
     run_parser.add_argument(
         "--max-concurrent",
@@ -84,13 +84,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     clean_parser = sub.add_parser("clean", help="remove a run's worktrees, branches, and files")
-    clean_parser.add_argument("label", help="the run label to remove")
+    clean_parser.add_argument("-l", "--label", help="the run label to remove")
 
     init_parser = sub.add_parser(
         "init", help="create the project configuration for the repo in the current directory"
     )
     init_parser.add_argument(
-        "--name",
+        "-n", "--name",
         help="how to file this project under AGL_HOME; defaults to the repo's directory name",
     )
 
@@ -112,7 +112,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except ConfigError as error:
         return _fail(error)
 
-    label = args.name if args.name is not None else vcs.current_branch()
+    label = args.name
     try:
         paths.validate_label(label)
     except InvalidNameError as error:
@@ -413,7 +413,7 @@ def _report_init(project_dir: Path, build: tuple[str, ...], build_note: str) -> 
         "your conventions. Fill it in before relying on it."
     )
     print()
-    print('Next: agl run tickets "what you want built"')
+    print('Next: agl run tickets --name my-run "what you want built"')
 
 
 def _display_path(path: Path) -> str:
