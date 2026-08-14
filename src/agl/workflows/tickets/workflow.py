@@ -251,8 +251,6 @@ class Run:
     def _merge_queue(self) -> MergeQueue:
         return MergeQueue(
             self.deps.vcs,
-            self.deps.config.repo,
-            self.state.base_branch,
             self._build,
             self._on_merged,
             self._on_halt,
@@ -312,24 +310,16 @@ class Run:
 
     async def enqueue_merge(self, w: Work) -> None:
         state.set_status(self.state, self.live, w.ticket.id, Status.MERGING)
-        if w.ticket.parent is not None:
-            self._merge_bug(w)
-            return
+        target = self._base_for(w.ticket)
+        if w.ticket.parent is None:
+            cwd = self.deps.config.repo
+        else:
+            cwd = self._trees[w.ticket.parent].tree
         resolved = asyncio.Event()
         self._pending_merges[w.ticket.id] = resolved
         assert self.merge_queue is not None
-        self.merge_queue.put(MergeRequest(w.ticket.id, w.branch))
+        self.merge_queue.put(MergeRequest(w.ticket.id, w.branch, target, cwd))
         await resolved.wait()
-
-    def _merge_bug(self, w: Work) -> None:
-        assert w.ticket.parent is not None
-        parent_tree = self._trees[w.ticket.parent].tree
-        result = self.deps.vcs.merge(parent_tree, w.branch)
-        if not result.clean:
-            reason = f"{w.ticket.id} conflicts with {w.ticket.parent}"
-            self._halt(Halt(reason, resumable=False))
-            return
-        state.set_status(self.state, self.live, w.ticket.id, Status.MERGED)
 
     def _next_bug_start(self, parent_id: str) -> int:
         prefix = f"{parent_id}-bug-"

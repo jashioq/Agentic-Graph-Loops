@@ -11,11 +11,14 @@ each integrate against the *current* tip, so a build can run before the ref is
 trusted. That catches the failure git cannot see — one ticket renames a method,
 another adds a caller, both merge cleanly, nothing conflicts, the build breaks.
 
-**Where merges happen.** In the main repository root, which is checked out on the
-base branch. Not in a dedicated merge worktree: git refuses to check out a branch
-another tree already holds, so a `_merge` tree could never hold the base branch.
-The root is already there, the ticket worktrees are untouched either way, and a
-conflict leaves the markers exactly where a person would go to resolve them.
+**Where merges happen.** Wherever the request's `cwd` says: the repository root
+for a feature ticket merging into the run's base branch, or a parent ticket's
+kept-alive worktree for a bug ticket merging into the parent's branch. Never a
+dedicated merge worktree: git refuses to check out a branch another tree already
+holds, so a `_merge` tree could never hold a branch that is checked out
+somewhere else. `cwd` is always a tree that already has `target` checked out,
+untouched either way by the ticket worktrees, and a conflict leaves the markers
+exactly where a person would go to resolve them.
 
 **A halt stops at the head.** Requests are still accepted; none are processed.
 Everything behind a stuck merge would otherwise integrate against a base that is
@@ -56,10 +59,12 @@ is being truncated for.
 
 @dataclass(frozen=True)
 class MergeRequest:
-    """One ticket's branch, asking to land."""
+    """One branch asking to land somewhere."""
 
     ticket_id: str
-    branch: str
+    branch: str  # source
+    target: str  # branch to merge into
+    cwd: Path  # working tree holding `target`
 
 
 class MergeQueue:
@@ -68,8 +73,6 @@ class MergeQueue:
     def __init__(
         self,
         vcs: Vcs,
-        repo: Path,
-        base_branch: str,
         build: Callable[[], Awaitable[ExecResult]] | None,
         on_merged: Callable[[str], None],
         on_halt: Callable[[Halt], None],
@@ -86,10 +89,12 @@ class MergeQueue:
         `on_abandoned` is the third outcome the other two cannot say: a person
         who resolves a halt by aborting the merge has ended that ticket's
         attempt without merging it and without leaving anything to halt on.
+
+        There is no fixed `repo` or `base_branch` here: each `MergeRequest`
+        carries the `cwd` and `target` it merges into, so one queue serializes
+        merges into any number of trees.
         """
         self._vcs = vcs
-        self._repo = repo
-        self._base_branch = base_branch
         self._build = build
         self._on_merged = on_merged
         self._on_halt = on_halt
@@ -200,7 +205,7 @@ class MergeQueue:
         self._current = request
         try:
             try:
-                result = self._vcs.merge(self._repo, request.branch)
+                result = self._vcs.merge(request.cwd, request.branch)
             except VcsError as error:
                 # Not a conflict — a branch that does not resolve, or a git
                 # that refused for its own reasons. It halts rather than
@@ -262,15 +267,15 @@ class MergeQueue:
             return
         try:
             try:
-                unmerged = self._vcs.unmerged_paths(self._repo)
+                unmerged = self._vcs.unmerged_paths(request.cwd)
                 if unmerged:
                     self._halt_with(_conflict(request, unmerged))
                     return
-                if self._vcs.merge_in_progress(self._repo):
-                    self._vcs.commit_merge(self._repo, _merge_message(request))
+                if self._vcs.merge_in_progress(request.cwd):
+                    self._vcs.commit_merge(request.cwd, _merge_message(request))
                     await self._gate(request)
                     return
-                if self._landed(request.branch):
+                if self._landed(request.branch, request.target):
                     await self._gate(request)
                     return
             except VcsError as error:
@@ -282,15 +287,15 @@ class MergeQueue:
             # `on_merged`/`on_abandoned` must not take the consumer with it.
             self._halt_with(_unexpected_halt(request, error))
 
-    def _landed(self, branch: str) -> bool:
-        """Whether `branch` is in the base branch now.
+    def _landed(self, branch: str, target: str) -> bool:
+        """Whether `branch` is in `target` now.
 
         A branch that no longer resolves — deleted while the halt was being
         dealt with — reads as gone rather than landed, which puts it on the
         abandoned row where it belongs.
         """
         try:
-            return self._vcs.is_ancestor(branch, self._base_branch)
+            return self._vcs.is_ancestor(branch, target)
         except VcsError:
             return False
 

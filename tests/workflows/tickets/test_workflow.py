@@ -25,6 +25,8 @@ from agl.core.agent import AgentOption, AgentQuestion, AgentResult, AgentRunner,
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Answer, Question, Screen, Terminal
 from agl.core.vcs.impl.git import Git
+from agl.workflows.tickets import workflow as workflow_module
+from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status
 from agl.workflows.tickets.state import check_consistent
 from agl.workflows.tickets.workflow import DecomposeAbortedError, Deps, PreflightError, Run
@@ -107,6 +109,23 @@ class GatedTerminal(HeadlessTerminal):
             yield session
         finally:
             session.frame()
+
+
+class RecordingQueue(MergeQueue):
+    """A `MergeQueue` that remembers every request `put` to it.
+
+    Stands in for the real queue via `monkeypatch`, so a test can assert the
+    workflow routed a bug ticket's merge through the queue rather than only
+    checking the end state, which a bypass could also reach.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.seen: list[MergeRequest] = []
+
+    def put(self, request: MergeRequest) -> None:
+        self.seen.append(request)
+        super().put(request)
 
 
 type _Overrides = dict[str, tuple[str, str]]
@@ -481,6 +500,131 @@ async def test_a_merge_conflict_halts_the_run(tmp_path: Path, repo: Path) -> Non
     assert run.state.tickets["T1"].status is Status.MERGED
     assert run.state.tickets["T2"].status is Status.MERGED
     assert run.state.tickets["T3"].status is Status.MERGED
+    assert run.state.dag.is_complete()
+    check_consistent(run.state)
+    assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
+
+
+# -- bug merges go through the queue too --------------------------------------
+
+
+async def test_a_bug_tickets_merge_goes_through_the_queue(
+    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(workflow_module, "MergeQueue", RecordingQueue)
+
+    start(repo)
+    home, trees = tmp_path / "home", tmp_path / "trees"
+    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
+    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    fake = FakeAgentRunner(
+        {
+            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
+            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
+            "implement": ScriptedRun("done"),
+            "review-quality": ScriptedRun(result=findings_result()),
+            "triage": ScriptedRun(result=groups_result(group())),
+        }
+    )
+    spec_queues = {
+        "T-01": [findings_result(finding()), findings_result()],
+        "T-01-bug-1": [findings_result()],
+    }
+    writer = WritingAgentRunner(fake)
+    scripted = ScriptedByTicket(writer, "review-spec", spec_queues)
+    d = deps(repo, home, trees, scripted, terminal)
+    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
+
+    await run.go()
+
+    assert run.state.tickets["T-01"].status is Status.MERGED
+    assert run.state.tickets["T-01-bug-1"].status is Status.MERGED
+    assert isinstance(run.merge_queue, RecordingQueue)
+    ticket_ids = [r.ticket_id for r in run.merge_queue.seen]
+    assert ticket_ids == ["T-01-bug-1", "T-01"]
+
+    bug_request = run.merge_queue.seen[0]
+    assert bug_request.target == paths.branch(LABEL, "T-01")
+    assert bug_request.cwd != d.config.repo.resolve()
+
+    feature_request = run.merge_queue.seen[1]
+    assert feature_request.target == "feature"
+    assert feature_request.cwd == d.config.repo
+
+
+async def test_a_bug_merge_conflict_halts_resumably_and_resuming_lets_the_parent_merge(
+    tmp_path: Path, repo: Path
+) -> None:
+    start(repo)
+    (repo / "shared.py").write_text("MODE = 'off'\n", encoding="utf-8")
+    git(repo, "add", "shared.py")
+    git(repo, "commit", "-m", "add shared.py")
+    home, trees = tmp_path / "home", tmp_path / "trees"
+    ready = asyncio.Event()
+    terminal = GatedTerminal(ready, answers=[Answer("approve", was_free_text=False)])
+    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    fake = FakeAgentRunner(
+        {
+            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
+            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
+            "implement": ScriptedRun("done"),
+            "review-quality": ScriptedRun(result=findings_result()),
+            "triage": ScriptedRun(
+                result=groups_result(
+                    group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
+                    group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
+                )
+            ),
+        }
+    )
+    spec_queues = {
+        "T-01": [
+            findings_result(
+                finding(id="S-1", severity="high", files=["shared.py"]),
+                finding(id="S-2", severity="high", files=["shared.py"]),
+            ),
+            findings_result(),
+        ],
+        "T-01-bug-1": [findings_result()],
+        "T-01-bug-2": [findings_result()],
+    }
+    overrides = {
+        "T-01-bug-1": ("shared.py", "MODE = 'ours'\n"),
+        "T-01-bug-2": ("shared.py", "MODE = 'theirs'\n"),
+    }
+    writer = WritingAgentRunner(fake, overrides)
+    scripted = ScriptedByTicket(writer, "review-spec", spec_queues)
+    d = deps(repo, home, trees, scripted, terminal)
+    run = Run(d, LABEL, "conflict please", max_concurrent=2)
+
+    task = asyncio.create_task(run.go())
+    async with asyncio.timeout(10.0):
+        while run.state.halt is None:
+            await asyncio.sleep(0.01)
+
+    bug_ids = ("T-01-bug-1", "T-01-bug-2")
+    merged = {tid for tid in bug_ids if run.state.tickets[tid].status is Status.MERGED}
+    assert len(merged) == 1
+    conflicted = "T-01-bug-2" if "T-01-bug-1" in merged else "T-01-bug-1"
+    assert run.state.halt is not None
+    assert run.state.halt.resumable is True
+
+    parent_branch = paths.branch(LABEL, "T-01")
+    parent_tree = next(w.path for w in d.vcs.list_worktrees() if w.branch == parent_branch)
+
+    # A person resolves it in the parent's worktree — not the repository root,
+    # which was never touched by this merge — then presses enter.
+    (parent_tree / "shared.py").write_text("MODE = 'resolved'\n", encoding="utf-8")
+    d.vcs.commit_merge(parent_tree, f"merge {conflicted}")
+    terminal.queue(Answer("continue", was_free_text=False))
+    ready.set()
+
+    async with asyncio.timeout(10.0):
+        await task
+
+    assert run.state.tickets["T-01-bug-1"].status is Status.MERGED
+    assert run.state.tickets["T-01-bug-2"].status is Status.MERGED
+    assert run.state.tickets["T-01"].status is Status.MERGED
     assert run.state.dag.is_complete()
     check_consistent(run.state)
     assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]

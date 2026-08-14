@@ -358,9 +358,14 @@ async def test_cancelling_a_run_async_call_kills_the_child(tmp_path: Path) -> No
         async with asyncio.timeout(5.0):
             await task
 
-    async with asyncio.timeout(5.0):
-        while not _process_is_gone(pid):
-            await asyncio.sleep(0.01)
+    # `run_async` kills the child and awaits `process.wait()` before letting
+    # the cancellation propagate, so the child is already reaped the moment
+    # `await task` raises — no need to poll the process table for it to catch
+    # up. Polling here used to race a reused pid: under load, some unrelated
+    # process started elsewhere in the suite could claim the freed pid before
+    # the loop's next check, making `_process_is_gone` read "alive" forever
+    # and time out.
+    assert _process_is_gone(pid)
 
 
 async def test_a_timeout_kills_the_child_rather_than_orphaning_it(tmp_path: Path) -> None:
