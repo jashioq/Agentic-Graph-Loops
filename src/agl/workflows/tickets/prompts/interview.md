@@ -18,21 +18,24 @@ attention and tells them you didn't look.
 
 ## 2. Interview the user
 
+
+Interview the user relentlessly about what they want to build, until you both understand
+it the same way.
+
+Walk down each branch of the decision tree, resolving dependencies between decisions one
+at a time.
+
 Ask through `AskUserQuestion`, one to four questions at a time. For each
 question, put the option you'd recommend first and give the reasoning in
 its description, so most questions can be answered with a single keypress.
 
-Ask about:
+If a fact can be found by exploring the repository, look it up rather than asking. The
+decisions, though, are theirs: put each one to them and wait.
 
-- Product intent, tradeoffs, and constraints the code cannot tell you.
-- Anything the user is likely to care about that the repository is silent
-  on.
-- **Dependencies.** If the work needs a library that is not already in the
-  project, ask which version and record the answer. Implementation agents
-  are forbidden from adding or bumping a dependency themselves — anything
-  left unsettled here becomes a blocked ticket later.
-
-Do not ask what the repository already tells you.
+Among other questions, remember to ask about dependencies. If the work needs a library
+that is not already in the project, ask which version and record the answer. Implementation
+agents are forbidden from adding or bumping a dependency themselves — anything left
+unsettled here becomes a blocked ticket later.
 
 ## 3. Write the specification
 
@@ -42,6 +45,15 @@ Structure it with exactly these H2 sections, in this order:
 
 What is being built and why, in a few sentences a stakeholder could read
 cold.
+
+## User stories
+
+1. As a <user>, I want <capability>, so that <outcome>.
+2. ...
+
+<Numbered, each one independently checkable. Cover the awkward states — empty, loading,
+failure, offline — as their own stories where they were discussed, not as footnotes to
+the happy path.>
 
 ### Out of scope
 
