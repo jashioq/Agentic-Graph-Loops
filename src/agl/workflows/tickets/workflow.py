@@ -28,7 +28,7 @@ from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
 from agl.workflows.tickets import agents, scheduler, state
 from agl.workflows.tickets import tools as ticket_tools
-from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, plain_screen
+from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, session_screen
 from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import render
@@ -77,7 +77,12 @@ class Run:
         base_branch = deps.vcs.current_branch()
         self.state = RunState(label=label, base_branch=base_branch, dag=Dag(), tickets={})
         self.state.dag = Dag(priority=scheduler.bugs_first(self.state))
-        self.live: Live | None = None
+        # Created here, not after approval: `started_at` has to cover the
+        # whole session for the interview and decompose headers to have a
+        # timer, and `activity` has to have somewhere to go the moment either
+        # one starts. `approved_at` — the dashboard footer's clock — is set
+        # later, in `decompose`, once tickets exist to approve.
+        self.live: Live | None = Live(started_at=time.monotonic())
         self.session: LiveSession | None = None
         self.merge_queue: MergeQueue | None = None
         self.worktrees = Worktrees(deps.vcs, deps.config, label, base_branch)
@@ -122,18 +127,23 @@ class Run:
     # -- interview ------------------------------------------------------------
 
     async def interview(self) -> None:
-        async with self.deps.terminal.live(lambda: plain_screen(self.label)) as session:
+        async with self.deps.terminal.live(self._session_screen) as session:
             ctx = self.wiring.ctx(self.wiring.ask(session, None))
-            await agents.interview(ctx, self.description)
+            await agents.interview(ctx, self.description, self.wiring.activity(self.label))
         if not self.deps.store.exists(ticket_tools.SPEC_KEY):
             raise InterviewIncompleteError("the interview ended without saving a specification")
+
+    def _session_screen(self) -> Screen:
+        assert self.live is not None
+        return session_screen(self.label, self.live)
 
     # -- decompose --------------------------------------------------------------
 
     async def decompose(self) -> None:
         approval = Approval(self.deps.terminal, self.deps.store, self.label, self.wiring)
         tickets = await approval.run()
-        self.live = Live(started_at=time.monotonic())
+        assert self.live is not None
+        self.live.approved_at = time.monotonic()
         state.add_tickets(self.state, self.live, tickets)
 
     # -- implement_all ----------------------------------------------------------

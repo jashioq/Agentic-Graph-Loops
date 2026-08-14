@@ -1,11 +1,12 @@
 """The decompose approval flow: propose tickets, ask approve/revise/abort, loop.
 
 Layer: workflows. Imports `agl.core.dag` and `agl.core.terminal`, and this
-workflow's `agents`, `models`, `tools`, and `wiring`.
+workflow's `agents`, `models`, `render`, `tools`, and `wiring`.
 
-Runs exactly once per run, before `Run.live` exists — approval happens
-against a proposed plan, not yet a running graph, which is why the screen
-falls back to the plain label when there is nothing to show yet.
+Runs before `Run.implement_all` builds the dashboard — the decompose screen
+shows tickets once there are any, and falls back to the bare session header
+when there are none yet. `Run.live` exists for the whole session by this
+point, so both states have a timer and an activity string to show.
 """
 
 from agl.core.dag import Dag
@@ -14,9 +15,11 @@ from agl.core.terminal import LiveSession, Option, Question, Row, Rows, Screen, 
 from agl.workflows.tickets import agents
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket, tickets_from_json
+from agl.workflows.tickets.render import session_header
+from agl.workflows.tickets.state import Live
 from agl.workflows.tickets.wiring import Wiring
 
-__all__ = ["Approval", "DecomposeAbortedError", "plain_screen"]
+__all__ = ["Approval", "DecomposeAbortedError", "session_screen"]
 
 
 class DecomposeAbortedError(Exception):
@@ -36,7 +39,7 @@ class Approval:
         tickets: tuple[Ticket, ...] = ()
 
         def screen() -> Screen:
-            return _decompose_screen(self._label, tickets)
+            return _decompose_screen(self._label, self._live(), tickets)
 
         async with self._terminal.live(screen) as session:
             revision = ""
@@ -47,11 +50,16 @@ class Approval:
                     return tickets
                 revision = answer
 
+    def _live(self) -> Live:
+        live = self._wiring.live()
+        assert live is not None
+        return live
+
     async def _propose(self, session: LiveSession, revision: str) -> tuple[Ticket, ...]:
         if revision:
             self._append_spec(revision)
         ctx = self._wiring.ctx(self._wiring.ask(session, None))
-        await agents.decompose(ctx)
+        await agents.decompose(ctx, self._wiring.activity(self._label))
         payload = self._store.read_json(ticket_tools.TICKETS_KEY)
         return tickets_from_json(payload)
 
@@ -80,13 +88,13 @@ class Approval:
         )
 
 
-def plain_screen(label: str) -> Screen:
-    return Screen(content=Rows(Row(Text(label))))
+def session_screen(label: str, live: Live) -> Screen:
+    return Screen(header=session_header(label, live), content=Rows())
 
 
-def _decompose_screen(label: str, tickets: tuple[Ticket, ...]) -> Screen:
+def _decompose_screen(label: str, live: Live, tickets: tuple[Ticket, ...]) -> Screen:
     if not tickets:
-        return plain_screen(label)
+        return session_screen(label, live)
     dag = Dag()
     for ticket in tickets:
         dag.add_node(ticket.id)
@@ -94,10 +102,10 @@ def _decompose_screen(label: str, tickets: tuple[Ticket, ...]) -> Screen:
         for blocker in ticket.blocked_by:
             dag.add_edge(ticket.id, blocker)
     by_id = {t.id: t for t in tickets}
-    rows = [Row(Text(label))]
+    rows = []
     for level in dag.levels():
         for ticket_id in level:
             ticket = by_id[ticket_id]
             blocked = ", ".join(ticket.blocked_by) if ticket.blocked_by else "—"
             rows.append(Row(Text(f"{ticket.id}: {ticket.title} (blocked by: {blocked})")))
-    return Screen(content=Rows(*rows))
+    return Screen(header=session_header(label, live), content=Rows(*rows))

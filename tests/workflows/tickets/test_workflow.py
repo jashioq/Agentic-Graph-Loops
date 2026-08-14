@@ -276,6 +276,41 @@ async def test_one_ticket_end_to_end(tmp_path: Path, repo: Path) -> None:
     assert d.vcs.is_ancestor(d.vcs.rev_parse("feature"), "feature")
 
 
+async def test_the_interview_header_carries_the_label_and_activity_wired_through(
+    tmp_path: Path, repo: Path
+) -> None:
+    """`Run.interview` passes `Wiring.activity(label)` through to the agent, and
+    the screen it draws shows the label before any activity has a chance to
+    arrive — the state of the first seconds of every run.
+    """
+    start(repo)
+    home, trees = tmp_path / "home", tmp_path / "trees"
+    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
+    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    fake = FakeAgentRunner(
+        {
+            "interview": ScriptedRun(
+                "noted",
+                activity=("read app/build.gradle.kts",),
+                calls=(("save_spec", {"content": "# Add auth\n"}),),
+            ),
+            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
+            "implement": ScriptedRun("done"),
+            **clean_review(),
+        }
+    )
+    d = deps(repo, home, trees, WritingAgentRunner(fake), terminal)
+    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+
+    await run.go()
+
+    assert LABEL in terminal.frames[0]
+    assert "read app/build.gradle.kts" not in terminal.frames[0]
+    assert any(
+        LABEL in frame and "read app/build.gradle.kts" in frame for frame in terminal.frames
+    )
+
+
 def test_preflight_refuses_a_dirty_repo(tmp_path: Path, repo: Path) -> None:
     start(repo)
     (repo / "dirty.txt").write_text("oops\n", encoding="utf-8")

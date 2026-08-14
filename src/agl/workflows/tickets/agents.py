@@ -115,7 +115,7 @@ class PromptError(Exception):
 # -- the roles ----------------------------------------------------------------
 
 
-async def interview(ctx: AgentContext, user_input: str) -> None:
+async def interview(ctx: AgentContext, user_input: str, on_activity: _ActivityCallback) -> None:
     """Interrogate the user about what to build. Writes the spec through its tools."""
     spec = _spec(
         ctx,
@@ -125,10 +125,10 @@ async def interview(ctx: AgentContext, user_input: str) -> None:
         agent_tools=ticket_tools.interview_tools(ctx.store),
         permission_mode="plan",
     )
-    await ctx.runner.run(spec, None, ctx.ask)
+    await ctx.runner.run(spec, on_activity, ctx.ask)
 
 
-async def decompose(ctx: AgentContext) -> None:
+async def decompose(ctx: AgentContext, on_activity: _ActivityCallback) -> None:
     """Break the spec into tickets. Writes them through its tools."""
     spec = _spec(
         ctx,
@@ -137,7 +137,7 @@ async def decompose(ctx: AgentContext) -> None:
         cwd=ctx.repo,
         agent_tools=ticket_tools.decompose_tools(ctx.store),
     )
-    await ctx.runner.run(spec, None, ctx.ask)
+    await ctx.runner.run(spec, on_activity, ctx.ask)
 
 
 async def implement(

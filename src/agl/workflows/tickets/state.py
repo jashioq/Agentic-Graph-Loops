@@ -84,9 +84,19 @@ class Live:
     Everything here is about watching a run rather than running it: when each
     ticket last changed status, and the one-line activity an agent last
     reported. A run with no `Live` at all produces the same `RunState`.
+
+    Two clocks, two meanings. `started_at` covers the whole session — set the
+    moment the run begins, before the interview has asked its first question —
+    and is what a session header's timer reads: a liveness signal for the
+    agent currently working. `approved_at` is set later, at ticket approval,
+    and is what the dashboard footer reads: how long the implementation loop
+    has been going. Ten minutes spent answering interview questions must not
+    read as ten minutes of run time, so the two are independent stamps rather
+    than one derived from the other. `None` until approval happens.
     """
 
     started_at: float
+    approved_at: float | None = None
     status_since: dict[str, float] = field(default_factory=dict)
     activity: dict[str, str] = field(default_factory=dict)
 

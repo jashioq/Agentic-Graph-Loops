@@ -18,7 +18,7 @@ from agl.core.dag import Dag
 from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
 from agl.core.terminal.impl.screen import to_layout
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.render import render
+from agl.workflows.tickets.render import SESSION_ACTIVITY_WIDTH, render, session_header
 from agl.workflows.tickets.state import (
     Halt,
     Live,
@@ -67,9 +67,9 @@ def bug(ticket_id: str, parent: str) -> Ticket:
 
 
 def new_run(*tickets: Ticket) -> tuple[RunState, Live]:
-    """A run holding `tickets`, and a `Live` that has watched it from `NOW`."""
+    """A run holding `tickets`, and a `Live` that has watched it since `NOW`, approved at `NOW`."""
     state = RunState(label="add-auth-ticket-18732", base_branch="main", dag=Dag(), tickets={})
-    live = Live(started_at=NOW)
+    live = Live(started_at=NOW, approved_at=NOW)
     add_tickets(state, live, tickets, now=NOW)
     return state, live
 
@@ -153,7 +153,7 @@ def content_lines(screen: Screen, now: float = NOW) -> list[str]:
 
 def test_a_run_with_no_tickets_renders_header_and_footer() -> None:
     state = RunState(label="add-auth", base_branch="main", dag=Dag(), tickets={})
-    screen = render(state, Live(started_at=NOW - 767.0), NOW)
+    screen = render(state, Live(started_at=NOW, approved_at=NOW - 767.0), NOW)
     assert screen.content.children == ()
     assert "add-auth" in words(screen.header)
     assert lines(screen)[0] == "add-auth"
@@ -392,11 +392,25 @@ def test_a_ticket_with_no_stamp_shows_no_timer_rather_than_crashing() -> None:
     assert content_lines(screen)[0].startswith("T-01")
 
 
-def test_the_footer_timer_reads_from_the_start_of_the_run() -> None:
+def test_the_footer_timer_reads_from_ticket_approval_not_session_start() -> None:
     state, live = one_at(Status.IN_PROGRESS)
-    live.started_at = NOW - 767.0
+    live.approved_at = NOW - 767.0
     assert timers(render(state, live, NOW).footer) == [Timer(since=NOW - 767.0)]
     assert lines(render(state, live, NOW))[-1] == "12:47"
+
+
+def test_the_footer_timer_does_not_move_when_the_session_start_does() -> None:
+    """A long interview must not read as a long run: the two stamps are independent.
+
+    A session that ran for 300 seconds before approval reads `0:00` on the
+    dashboard's first frame — the footer is a function of `approved_at` alone,
+    never of `started_at`.
+    """
+    state, live = one_at(Status.IN_PROGRESS)
+    live.started_at = NOW - 300.0
+    live.approved_at = NOW
+    assert timers(render(state, live, NOW).footer) == [Timer(since=NOW)]
+    assert lines(render(state, live, NOW))[-1] == "0:00"
 
 
 # -- activity, one string per row -----------------------------------------
@@ -513,7 +527,7 @@ def test_an_empty_live_renders_every_row() -> None:
     state, live = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
     walk_to(state, live, "T-01", Status.IN_PROGRESS)
     walk_to(state, live, "T-02", Status.MERGED)
-    empty = Live(started_at=NOW)
+    empty = Live(started_at=NOW, approved_at=NOW)
     screen = render(state, empty, NOW)
     assert id_column(screen) == ["T-01", "T-02", "T-03"]
     assert timers(screen.content) == []
@@ -646,9 +660,82 @@ def test_a_frame_of_a_real_looking_run_reads_as_expected() -> None:
     walk_to(state, live, "T-02", Status.IN_REVIEW, at=NOW - 72.0)
     walk_to(state, live, "T-04", Status.AWAITING_INPUT)
     live.activity["T-02"] = "Reading TokenStore.kt"
-    live.started_at = NOW - 767.0
+    live.approved_at = NOW - 767.0
     drawn = lines(render(state, live, NOW))
     assert drawn[0].startswith("add-auth-ticket-18732")
     assert drawn[0].endswith("⏸ T-04 needs input")
     assert "in review" in drawn[3] and "1:12" in drawn[3] and "Reading TokenStore.kt" in drawn[3]
     assert drawn[-1] == "12:47"
+
+
+# -- the interview and decompose header ------------------------------------
+
+
+def header_activity(header: Row) -> str | None:
+    """Whatever the header says after its label, if anything."""
+    trailing = texts(header)[1:]
+    return trailing[0].content.strip() if trailing else None
+
+
+def test_the_session_header_carries_the_label() -> None:
+    live = Live(started_at=NOW)
+    header = session_header("add-auth-ticket-18732", live)
+    assert words(header)[0] == "add-auth-ticket-18732"
+
+
+def test_the_session_timer_reads_elapsed_since_the_session_began() -> None:
+    live = Live(started_at=NOW - 42.0)
+    header = session_header("add-auth", live)
+    assert timers(header) == [Timer(since=NOW - 42.0)]
+    assert lines(Screen(content=Rows(header)), NOW)[0].endswith("0:42")
+
+
+def test_with_no_activity_the_header_is_the_label_and_timer_with_no_gap() -> None:
+    live = Live(started_at=NOW - 42.0)
+    header = session_header("add-auth", live)
+    assert texts(header) == [Text("add-auth", Color.CYAN)]
+    assert lines(Screen(content=Rows(header)), NOW)[0] == "add-auth  0:42"
+
+
+def test_an_activity_written_through_wiring_style_lookup_reaches_the_header() -> None:
+    live = Live(started_at=NOW)
+    live.activity["add-auth"] = "Read app/build.gradle.kts"
+    header = session_header("add-auth", live)
+    assert header_activity(header) == "Read app/build.gradle.kts"
+
+
+def test_both_screens_render_before_any_activity_has_arrived() -> None:
+    """The state during the first seconds of every run: no crash, no gap."""
+    live = Live(started_at=NOW)
+    header = session_header("add-auth", live)
+    assert timers(header) == [Timer(since=NOW)]
+    assert [text.content for text in texts(header)] == ["add-auth"]
+
+
+def test_a_long_activity_string_is_truncated_rather_than_wrapped() -> None:
+    # Elided to a fixed width rather than left whole: unlike a ticket row,
+    # this header is sticky, and a wrapped header cannot be undrawn once
+    # content appears beneath it.
+    live = Live(started_at=NOW)
+    long_activity = "x" * (SESSION_ACTIVITY_WIDTH + 20)
+    live.activity["add-auth"] = long_activity
+    header = session_header("add-auth", live)
+    shown = header_activity(header)
+    assert shown is not None
+    assert shown != long_activity
+    assert len(shown) == SESSION_ACTIVITY_WIDTH
+    assert shown.endswith("…")
+    assert long_activity.startswith(shown[:-1])
+
+
+def test_the_session_timer_and_the_dashboard_timer_are_independent() -> None:
+    """A session that ran 300s before approval: the dashboard starts at zero
+    regardless of how long the session took, and the session header still
+    remembers the session's own elapsed time. Neither stamp is derived from
+    the other.
+    """
+    state, _ = one_at(Status.IN_PROGRESS)
+    live = Live(started_at=NOW - 300.0, approved_at=NOW)
+
+    assert lines(render(state, live, NOW))[-1] == "0:00"
+    assert lines(Screen(content=Rows(session_header(state.label, live))), NOW)[0].endswith("5:00")

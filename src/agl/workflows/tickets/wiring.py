@@ -57,9 +57,13 @@ class Wiring:
             store=self._store,
             repo=self._repo,
             prompts=PROMPTS_DIR,
-            limits=Limits(),
+            limits=Limits(model="sonnet"),
             ask=ask,
         )
+
+    def live(self) -> Live | None:
+        """The `Live` this run is watched through, if anyone is watching."""
+        return self._live()
 
     def activity(self, ticket_id: str) -> Callable[[str], None]:
         def on_activity(text: str) -> None:

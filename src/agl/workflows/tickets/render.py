@@ -22,7 +22,7 @@ from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text,
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.state import Halt, Live, RunState, display_order
 
-__all__ = ["render"]
+__all__ = ["render", "session_header"]
 
 # The columns. `LABEL_WIDTH` covers the id and the title together, indent
 # included, so an id sits right against its title and a bug row's title may
@@ -34,6 +34,12 @@ GAP = 2
 # What a timer occupies, so that a row without one still puts its activity in
 # the activity column.
 TIMER_WIDTH = 4
+
+# The interview and decompose headers are sticky — one line, drawn on top of
+# whatever else the screen has — so a wrapped line cannot be undrawn. Unlike a
+# ticket row's activity, which is left whole because the terminal can wrap the
+# row below it, this is elided to a fixed width instead.
+SESSION_ACTIVITY_WIDTH = 40
 
 # The statuses an agent — or the merge queue — is actually working. A ticket
 # waiting on a person is not making progress, and a clock ticking beside it
@@ -77,6 +83,24 @@ def render(state: RunState, live: Live, now: float) -> Screen:
         content=Rows(*(_row(state, live, state.tickets[t]) for t in display_order(state))),
         footer=_footer(live),
     )
+
+
+def session_header(label: str, live: Live) -> Row:
+    """The header for the interview and decompose screens: label, timer, activity.
+
+    These sessions have no ticket, so `live.activity` is keyed by `label`
+    itself — the same fallback `Wiring.ask` uses for its question header, for
+    the same reason. Unpadded, unlike the dashboard header: there is no
+    status column or waiting marker to hold a place for here, only a label
+    that is whatever length it is. Renders before any activity has arrived:
+    with nothing recorded for `label`, the row is the label and the timer
+    alone, with no gap held open for a string that has not shown up yet.
+    """
+    cells: list[Component] = [Text(label, Color.CYAN), Spacer(GAP), Timer(live.started_at)]
+    activity = live.activity.get(label)
+    if activity is not None:
+        cells.extend((Spacer(GAP), Text(_fit(activity, SESSION_ACTIVITY_WIDTH), Color.DIM_GREY)))
+    return Row(*cells)
 
 
 # -- the header -----------------------------------------------------------
@@ -227,5 +251,12 @@ def _open_bugs(state: RunState, parent_id: str) -> int:
 
 
 def _footer(live: Live) -> Rows:
-    """How long the whole run has been going, set off by a blank line."""
-    return Rows(Row(), Row(Timer(live.started_at)))
+    """How long the implementation loop has been going, set off by a blank line.
+
+    Reads `approved_at`, not `started_at`: the footer answers "how long has
+    this run taken", and a person answering interview questions is not the run
+    taking that long. By the time the dashboard exists, tickets are approved
+    and the stamp is set — see `Live`.
+    """
+    assert live.approved_at is not None
+    return Rows(Row(), Row(Timer(live.approved_at)))

@@ -128,7 +128,7 @@ async def test_decompose_prompt_has_no_placeholders(tmp_path: Path) -> None:
     runner = FakeAgentRunner({"decompose": "ok"})
     ctx = context(runner, tmp_path)
 
-    await decompose(ctx)
+    await decompose(ctx, None)
 
     assert "$" not in runner.specs[0].prompt
 
@@ -140,7 +140,7 @@ async def test_interview_prompt_substitutes_user_input(tmp_path: Path) -> None:
     runner = FakeAgentRunner({"interview": "ok"})
     ctx = context(runner, tmp_path)
 
-    await interview(ctx, "Add password login")
+    await interview(ctx, "Add password login", None)
 
     prompt = runner.specs[0].prompt
     assert "Add password login" in prompt

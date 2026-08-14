@@ -183,7 +183,7 @@ async def test_interview_spec(tmp_path: Path) -> None:
     runner = FakeAgentRunner({"interview": "ok"})
     ctx = context(tmp_path, runner)
 
-    await interview(ctx, "Add password login")
+    await interview(ctx, "Add password login", None)
 
     spec = runner.specs[0]
     assert spec.role == "interview"
@@ -197,7 +197,7 @@ async def test_decompose_spec(tmp_path: Path) -> None:
     runner = FakeAgentRunner({"decompose": "ok"})
     ctx = context(tmp_path, runner)
 
-    await decompose(ctx)
+    await decompose(ctx, None)
 
     spec = runner.specs[0]
     assert spec.role == "decompose"
@@ -305,8 +305,8 @@ async def test_ask_user_question_never_appears_as_a_tool(tmp_path: Path) -> None
     ctx = context(tmp_path, runner)
     tree = tmp_path / "tree"
 
-    await interview(ctx, "hello")
-    await decompose(ctx)
+    await interview(ctx, "hello", None)
+    await decompose(ctx, None)
     await implement(ctx, feature_ticket(), tree, None)
     await review(ctx, feature_ticket(review_round=1), tree, "main", None)
     await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
@@ -417,6 +417,26 @@ async def test_triage_activity_is_prefixed(tmp_path: Path) -> None:
     assert seen == ["triage · thinking"]
 
 
+async def test_interview_reports_activity_unprefixed(tmp_path: Path) -> None:
+    runner = FakeAgentRunner({"interview": ScriptedRun("noted", activity=("read spec.md",))})
+    ctx = context(tmp_path, runner)
+    seen: list[str] = []
+
+    await interview(ctx, "Add password login", seen.append)
+
+    assert seen == ["read spec.md"]
+
+
+async def test_decompose_reports_activity_unprefixed(tmp_path: Path) -> None:
+    runner = FakeAgentRunner({"decompose": ScriptedRun("planned", activity=("read spec.md",))})
+    ctx = context(tmp_path, runner)
+    seen: list[str] = []
+
+    await decompose(ctx, seen.append)
+
+    assert seen == ["read spec.md"]
+
+
 # -- triage: skip when there is nothing to decide -----------------------------
 
 
@@ -507,8 +527,8 @@ async def test_limits_reach_every_spec(tmp_path: Path) -> None:
     ctx = context(tmp_path, runner, limits=limits)
     tree = tmp_path / "tree"
 
-    await interview(ctx, "hello")
-    await decompose(ctx)
+    await interview(ctx, "hello", None)
+    await decompose(ctx, None)
     await implement(ctx, feature_ticket(), tree, None)
     await review(ctx, feature_ticket(review_round=1), tree, "main", None)
     await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
@@ -528,13 +548,13 @@ async def test_a_prompt_with_an_unsubstituted_placeholder_raises(tmp_path: Path)
     ctx = context(tmp_path, runner, prompts=prompts)
 
     with pytest.raises(PromptError):
-        await decompose(ctx)
+        await decompose(ctx, None)
 
 
 async def test_interview_substitutes_user_input(tmp_path: Path) -> None:
     runner = FakeAgentRunner({"interview": "ok"})
     ctx = context(tmp_path, runner)
 
-    await interview(ctx, "Add password login")
+    await interview(ctx, "Add password login", None)
 
     assert runner.specs[0].prompt == "Talk to the user about: Add password login"
