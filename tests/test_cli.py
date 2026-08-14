@@ -1,4 +1,5 @@
-"""`agl run` and `agl clean`: argument handling and composition-root wiring.
+"""`agl run`, `agl clean`, and `agl init`: argument handling and
+composition-root wiring.
 
 A full run is already covered by `test_workflow.py`, so `run` here never
 drives a real ticket workflow to completion. Wiring tests replace the ticket
@@ -13,6 +14,7 @@ either fails before one (preflight) or is stubbed out before one (wiring).
 """
 
 import shutil
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +22,7 @@ from typing import Any
 import pytest
 
 from agl.cli import main
+from agl.config import load_project
 from agl.core import paths
 from agl.core.vcs.impl.git import Git
 from agl.workflows.tickets import workflow as tickets_workflow
@@ -248,6 +251,98 @@ def test_max_concurrent_reaches_run(
     assert created[0].max_concurrent == 7
 
 
+# -- description from stdin ------------------------------------------------
+
+
+class _FakeStdin:
+    """Stands in for `sys.stdin`: a fixed `isatty()`, and a `read()` that
+    records whether it was ever called."""
+
+    def __init__(self, text: str, isatty: bool) -> None:
+        self._text = text
+        self._isatty = isatty
+        self.read_called = False
+
+    def isatty(self) -> bool:
+        return self._isatty
+
+    def read(self) -> str:
+        self.read_called = True
+        return self._text
+
+
+def test_piped_stdin_description_arrives_intact_including_newlines(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    created = stub_run(monkeypatch)
+    stdin = _FakeStdin("Add auth\nwith OAuth\n", isatty=False)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    code = main(["run", "tickets"])
+
+    assert code == 0
+    assert created[0].description == "Add auth\nwith OAuth\n"
+
+
+def test_a_positional_description_wins_and_stdin_is_untouched(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    created = stub_run(monkeypatch)
+    stdin = _FakeStdin("should not be read", isatty=False)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    code = main(["run", "tickets", "Add auth"])
+
+    assert code == 0
+    assert created[0].description == "Add auth"
+    assert stdin.read_called is False
+
+
+def test_no_description_with_a_terminal_stdin_exits_nonzero_with_a_message(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    stub_run(monkeypatch)
+    stdin = _FakeStdin("", isatty=True)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    code = main(["run", "tickets"])
+
+    assert code != 0
+    assert capsys.readouterr().err.strip()
+    assert stdin.read_called is False
+
+
+def test_an_empty_positional_description_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    stub_run(monkeypatch)
+
+    code = main(["run", "tickets", "   "])
+
+    assert code != 0
+
+
+def test_a_whitespace_only_piped_stdin_description_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    stub_run(monkeypatch)
+    stdin = _FakeStdin("   \n  ", isatty=False)
+    monkeypatch.setattr(sys, "stdin", stdin)
+
+    code = main(["run", "tickets"])
+
+    assert code != 0
+
+
 # -- preflight -----------------------------------------------------------
 
 
@@ -273,7 +368,9 @@ def test_a_preflight_refusal_exits_nonzero_with_the_reason_printed(
 # -- help ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("argv", [["--help"], ["run", "--help"], ["clean", "--help"]])
+@pytest.mark.parametrize(
+    "argv", [["--help"], ["run", "--help"], ["clean", "--help"], ["init", "--help"]]
+)
 def test_help_exits_cleanly(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     code = main(argv)
 
@@ -388,3 +485,191 @@ def test_clean_succeeds_when_the_run_directory_does_not_exist(
     assert branch not in vcs.branches()
     assert not worktree.exists()
     assert not (home / "runs" / label).exists()
+
+
+# -- init --------------------------------------------------------------------
+
+
+def _chdir_repo(monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path) -> None:
+    monkeypatch.setenv("AGL_HOME", str(home))
+    monkeypatch.chdir(repo)
+
+
+def test_init_creates_config_standards_and_runs_dir(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    project_dir = home / "projects" / "repo"
+    assert (project_dir / "config.toml").is_file()
+    assert (project_dir / "standards.md").is_file()
+    assert (home / "runs").is_dir()
+
+
+def test_init_config_round_trips_through_load_project(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    config = load_project(home, repo)
+    assert config.name == "repo"
+    assert config.repo == repo.resolve()
+    assert config.trees_root.is_absolute()
+    assert config.build
+    assert config.build_timeout > 0
+
+
+def test_init_standards_has_headings_and_no_content(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    text = (home / "projects" / "repo" / "standards.md").read_text(encoding="utf-8")
+    assert "Architecture" in text
+    lines = [line for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    assert lines == []
+
+
+def test_init_name_defaults_to_the_repo_directory_name(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    assert (home / "projects" / "repo").is_dir()
+
+
+def test_init_name_is_overridden_by_the_flag(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init", "--name", "myproject"])
+
+    assert code == 0
+    assert (home / "projects" / "myproject").is_dir()
+    assert not (home / "projects" / "repo").exists()
+    assert load_project(home, repo).name == "myproject"
+
+
+def test_init_trees_root_is_absolute_and_a_sibling_of_the_repo(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    config = load_project(home, repo)
+    assert config.trees_root.is_absolute()
+    assert config.trees_root.parent == repo.resolve().parent
+    assert config.trees_root != repo.resolve()
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_build"),
+    [
+        ("gradlew", ("./gradlew", "compileDebugKotlin")),
+        ("Cargo.toml", ("cargo", "check")),
+        ("package.json", ("npm", "run", "build")),
+    ],
+)
+def test_init_guesses_the_build_command_from_a_marker_file(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    marker: str,
+    expected_build: tuple[str, ...],
+) -> None:
+    (repo / marker).write_text("", encoding="utf-8")
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    config = load_project(home, repo)
+    assert config.build == expected_build
+
+
+def test_init_falls_back_to_a_placeholder_build_when_nothing_is_recognised(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code == 0
+    config = load_project(home, repo)
+    assert config.build not in (
+        ("./gradlew", "compileDebugKotlin"),
+        ("cargo", "check"),
+        ("npm", "run", "build"),
+    )
+    assert "config.toml" in " ".join(config.build)
+
+
+def test_init_refuses_when_the_project_directory_already_exists(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    project_dir = home / "projects" / "repo"
+    project_dir.mkdir(parents=True)
+    marker = project_dir / "keep.txt"
+    marker.write_text("mine\n", encoding="utf-8")
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code != 0
+    assert marker.read_text(encoding="utf-8") == "mine\n"
+    assert not (project_dir / "config.toml").exists()
+
+
+def test_init_refuses_a_duplicate_repo_naming_the_existing_config(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    existing = write_config(home, repo, trees, name="other")
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init"])
+
+    assert code != 0
+    assert str(existing) in capsys.readouterr().err
+    assert not (home / "projects" / "repo").exists()
+
+
+def test_init_refuses_outside_a_git_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, home: Path
+) -> None:
+    monkeypatch.setenv("AGL_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+
+    code = main(["init"])
+
+    assert code != 0
+    assert not (home / "projects").exists()
+
+
+def test_init_refuses_an_invalid_name(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path
+) -> None:
+    _chdir_repo(monkeypatch, repo, home)
+
+    code = main(["init", "--name", "Bad Name"])
+
+    assert code != 0
+    assert not (home / "projects").exists()

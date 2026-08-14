@@ -4,7 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from agl.config import ConfigError, ProjectConfig, agl_home, load_project
+from agl.config import (
+    ConfigError,
+    ProjectConfig,
+    agl_home,
+    find_project_by_repo,
+    load_project,
+    resolve_agl_home,
+)
 
 
 def _write_config(path: Path, **overrides: object) -> Path:
@@ -60,6 +67,30 @@ def test_agl_home_nonexistent_raises(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("AGL_HOME", str(missing))
     with pytest.raises(ConfigError, match="AGL_HOME"):
         agl_home()
+
+
+# -- resolve_agl_home ---------------------------------------------------------
+
+
+def test_resolve_agl_home_reads_the_env_var(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AGL_HOME", str(tmp_path))
+    assert resolve_agl_home() == tmp_path
+
+
+def test_resolve_agl_home_unset_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AGL_HOME", raising=False)
+    with pytest.raises(ConfigError, match="AGL_HOME"):
+        resolve_agl_home()
+
+
+def test_resolve_agl_home_does_not_require_the_directory_to_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "does-not-exist-yet"
+    monkeypatch.setenv("AGL_HOME", str(missing))
+    assert resolve_agl_home() == missing
 
 
 # -- load_project: happy path ------------------------------------------------
@@ -137,6 +168,20 @@ def test_no_match_raises_naming_the_repo(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match=str(repo)):
         load_project(home, repo)
+
+
+def test_no_match_names_the_search_path_and_agl_init(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "projects").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    with pytest.raises(ConfigError) as excinfo:
+        load_project(home, repo)
+
+    message = str(excinfo.value)
+    assert str(home / "projects") in message
+    assert "agl init" in message
 
 
 def test_two_configs_with_the_same_repo_raises_naming_both(tmp_path: Path) -> None:
@@ -241,3 +286,36 @@ def test_malformed_toml_raises_naming_the_file(tmp_path: Path) -> None:
         load_project(home, repo)
 
     assert str(config_path) in str(excinfo.value)
+
+
+# -- find_project_by_repo -----------------------------------------------------
+
+
+def test_find_project_by_repo_returns_none_when_nothing_matches(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    (home / "projects").mkdir(parents=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert find_project_by_repo(home, repo) is None
+
+
+def test_find_project_by_repo_returns_none_when_projects_dir_is_absent(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    assert find_project_by_repo(home, repo) is None
+
+
+def test_find_project_by_repo_finds_the_matching_config(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    config_path = _write_config(
+        home / "projects" / "myproject" / "config.toml",
+        repo=str(repo),
+        trees_root=str(tmp_path / "trees"),
+    )
+
+    assert find_project_by_repo(home, repo) == config_path

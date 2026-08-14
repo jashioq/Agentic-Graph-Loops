@@ -22,7 +22,14 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["ConfigError", "ProjectConfig", "agl_home", "load_project"]
+__all__ = [
+    "ConfigError",
+    "ProjectConfig",
+    "agl_home",
+    "find_project_by_repo",
+    "load_project",
+    "resolve_agl_home",
+]
 
 _REQUIRED_KEYS = ("name", "repo", "trees_root", "build", "build_timeout")
 
@@ -46,13 +53,24 @@ class ProjectConfig:
 
 def agl_home() -> Path:
     """`AGL_HOME` from the environment. Raises `ConfigError` unset or missing."""
-    raw = os.environ.get("AGL_HOME")
-    if not raw:
-        raise ConfigError("AGL_HOME is not set; set it to AGL's home directory")
-    home = Path(raw)
+    home = resolve_agl_home()
     if not home.is_dir():
         raise ConfigError(f"AGL_HOME is set to {home}, which does not exist")
     return home
+
+
+def resolve_agl_home() -> Path:
+    """`AGL_HOME` from the environment, without requiring it to exist yet.
+
+    `agl init` is often the first command run against a fresh `AGL_HOME` and
+    is what creates the directory, so it resolves the path this way instead
+    of through `agl_home`. Every other caller wants the directory to already
+    be there and should use `agl_home`.
+    """
+    raw = os.environ.get("AGL_HOME")
+    if not raw:
+        raise ConfigError("AGL_HOME is not set; set it to AGL's home directory")
+    return Path(raw)
 
 
 def load_project(home: Path, repo_root: Path) -> ProjectConfig:
@@ -72,13 +90,33 @@ def load_project(home: Path, repo_root: Path) -> ProjectConfig:
 
     if not matches:
         raise ConfigError(
-            f"no project configured for {repo_root}; "
-            f"configs are read from {projects_dir}/*/config.toml"
+            f"No project configured for {repo_root}\n\n"
+            f"Looked in {projects_dir}/*/config.toml\n"
+            "Run `agl init` here to create one."
         )
     if len(matches) > 1:
         found = ", ".join(str(path) for path, _ in matches)
         raise ConfigError(f"multiple projects configured for {repo_root}: {found}")
     return matches[0][1]
+
+
+def find_project_by_repo(home: Path, repo_root: Path) -> Path | None:
+    """The `config.toml` that already claims `repo_root`, if any.
+
+    Scans the same `projects/*/config.toml` glob `load_project` does. `agl
+    init` calls this before writing a new project, so the duplicate-repo case
+    `load_project` would raise on later is caught earlier, where naming the
+    conflicting file is friendlier than a failed `agl run`.
+    """
+    repo_root = repo_root.resolve()
+    projects_dir = home / "projects"
+    if not projects_dir.is_dir():
+        return None
+    for config_path in sorted(projects_dir.glob("*/config.toml")):
+        config = _load_one(config_path)
+        if config.repo.resolve() == repo_root:
+            return config_path
+    return None
 
 
 def _load_one(config_path: Path) -> ProjectConfig:
