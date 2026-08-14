@@ -32,6 +32,7 @@ from claude_agent_sdk.types import _warn_if_can_use_tool_shadowed
 from agl.core.agent import (
     AgentBudgetError,
     AgentError,
+    AgentOutputError,
     AgentQuestion,
     AgentSpec,
     Tool,
@@ -558,6 +559,23 @@ async def test_the_budget_error_says_which_limit_was_hit() -> None:
 
     with pytest.raises(AgentBudgetError, match="error_max_budget_usd"):
         await ClaudeRunner(query_fn=query).run(SPEC)
+
+
+# -- an output parse failure is not retried either --------------------------
+
+
+async def test_an_output_parse_failure_raises_immediately() -> None:
+    # A model that answered in prose instead of JSON gives the same prose back
+    # on an identical retry — retrying spends the budget again for nothing.
+    spec = AgentSpec(
+        prompt="p", cwd=Path("/repo"), role="r", output_schema={"type": "object"}
+    )
+    query = StubQuery(messages("not json at all"))
+
+    with pytest.raises(AgentOutputError):
+        await ClaudeRunner(query_fn=query).run(spec)
+
+    assert query.calls == 1
 
 
 # -- an error result is a failure, and failures are retried -----------------

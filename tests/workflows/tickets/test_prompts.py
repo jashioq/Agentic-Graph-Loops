@@ -12,7 +12,6 @@ from string import Template
 import pytest
 
 import agl.workflows.tickets as tickets_pkg
-from agl.core.agent import AgentResult
 from agl.workflows.tickets.agents import (
     AgentContext,
     Limits,
@@ -24,7 +23,7 @@ from agl.workflows.tickets.agents import (
 )
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.reviews import Finding, Severity
-from tests.fakes import FakeAgentRunner, MemoryStore
+from tests.fakes import FakeAgentRunner, MemoryStore, ScriptedRun
 
 PROMPTS_DIR = Path(tickets_pkg.__file__).parent / "prompts"
 
@@ -84,28 +83,14 @@ def a_finding(**overrides: object) -> Finding:
     return Finding(**fields)  # type: ignore[arg-type]
 
 
-def findings_result() -> AgentResult:
-    return AgentResult(
-        text="done",
-        structured={"findings": []},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def findings_result() -> ScriptedRun:
+    """A run that reports through `save_findings`, the way a real one now must."""
+    return ScriptedRun(text="done", calls=(("save_findings", {"findings": []}),))
 
 
-def groups_result(*groups: dict[str, object]) -> AgentResult:
-    return AgentResult(
-        text="done",
-        structured={"groups": list(groups)},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def groups_result(*groups: dict[str, object]) -> ScriptedRun:
+    """A run that reports through `save_triage`, the way a real one now must."""
+    return ScriptedRun(text="done", calls=(("save_triage", {"groups": list(groups)}),))
 
 
 # -- every file exists and has no stray placeholders after substitution -----
@@ -243,6 +228,21 @@ def test_reviewer_prompts_require_a_fix_in_every_detail() -> None:
         text = (PROMPTS_DIR / f"{name}.md").read_text()
         assert "must say both what is wrong and what would satisfy it" in text
         assert "leaks Retrofit types upward" in text  # the worked example
+
+
+# -- every role reports through its tool, never its final message ------------
+
+
+def test_reviewer_prompts_name_save_findings_and_the_empty_case() -> None:
+    for name in ("review_quality", "review_spec"):
+        text = (PROMPTS_DIR / f"{name}.md").read_text()
+        assert "save_findings" in text
+        assert "empty list" in text
+
+
+def test_triage_prompt_names_save_triage() -> None:
+    text = (PROMPTS_DIR / "triage.md").read_text()
+    assert "save_triage" in text
 
 
 # -- implement: bug vs feature use different files ---------------------------

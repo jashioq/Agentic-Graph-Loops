@@ -4,16 +4,26 @@ Layer: workflows. The only file in the workflow that constructs an
 `AgentSpec`. Imports `agl.core.agent`, `agl.core.store`, and this workflow's
 `models`, `tools`, and `reviews`.
 
-`interview` and `decompose` write through their tools and return nothing.
-`review` and `triage` return data the workflow consumes, so they use
-`output_schema` — tools for what persists, `output_schema` for what the
-workflow reads and acts on.
+Every role reports through a tool, never through `output_schema`: a tool call
+the workflow can validate lets the agent read the error and correct itself in
+the same session, where a bad `output_schema` result fails the whole call and
+sends it back round the retry ladder to redo work it already did. `interview`
+and `decompose` have always worked this way; `review` and `triage` write their
+result through `save_findings` and `save_triage` and this file reads it back
+from the store afterward. A role that ends without calling its tool raises
+`RoleIncompleteError` naming the role and the ticket — a missing key is a
+failure to surface, not an empty result to return quietly.
 
 **`review` runs both reviewers as parallel top-level calls**, never as
 subagents: `AskUserQuestion` is unavailable to subagents spawned via the Agent
 tool, and a reviewer that cannot ask anything is a reviewer working from
-guesses. Both are awaited together, so a failure from either one raises before
-anything is persisted — there is no half-reported review.
+guesses. Both are awaited together: `asyncio.gather` without
+`return_exceptions` raises on the first failure, so a reviewer that never
+finished never reaches the read-back below. Each reviewer persists its own
+findings itself, through its own tool call, as soon as it makes one — so a
+review that fails after the other reviewer already saved leaves that one
+write standing; `RoleIncompleteError` is what still stops the ticket from
+moving on with half a review.
 
 **Triage gets the findings and the parent ticket's deliverables, and no
 code.** It is denied the file and shell tools entirely: if it needed to read
@@ -39,8 +49,6 @@ from agl.core.store import Store
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket
 from agl.workflows.tickets.reviews import (
-    FINDINGS_SCHEMA,
-    TRIAGE_SCHEMA,
     BugGroup,
     Finding,
     bug_groups_from_json,
@@ -55,6 +63,7 @@ __all__ = [
     "AgentContext",
     "Limits",
     "PromptError",
+    "RoleIncompleteError",
     "decompose",
     "implement",
     "interview",
@@ -110,6 +119,15 @@ class AgentContext:
 
 class PromptError(Exception):
     """Raised when a prompt could not be assembled — usually a missing substitution."""
+
+
+class RoleIncompleteError(Exception):
+    """Raised when a role's run ended without calling the tool that reports its result.
+
+    Not treated as "found nothing": a missing key is a run that stopped short,
+    and the caller has no way to tell that apart from a genuine empty result
+    unless this is raised instead of returned.
+    """
 
 
 # -- the roles ----------------------------------------------------------------
@@ -176,20 +194,13 @@ async def review(
     quality_spec = _review_spec(ctx, "review-quality", "review_quality", ticket, tree, base_branch)
     spec_spec = _review_spec(ctx, "review-spec", "review_spec", ticket, tree, base_branch)
 
-    quality_result, spec_result = await asyncio.gather(
+    await asyncio.gather(
         ctx.runner.run(quality_spec, _prefixed(on_activity, "quality"), ctx.ask),
         ctx.runner.run(spec_spec, _prefixed(on_activity, "spec"), ctx.ask),
     )
 
-    quality_findings = findings_from_json(quality_result.structured)
-    spec_findings = findings_from_json(spec_result.structured)
-
-    ctx.store.write_json(
-        review_key(ticket.id, ticket.review_round, "quality"), quality_result.structured
-    )
-    ctx.store.write_json(
-        review_key(ticket.id, ticket.review_round, "spec"), spec_result.structured
-    )
+    quality_findings = _read_findings(ctx, "review-quality", ticket, "quality")
+    spec_findings = _read_findings(ctx, "review-spec", ticket, "spec")
 
     return quality_findings + spec_findings
 
@@ -223,12 +234,18 @@ async def triage(
             deliverables=_render_list(ticket.deliverables),
         ),
         cwd=ctx.repo,
-        agent_tools=(),
+        agent_tools=ticket_tools.triage_tools(ctx.store, ticket.id, ticket.review_round, highs),
         disallowed_tools=_NO_FILE_ACCESS,
-        output_schema=TRIAGE_SCHEMA,
     )
-    result = await ctx.runner.run(spec, _prefixed(on_activity, "triage"), ctx.ask)
-    groups = bug_groups_from_json(result.structured)
+    await ctx.runner.run(spec, _prefixed(on_activity, "triage"), ctx.ask)
+
+    key = review_key(ticket.id, ticket.review_round, "triage")
+    if not ctx.store.exists(key):
+        raise RoleIncompleteError(f"triage on {ticket.id!r} ended without calling save_triage")
+    groups = bug_groups_from_json(ctx.store.read_json(key))
+    # A backstop, not the enforcement: `save_triage` already refused to store
+    # groups that fail this, so a failure here means the tool was bypassed or
+    # the store was written to by something else.
     check_coverage(groups, highs)
     return groups
 
@@ -249,10 +266,19 @@ def _review_spec(
         role=role,
         prompt=_prompt(ctx, prompt_name, base_branch=base_branch),
         cwd=tree,
-        agent_tools=factory(ctx.store, ticket.id),
+        agent_tools=factory(ctx.store, ticket.id, ticket.review_round),
         disallowed_tools=GIT_WRITES,
-        output_schema=FINDINGS_SCHEMA,
     )
+
+
+def _read_findings(
+    ctx: AgentContext, role: str, ticket: Ticket, source: str
+) -> tuple[Finding, ...]:
+    """One reviewer's findings, read back from where its `save_findings` wrote them."""
+    key = review_key(ticket.id, ticket.review_round, source)
+    if not ctx.store.exists(key):
+        raise RoleIncompleteError(f"{role} on {ticket.id!r} ended without calling save_findings")
+    return findings_from_json(ctx.store.read_json(key))
 
 
 def _spec(
@@ -264,7 +290,6 @@ def _spec(
     agent_tools: tuple[Tool, ...],
     disallowed_tools: tuple[str, ...] = (),
     permission_mode: str = "default",
-    output_schema: dict[str, object] | None = None,
 ) -> AgentSpec:
     """Every field `Limits` owns, threaded onto one spec, once."""
     return AgentSpec(
@@ -277,7 +302,6 @@ def _spec(
         model=ctx.limits.model,
         max_turns=ctx.limits.max_turns,
         max_budget_usd=ctx.limits.max_budget_usd,
-        output_schema=output_schema,
     )
 
 

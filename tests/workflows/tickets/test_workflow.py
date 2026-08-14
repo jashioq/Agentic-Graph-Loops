@@ -160,15 +160,19 @@ class WritingAgentRunner(AgentRunner):
 
 
 class ScriptedByTicket(AgentRunner):
-    """Routes one role to a per-ticket queue of results, popped in call order.
+    """Routes one role to a per-ticket queue of scripted runs, popped in call order.
 
     Two tickets sharing a role — every review, across every ticket — never
     share a script this way, and a ticket reviewed more than once gets its
     results in the order it is reviewed. Everything else falls through to
     `inner`.
+
+    A scripted run's `calls` are invoked against the real spec's tools, the
+    same as `FakeAgentRunner` does, so a review scripted here still reports
+    through `save_findings` rather than a bare returned result.
     """
 
-    def __init__(self, inner: AgentRunner, role: str, queues: dict[str, list[AgentResult]]) -> None:
+    def __init__(self, inner: AgentRunner, role: str, queues: dict[str, list[ScriptedRun]]) -> None:
         self._inner = inner
         self._role = role
         self._queues = queues
@@ -177,7 +181,11 @@ class ScriptedByTicket(AgentRunner):
         self, spec: AgentSpec, on_activity: Any = None, on_question: Any = None
     ) -> AgentResult:
         if spec.role == self._role:
-            return self._queues[spec.cwd.name].pop(0)
+            scripted = self._queues[spec.cwd.name].pop(0)
+            for name, arguments in scripted.calls:
+                tool = next(tool for tool in spec.tools if tool.name == name)
+                await tool.handler(arguments)
+            return scripted.outcome()
         return await self._inner.run(spec, on_activity, on_question)
 
 
@@ -190,16 +198,9 @@ def ticket_json(
     return payload
 
 
-def findings_result(*findings: dict[str, Any]) -> AgentResult:
-    return AgentResult(
-        text="reviewed",
-        structured={"findings": list(findings)},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def findings_result(*findings: dict[str, Any]) -> ScriptedRun:
+    """A run that reports through `save_findings`, the way a real one now must."""
+    return ScriptedRun(text="reviewed", calls=(("save_findings", {"findings": list(findings)}),))
 
 
 def finding(**overrides: Any) -> dict[str, Any]:
@@ -214,16 +215,9 @@ def finding(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def groups_result(*groups: dict[str, Any]) -> AgentResult:
-    return AgentResult(
-        text="triaged",
-        structured={"groups": list(groups)},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def groups_result(*groups: dict[str, Any]) -> ScriptedRun:
+    """A run that reports through `save_triage`, the way a real one now must."""
+    return ScriptedRun(text="triaged", calls=(("save_triage", {"groups": list(groups)}),))
 
 
 def group(**overrides: Any) -> dict[str, Any]:
@@ -239,8 +233,8 @@ def group(**overrides: Any) -> dict[str, Any]:
 def clean_review() -> dict[str, ScriptedRun]:
     """Both reviewers scripted to find nothing."""
     return {
-        "review-quality": ScriptedRun(result=findings_result()),
-        "review-spec": ScriptedRun(result=findings_result()),
+        "review-quality": findings_result(),
+        "review-spec": findings_result(),
     }
 
 
@@ -408,12 +402,10 @@ async def test_review_findings_file_bugs_that_run_before_the_parent_merges(
             "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
             "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
             "implement": ScriptedRun("done"),
-            "review-quality": ScriptedRun(result=findings_result()),
-            "triage": ScriptedRun(
-                result=groups_result(
-                    group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
-                    group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
-                )
+            "review-quality": findings_result(),
+            "triage": groups_result(
+                group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
+                group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
             ),
         }
     )
@@ -573,8 +565,8 @@ async def test_a_bug_tickets_merge_goes_through_the_queue(
             "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
             "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
             "implement": ScriptedRun("done"),
-            "review-quality": ScriptedRun(result=findings_result()),
-            "triage": ScriptedRun(result=groups_result(group())),
+            "review-quality": findings_result(),
+            "triage": groups_result(group()),
         }
     )
     spec_queues = {
@@ -619,12 +611,10 @@ async def test_a_bug_merge_conflict_halts_resumably_and_resuming_lets_the_parent
             "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
             "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
             "implement": ScriptedRun("done"),
-            "review-quality": ScriptedRun(result=findings_result()),
-            "triage": ScriptedRun(
-                result=groups_result(
-                    group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
-                    group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
-                )
+            "review-quality": findings_result(),
+            "triage": groups_result(
+                group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
+                group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
             ),
         }
     )
@@ -723,8 +713,7 @@ async def test_decompose_revision_sends_the_free_text_back_and_calls_the_agent_a
     await run.go()
 
     assert set(run.state.tickets) == {"T-01", "T-02"}
-    revised_read = fake.tool_results[-2]
-    assert "split them into two tickets" in revised_read.text
+    assert any("split them into two tickets" in result.text for result in fake.tool_results)
     check_consistent(run.state)
 
 

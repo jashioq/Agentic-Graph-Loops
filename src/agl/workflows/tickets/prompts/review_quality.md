@@ -34,3 +34,16 @@ that only diagnoses is half a finding:
   signature."
 
 `files` must name at least one real path from the diff.
+
+## Report your findings
+
+Call `save_findings` with the whole list. That is the only way findings
+leave this session — nothing reads your final message.
+
+Finding nothing is a good outcome on a clean change, and you report it
+the same way everything else is reported: call `save_findings` with an
+empty list. Do not write a summary instead; a review is not finished
+until `save_findings` has been called, whether or not it found anything.
+
+If the call comes back with an error, fix what it names and call
+`save_findings` again.

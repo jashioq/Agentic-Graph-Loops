@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent import AgentBudgetError, AgentError
+from agl.core.agent import AgentBudgetError, AgentError, AgentOutputError
 from agl.core.agent.impl.stream import fold, summarize_tool_use
 
 
@@ -224,6 +224,13 @@ async def test_an_unlabelled_fence_parses() -> None:
 
 async def test_malformed_json_raises() -> None:
     with pytest.raises(AgentError, match="JSON"):
+        await fold(stream(said("not json at all"), result()), None, True)
+
+
+async def test_malformed_json_raises_the_output_specific_error() -> None:
+    # Distinct from the bare `AgentError` other failures raise here: this one
+    # is not worth retrying, and the caller tells the two apart by type.
+    with pytest.raises(AgentOutputError):
         await fold(stream(said("not json at all"), result()), None, True)
 
 

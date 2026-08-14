@@ -17,6 +17,7 @@ from agl.workflows.tickets.agents import (
     AgentContext,
     Limits,
     PromptError,
+    RoleIncompleteError,
     decompose,
     implement,
     interview,
@@ -94,16 +95,9 @@ def context(
     )
 
 
-def findings_result(*findings: dict[str, Any]) -> AgentResult:
-    return AgentResult(
-        text="done",
-        structured={"findings": list(findings)},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def findings_result(*findings: dict[str, Any]) -> ScriptedRun:
+    """A run that reports through `save_findings`, the way a real one now must."""
+    return ScriptedRun(calls=(("save_findings", {"findings": list(findings)}),))
 
 
 def finding(**overrides: Any) -> dict[str, Any]:
@@ -131,16 +125,9 @@ def a_finding(**overrides: Any) -> Finding:
     return Finding(**fields)
 
 
-def groups_result(*groups: dict[str, Any]) -> AgentResult:
-    return AgentResult(
-        text="done",
-        structured={"groups": list(groups)},
-        session_id="s-1",
-        cost_usd=0.0,
-        num_turns=1,
-        duration_ms=0,
-        terminal_reason="completed",
-    )
+def groups_result(*groups: dict[str, Any]) -> ScriptedRun:
+    """A run that reports through `save_triage`, the way a real one now must."""
+    return ScriptedRun(calls=(("save_triage", {"groups": list(groups)}),))
 
 
 def group(**overrides: Any) -> dict[str, Any]:
@@ -233,14 +220,19 @@ async def test_review_specs(tmp_path: Path) -> None:
     assert [tool.name for tool in by_role["review-quality"].tools] == [
         "get_ticket",
         "read_standards",
+        "save_findings",
     ]
     assert by_role["review-quality"].disallowed_tools == GIT_WRITES
-    assert by_role["review-quality"].output_schema is not None
+    assert by_role["review-quality"].output_schema is None
 
     assert by_role["review-spec"].cwd == tree
-    assert [tool.name for tool in by_role["review-spec"].tools] == ["get_ticket", "read_spec"]
+    assert [tool.name for tool in by_role["review-spec"].tools] == [
+        "get_ticket",
+        "read_spec",
+        "save_findings",
+    ]
     assert by_role["review-spec"].disallowed_tools == GIT_WRITES
-    assert by_role["review-spec"].output_schema is not None
+    assert by_role["review-spec"].output_schema is None
 
 
 async def test_triage_spec(tmp_path: Path) -> None:
@@ -252,8 +244,8 @@ async def test_triage_spec(tmp_path: Path) -> None:
 
     spec = runner.specs[0]
     assert spec.role == "triage"
-    assert spec.tools == ()
-    assert spec.output_schema is not None
+    assert [tool.name for tool in spec.tools] == ["save_triage"]
+    assert spec.output_schema is None
 
 
 # -- GIT_WRITES ---------------------------------------------------------------
@@ -370,7 +362,45 @@ async def test_review_persists_both_under_the_right_review_key(tmp_path: Path) -
     assert ctx.store.read_json(review_key("T-03", 2, "spec")) == {"findings": [finding(id="S-1")]}
 
 
-async def test_review_propagates_a_failure_rather_than_half_reporting(tmp_path: Path) -> None:
+async def test_a_reviewer_that_never_calls_save_findings_raises_naming_role_and_ticket(
+    tmp_path: Path,
+) -> None:
+    # Prose instead of the tool call — the exact failure that crashed a real
+    # run on a clean review: the model summarized instead of reporting.
+    runner = FakeAgentRunner(
+        {
+            "review-quality": ScriptedRun("Everything checks out cleanly."),
+            "review-spec": findings_result(),
+        }
+    )
+    ctx = context(tmp_path, runner)
+    tree = tmp_path / "tree"
+
+    with pytest.raises(RoleIncompleteError, match="review-quality"):
+        await review(ctx, feature_ticket(review_round=1), tree, "main", None)
+
+
+async def test_a_clean_review_that_saves_empty_lists_returns_no_findings(tmp_path: Path) -> None:
+    # The case that crashed the real run: nothing to report is not an error.
+    runner = FakeAgentRunner(
+        {"review-quality": findings_result(), "review-spec": findings_result()}
+    )
+    ctx = context(tmp_path, runner)
+    tree = tmp_path / "tree"
+
+    findings = await review(ctx, feature_ticket(review_round=1), tree, "main", None)
+
+    assert findings == ()
+
+
+async def test_review_propagates_a_failure_rather_than_returning_half_a_review(
+    tmp_path: Path,
+) -> None:
+    # `review-spec` still saves its own findings through its own tool call —
+    # that write is real and stands. What `review` guarantees is that a
+    # failure on the other reviewer is not swallowed into a partial result:
+    # the caller sees `AgentError` and does not treat this as a finished
+    # review.
     ok = FakeAgentRunner({"review-spec": findings_result(finding(id="S-1"))})
     runner = _FailingRunner(ok, fails_role="review-quality")
     ctx = context(tmp_path, runner)
@@ -379,7 +409,8 @@ async def test_review_propagates_a_failure_rather_than_half_reporting(tmp_path: 
     with pytest.raises(AgentError):
         await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
-    assert ctx.store.list() == ()
+    assert ctx.store.list() == (review_key("T-03", 1, "spec"),)
+    assert ctx.store.exists(review_key("T-03", 1, "quality")) is False
 
 
 # -- activity prefixes ---------------------------------------------------------
@@ -389,8 +420,12 @@ async def test_review_activity_is_prefixed_and_implement_is_not(tmp_path: Path) 
     runner = FakeAgentRunner(
         {
             "implement": ScriptedRun("done", activity=("wrote a.py",)),
-            "review-quality": ScriptedRun(result=findings_result(), activity=("read a.py",)),
-            "review-spec": ScriptedRun(result=findings_result(), activity=("read spec",)),
+            "review-quality": ScriptedRun(
+                calls=(("save_findings", {"findings": []}),), activity=("read a.py",)
+            ),
+            "review-spec": ScriptedRun(
+                calls=(("save_findings", {"findings": []}),), activity=("read spec",)
+            ),
         }
     )
     ctx = context(tmp_path, runner)
@@ -407,7 +442,11 @@ async def test_review_activity_is_prefixed_and_implement_is_not(tmp_path: Path) 
 
 async def test_triage_activity_is_prefixed(tmp_path: Path) -> None:
     runner = FakeAgentRunner(
-        {"triage": ScriptedRun(result=groups_result(group()), activity=("thinking",))}
+        {
+            "triage": ScriptedRun(
+                calls=(("save_triage", {"groups": [group()]}),), activity=("thinking",)
+            )
+        }
     )
     ctx = context(tmp_path, runner)
     seen: list[str] = []
@@ -489,20 +528,42 @@ async def test_triage_has_no_file_or_shell_tools(tmp_path: Path) -> None:
     await triage(ctx, feature_ticket(), findings, None)
 
     spec = runner.specs[0]
-    assert spec.tools == ()
+    assert [tool.name for tool in spec.tools] == ["save_triage"]
     assert "Bash" in spec.disallowed_tools
     assert "Read" in spec.disallowed_tools
     assert "Write" in spec.disallowed_tools
     assert "Edit" in spec.disallowed_tools
 
 
-# -- triage: a coverage failure raises rather than returning ------------------
+# -- triage: never called its tool ---------------------------------------
 
 
-async def test_triage_result_failing_coverage_raises(tmp_path: Path) -> None:
-    # Two HIGHs go in; the scripted triage only covers one of them.
-    runner = FakeAgentRunner({"triage": groups_result(group(findings=["Q-1"]))})
+async def test_triage_that_never_calls_save_triage_raises_naming_role_and_ticket(
+    tmp_path: Path,
+) -> None:
+    # The scripted run ends without calling its tool at all — prose instead of
+    # the call, the exact failure this workflow moved off `output_schema` to
+    # make loud instead of silently mistaken for "no groups".
+    runner = FakeAgentRunner({"triage": ScriptedRun("Here is my analysis...")})
     ctx = context(tmp_path, runner)
+    findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
+
+    with pytest.raises(RoleIncompleteError, match="triage"):
+        await triage(ctx, feature_ticket(), findings, None)
+
+
+# -- triage: check_coverage runs again as a backstop after reading back -------
+
+
+async def test_triage_backstop_raises_if_the_store_holds_uncovered_groups(
+    tmp_path: Path,
+) -> None:
+    # `save_triage` already refuses groups that fail coverage, so the only way
+    # this branch is reached is data landing at the key some other way — which
+    # is exactly why `agents.triage` does not just trust that the tool ran.
+    runner = FakeAgentRunner({"triage": ScriptedRun()})
+    ctx = context(tmp_path, runner)
+    ctx.store.write_json(review_key("T-03", 0, "triage"), {"groups": [group(findings=["Q-1"])]})
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
     with pytest.raises(CoverageError):

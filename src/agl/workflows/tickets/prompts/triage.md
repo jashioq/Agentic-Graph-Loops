@@ -40,3 +40,12 @@ worse than an honest "unclear: needs a human."
 Every `HIGH` finding above must appear in exactly one group, named by its
 id in that group's `findings` list. This is checked mechanically — a
 dropped finding fails the run.
+
+## Report your groups
+
+Call `save_triage` with the whole set of groups. That is the only way
+they leave this session — nothing reads your final message.
+
+If the call comes back with a coverage error, it names the finding that
+is missing, duplicated, or unrecognized. Fix what it names and call
+`save_triage` again with the whole set.

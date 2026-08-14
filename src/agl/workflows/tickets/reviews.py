@@ -113,10 +113,10 @@ FINDINGS_SCHEMA: dict[str, Any] = {
     "required": [FINDINGS_KEY],
     "additionalProperties": False,
 }
-"""The `output_schema` handed to a reviewer.
+"""The schema `tools.save_findings` hands the model for its `findings` argument.
 
-Read-only by convention, like `agent.NO_PARAMS` — hand it to an `AgentSpec`
-rather than mutating it."""
+Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
+than mutating it."""
 
 
 def findings_from_json(data: Any) -> tuple[Finding, ...]:
@@ -280,10 +280,10 @@ TRIAGE_SCHEMA: dict[str, Any] = {
     "required": [GROUPS_KEY],
     "additionalProperties": False,
 }
-"""The `output_schema` handed to the triage agent.
+"""The schema `tools.save_triage` hands the model for its `groups` argument.
 
-Read-only by convention, like `agent.NO_PARAMS` — hand it to an `AgentSpec`
-rather than mutating it."""
+Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
+than mutating it."""
 
 
 def bug_groups_from_json(data: Any) -> tuple[BugGroup, ...]:

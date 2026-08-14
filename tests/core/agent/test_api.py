@@ -12,6 +12,7 @@ from agl.core.agent import (
     AgentBudgetError,
     AgentError,
     AgentOption,
+    AgentOutputError,
     AgentQuestion,
     AgentResult,
     AgentRunner,
@@ -140,6 +141,13 @@ def test_the_question_type_is_this_modules_own() -> None:
 def test_budget_exhaustion_is_an_agent_error() -> None:
     assert issubclass(AgentBudgetError, AgentError)
     assert issubclass(AgentError, Exception)
+
+
+def test_output_parse_failure_is_an_agent_error_distinct_from_budget() -> None:
+    # Distinct from `AgentBudgetError` even though both are never retried: they
+    # are unrelated ways a call can fail, not the same failure under two names.
+    assert issubclass(AgentOutputError, AgentError)
+    assert not issubclass(AgentOutputError, AgentBudgetError)
 
 
 # -- the no-argument schema -----------------------------------------------

@@ -32,6 +32,7 @@ __all__ = [
     "AgentBudgetError",
     "AgentError",
     "AgentOption",
+    "AgentOutputError",
     "AgentQuestion",
     "AgentResult",
     "AgentRunner",
@@ -132,6 +133,16 @@ class AgentBudgetError(AgentError):
     Distinct because it is the one failure not worth retrying: the same call
     fails the same way and spends the budget again. Exhaustion says the task is
     too large, not that the call went wrong.
+    """
+
+
+class AgentOutputError(AgentError):
+    """Raised when `output_schema` was set and the final text did not parse as JSON.
+
+    Distinct for the same reason as `AgentBudgetError`: a model that answered
+    in prose instead of JSON says the same thing back word for word on an
+    identical retry, so retrying spends the budget again for a failure that
+    will recur unchanged. Not retried by `AgentRunner` implementations.
     """
 
 

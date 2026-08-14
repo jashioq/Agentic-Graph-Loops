@@ -20,6 +20,7 @@ import pytest
 from agl.core.agent import AgentSpec, Tool
 from agl.core.store.impl.file_store import FileStore
 from agl.workflows.tickets.models import TICKETS_SCHEMA, Ticket, tickets_from_json
+from agl.workflows.tickets.reviews import Finding, Severity, review_key
 from agl.workflows.tickets.tools import (
     SPEC_KEY,
     STANDARDS_KEY,
@@ -32,8 +33,11 @@ from agl.workflows.tickets.tools import (
     read_standards,
     review_quality_tools,
     review_spec_tools,
+    save_findings,
     save_spec,
     save_tickets,
+    save_triage,
+    triage_tools,
 )
 from tests.fakes import FakeAgentRunner, ScriptedRun
 
@@ -321,11 +325,24 @@ def test_implement_reads_everything_and_writes_nothing(store: FileStore) -> None
 
 
 def test_review_quality_is_given_the_standards_and_not_the_spec(store: FileStore) -> None:
-    assert names(review_quality_tools(store, "T-03")) == {"get_ticket", "read_standards"}
+    assert names(review_quality_tools(store, "T-03", 1)) == {
+        "get_ticket",
+        "read_standards",
+        "save_findings",
+    }
 
 
 def test_review_spec_is_given_the_spec_and_not_the_standards(store: FileStore) -> None:
-    assert names(review_spec_tools(store, "T-03")) == {"get_ticket", "read_spec"}
+    assert names(review_spec_tools(store, "T-03", 1)) == {
+        "get_ticket",
+        "read_spec",
+        "save_findings",
+    }
+
+
+def test_triage_tools_holds_only_save_triage(store: FileStore) -> None:
+    highs = (a_finding(id="Q-1"),)
+    assert names(triage_tools(store, "T-03", 1, highs)) == {"save_triage"}
 
 
 def bundles(store: FileStore) -> list[tuple[Tool, ...]]:
@@ -334,8 +351,9 @@ def bundles(store: FileStore) -> list[tuple[Tool, ...]]:
         interview_tools(store),
         decompose_tools(store),
         implement_tools(store, "T-03"),
-        review_quality_tools(store, "T-03"),
-        review_spec_tools(store, "T-03"),
+        review_quality_tools(store, "T-03", 1),
+        review_spec_tools(store, "T-03", 1),
+        triage_tools(store, "T-03", 1, (a_finding(id="Q-1"),)),
     ]
 
 
@@ -362,7 +380,7 @@ async def test_review_quality_has_no_tool_that_reaches_the_spec(
 ) -> None:
     # By name above, and here by driving every tool the role holds: none of them
     # answers with the spec. Re-litigating design decisions is not its job.
-    tools = review_quality_tools(store, "T-03")
+    tools = review_quality_tools(store, "T-03", 1)
     runner = FakeAgentRunner(
         {"review-quality": ScriptedRun(calls=tuple((tool.name, {}) for tool in tools))}
     )
@@ -382,14 +400,14 @@ async def test_review_quality_cannot_call_a_tool_it_was_not_given(
 
     with pytest.raises(AssertionError, match="read_spec"):
         await runner.run(
-            spec("review-quality", tmp_path, review_quality_tools(store, "T-03"))
+            spec("review-quality", tmp_path, review_quality_tools(store, "T-03", 1))
         )
 
 
 async def test_review_spec_does_get_the_spec(store: FileStore, tmp_path: Path) -> None:
     # The other half of the same fact: the difference between the two reviewers
     # is the bundle they were handed and nothing else.
-    tools = review_spec_tools(store, "T-03")
+    tools = review_spec_tools(store, "T-03", 1)
     runner = FakeAgentRunner(
         {"review-spec": ScriptedRun(calls=tuple((tool.name, {}) for tool in tools))}
     )
@@ -397,3 +415,197 @@ async def test_review_spec_does_get_the_spec(store: FileStore, tmp_path: Path) -
     await runner.run(spec("review-spec", tmp_path, tools))
 
     assert SPEC in [result.text for result in runner.tool_results]
+
+
+# -- saving findings ---------------------------------------------------------
+
+FINDING: dict[str, Any] = {
+    "id": "Q-1",
+    "severity": "high",
+    "title": "Missing null check",
+    "detail": "auth() does not check for a None token — add an early return.",
+    "files": ["src/auth.py"],
+}
+
+
+def a_finding(**overrides: Any) -> Finding:
+    """A parsed `Finding`, for building `highs` to hand `save_triage`."""
+    fields: dict[str, Any] = {
+        "id": "Q-1",
+        "severity": Severity.HIGH,
+        "title": "Missing null check",
+        "detail": "auth() does not check for a None token.",
+        "files": ("src/auth.py",),
+    }
+    fields.update(overrides)
+    return Finding(**fields)
+
+
+async def test_save_findings_writes_at_the_closures_key(empty: FileStore) -> None:
+    tool = save_findings(empty, "T-03", 1, "quality")
+    await call(tool, findings=[FINDING])
+    assert empty.read_json(review_key("T-03", 1, "quality")) == {"findings": [FINDING]}
+
+
+def test_save_findings_schema_has_no_key_for_the_model_to_point_elsewhere(
+    empty: FileStore,
+) -> None:
+    # Where a review's findings land was decided when the tool was built, so
+    # there is nothing in the schema for the model to redirect it with.
+    schema = save_findings(empty, "T-03", 1, "quality").schema
+    assert "key" not in schema["properties"]
+
+
+async def test_save_findings_with_an_empty_list_succeeds(empty: FileStore) -> None:
+    tool = save_findings(empty, "T-03", 1, "quality")
+    answer = await call(tool, findings=[])
+    assert answer.strip()
+    assert empty.read_json(review_key("T-03", 1, "quality")) == {"findings": []}
+
+
+FINDINGS_INVALID: dict[str, dict[str, Any]] = {
+    "no findings field": {},
+    "not a list": {"findings": {"id": "Q-1"}},
+    "missing detail": {"findings": [{k: v for k, v in FINDING.items() if k != "detail"}]},
+    "empty files": {"findings": [{**FINDING, "files": []}]},
+    "unknown severity": {"findings": [{**FINDING, "severity": "critical"}]},
+    "duplicate ids": {"findings": [FINDING, FINDING]},
+    "invented field": {"findings": [{**FINDING, "extra": "nope"}]},
+}
+
+
+@pytest.mark.parametrize("payload", FINDINGS_INVALID.values(), ids=list(FINDINGS_INVALID))
+async def test_save_findings_invalid_shapes_come_back_as_something_to_fix(
+    payload: dict[str, Any], empty: FileStore
+) -> None:
+    # The whole reason this is a tool rather than an `output_schema`: the model
+    # is told what was wrong and gets to call again in the same session.
+    tool = save_findings(empty, "T-03", 1, "quality")
+    answer = await call(tool, **payload)
+    assert answer.strip()
+    assert not answer.startswith("Saved")
+    assert empty.exists(review_key("T-03", 1, "quality")) is False
+
+
+async def test_two_save_findings_bound_to_different_rounds_write_different_keys(
+    empty: FileStore,
+) -> None:
+    first = save_findings(empty, "T-03", 1, "quality")
+    second = save_findings(empty, "T-03", 2, "quality")
+
+    await call(first, findings=[FINDING])
+    await call(second, findings=[{**FINDING, "id": "Q-2"}])
+
+    assert empty.read_json(review_key("T-03", 1, "quality"))["findings"][0]["id"] == "Q-1"
+    assert empty.read_json(review_key("T-03", 2, "quality"))["findings"][0]["id"] == "Q-2"
+
+
+async def test_review_quality_and_review_spec_save_to_their_own_source(
+    store: FileStore,
+) -> None:
+    quality_save = next(
+        t for t in review_quality_tools(store, "T-03", 1) if t.name == "save_findings"
+    )
+    spec_save = next(
+        t for t in review_spec_tools(store, "T-03", 1) if t.name == "save_findings"
+    )
+
+    await call(quality_save, findings=[FINDING])
+    await call(spec_save, findings=[{**FINDING, "id": "S-1"}])
+
+    assert store.read_json(review_key("T-03", 1, "quality"))["findings"][0]["id"] == "Q-1"
+    assert store.read_json(review_key("T-03", 1, "spec"))["findings"][0]["id"] == "S-1"
+
+
+# -- saving triage ------------------------------------------------------------
+
+GROUP: dict[str, Any] = {
+    "title": "Fix null checks",
+    "deliverables": ["Guard against a None token in auth()"],
+    "findings": ["Q-1", "S-1"],
+}
+
+
+async def test_save_triage_writes_when_groups_cover_every_high(empty: FileStore) -> None:
+    highs = (a_finding(id="Q-1"), a_finding(id="S-1"))
+    tool = save_triage(empty, "T-03", 1, highs)
+
+    answer = await call(tool, groups=[GROUP])
+
+    assert answer.startswith("Saved")
+    assert empty.read_json(review_key("T-03", 1, "triage")) == {"groups": [GROUP]}
+
+
+def test_save_triage_schema_has_no_key_for_the_model_to_point_elsewhere(
+    empty: FileStore,
+) -> None:
+    schema = save_triage(empty, "T-03", 1, (a_finding(id="Q-1"),)).schema
+    assert "key" not in schema["properties"]
+
+
+async def test_save_triage_missing_high_returns_error_naming_it_and_writes_nothing(
+    empty: FileStore,
+) -> None:
+    highs = (a_finding(id="Q-1"), a_finding(id="S-1"))
+    tool = save_triage(empty, "T-03", 1, highs)
+
+    answer = await call(tool, groups=[{**GROUP, "findings": ["Q-1"]}])
+
+    assert "S-1" in answer
+    assert not answer.startswith("Saved")
+    assert empty.exists(review_key("T-03", 1, "triage")) is False
+
+
+async def test_save_triage_double_covered_high_returns_error_naming_it(
+    empty: FileStore,
+) -> None:
+    highs = (a_finding(id="Q-1"),)
+    tool = save_triage(empty, "T-03", 1, highs)
+    groups = [
+        {"title": "a", "deliverables": ["x"], "findings": ["Q-1"]},
+        {"title": "b", "deliverables": ["y"], "findings": ["Q-1"]},
+    ]
+
+    answer = await call(tool, groups=groups)
+
+    assert "Q-1" in answer
+    assert not answer.startswith("Saved")
+    assert empty.exists(review_key("T-03", 1, "triage")) is False
+
+
+async def test_save_triage_unknown_id_returns_error_naming_it(empty: FileStore) -> None:
+    highs = (a_finding(id="Q-1"),)
+    tool = save_triage(empty, "T-03", 1, highs)
+
+    answer = await call(
+        tool, groups=[{"title": "a", "deliverables": ["x"], "findings": ["Q-1", "Q-99"]}]
+    )
+
+    assert "Q-99" in answer
+    assert not answer.startswith("Saved")
+    assert empty.exists(review_key("T-03", 1, "triage")) is False
+
+
+async def test_save_triage_invalid_shape_returns_error_and_writes_nothing(
+    empty: FileStore,
+) -> None:
+    tool = save_triage(empty, "T-03", 1, (a_finding(id="Q-1"),))
+
+    answer = await call(tool, groups=[])
+
+    assert not answer.startswith("Saved")
+    assert empty.exists(review_key("T-03", 1, "triage")) is False
+
+
+async def test_two_save_triage_bound_to_different_rounds_write_different_keys(
+    empty: FileStore,
+) -> None:
+    highs = (a_finding(id="Q-1"),)
+    first = save_triage(empty, "T-03", 1, highs)
+    second = save_triage(empty, "T-03", 2, highs)
+
+    await call(first, groups=[{"title": "a", "deliverables": ["x"], "findings": ["Q-1"]}])
+    await call(second, groups=[{"title": "b", "deliverables": ["y"], "findings": ["Q-1"]}])
+
+    assert empty.read_json(review_key("T-03", 1, "triage"))["groups"][0]["title"] == "a"
+    assert empty.read_json(review_key("T-03", 2, "triage"))["groups"][0]["title"] == "b"

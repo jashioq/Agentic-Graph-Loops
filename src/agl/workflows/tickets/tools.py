@@ -26,7 +26,7 @@ tool answers with and when to reach for it, not what it is called.
 """
 
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from typing import Any
 
 from agl.core.agent import NO_PARAMS, Tool
@@ -35,6 +35,18 @@ from agl.workflows.tickets.models import (
     TICKETS_KEY as TICKETS_FIELD,  # the field inside the payload, not a store key
 )
 from agl.workflows.tickets.models import TICKETS_SCHEMA, InvalidTicketsError, tickets_from_json
+from agl.workflows.tickets.reviews import (
+    FINDINGS_SCHEMA,
+    TRIAGE_SCHEMA,
+    CoverageError,
+    Finding,
+    InvalidFindingsError,
+    InvalidGroupsError,
+    bug_groups_from_json,
+    check_coverage,
+    findings_from_json,
+    review_key,
+)
 
 __all__ = [
     "SPEC_KEY",
@@ -48,8 +60,11 @@ __all__ = [
     "read_standards",
     "review_quality_tools",
     "review_spec_tools",
+    "save_findings",
     "save_spec",
     "save_tickets",
+    "save_triage",
+    "triage_tools",
 ]
 
 SPEC_KEY = "spec.md"
@@ -193,6 +208,87 @@ def save_tickets(store: Store) -> Tool:
     )
 
 
+def save_findings(store: Store, ticket_id: str, round_: int, source: str) -> Tool:
+    """Stores one reviewer's findings, refusing anything that is not a usable set.
+
+    The key is closed over — `review_key(ticket_id, round_, source)` — so
+    nothing an agent passes can land its findings anywhere else.
+    """
+
+    key = review_key(ticket_id, round_, source)
+
+    async def handler(arguments: dict[str, Any]) -> str:
+        try:
+            findings = findings_from_json(arguments)
+        except InvalidFindingsError as error:
+            return (
+                f"Nothing was saved: {error}. "
+                "Fix that and call this tool again with the whole set of findings."
+            )
+        store.write_json(key, arguments)
+        if not findings:
+            return "Saved: no findings."
+        return f"Saved {len(findings)} finding(s)."
+
+    return Tool(
+        name="save_findings",
+        description=(
+            "Stores the findings from this review. This is the only way findings leave "
+            "this session — the review is not finished until this has been called, even "
+            "when it finds nothing. An empty list is a valid and expected result on a "
+            "clean review: call this tool with an empty `findings` array rather than "
+            "writing a summary. Each finding needs an id, a severity, a title, and a "
+            "detail that says both what is wrong and what would fix it, plus at least one "
+            "file. If something is wrong the call comes back saying what, nothing is "
+            "stored, and you can call again with it fixed."
+        ),
+        schema=FINDINGS_SCHEMA,
+        handler=handler,
+    )
+
+
+def save_triage(store: Store, ticket_id: str, round_: int, highs: Sequence[Finding]) -> Tool:
+    """Stores the triage groups, refusing anything that does not cover every `HIGH`.
+
+    Validated in two stages: `bug_groups_from_json` for shape, then
+    `check_coverage` against the `highs` this closure holds — the same check
+    the caller runs again after reading back, as a backstop.
+    """
+
+    key = review_key(ticket_id, round_, "triage")
+
+    async def handler(arguments: dict[str, Any]) -> str:
+        try:
+            groups = bug_groups_from_json(arguments)
+        except InvalidGroupsError as error:
+            return (
+                f"Nothing was saved: {error}. "
+                "Fix that and call this tool again with the whole set of groups."
+            )
+        try:
+            check_coverage(groups, highs)
+        except CoverageError as error:
+            return (
+                f"Nothing was saved: {error}. "
+                "Fix that and call this tool again with the whole set of groups."
+            )
+        store.write_json(key, arguments)
+        return f"Saved {len(groups)} group(s)."
+
+    return Tool(
+        name="save_triage",
+        description=(
+            "Stores the groups you have triaged the HIGH findings into. Every HIGH "
+            "finding listed above must appear in exactly one group's `findings` list. If "
+            "one is missing, named in two groups, or a group names a finding that is not "
+            "HIGH, the call comes back saying which id and nothing is stored — fix that "
+            "and call this tool again with the whole set of groups."
+        ),
+        schema=TRIAGE_SCHEMA,
+        handler=handler,
+    )
+
+
 # -- what each role is handed ---------------------------------------------
 
 
@@ -214,19 +310,34 @@ def implement_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
     return (get_ticket(store, ticket_id), read_spec(store), read_standards(store))
 
 
-def review_quality_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
+def review_quality_tools(store: Store, ticket_id: str, round_: int) -> tuple[Tool, ...]:
     """Reviewing one ticket against the standards. **No spec access.**
 
     It judges the code as code. Handed the spec it starts re-arguing design
     decisions that were settled with the user, which is not its job and which
     would file findings nobody can act on.
     """
-    return (get_ticket(store, ticket_id), read_standards(store))
+    return (
+        get_ticket(store, ticket_id),
+        read_standards(store),
+        save_findings(store, ticket_id, round_, "quality"),
+    )
 
 
-def review_spec_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
+def review_spec_tools(store: Store, ticket_id: str, round_: int) -> tuple[Tool, ...]:
     """Reviewing one ticket against what was agreed — the reviewer that does hold the spec."""
-    return (get_ticket(store, ticket_id), read_spec(store))
+    return (
+        get_ticket(store, ticket_id),
+        read_spec(store),
+        save_findings(store, ticket_id, round_, "spec"),
+    )
+
+
+def triage_tools(
+    store: Store, ticket_id: str, round_: int, highs: Sequence[Finding]
+) -> tuple[Tool, ...]:
+    """Grouping the `HIGH` findings into bug tickets: nothing to read, one tool to write."""
+    return (save_triage(store, ticket_id, round_, highs),)
 
 
 # -- internals ------------------------------------------------------------

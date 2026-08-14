@@ -14,10 +14,12 @@ the run resolves (see `build_keepalive_server`).
 the Agent tool cannot ask, so a call that may need to ask has to be a top-level
 one. That is a constraint on how callers are shaped, not a bug here.
 
-Exhaustion is the one failure that is never retried: a run that ran out of
-budget or turns fails the same way next time and spends the budget again, so
-three attempts would cost three times as much for the same outcome. Every other
-failure — a transport error, an SDK error result — goes back round the ladder.
+Exhaustion and a bad `output_schema` parse are the two failures never retried:
+both fail the same way next time and spend the budget again, so three attempts
+would cost three times as much for the same outcome — a run out of budget
+stays out of budget, and a model that answered in prose instead of JSON gives
+the same prose back. Every other failure — a transport error, an SDK error
+result — goes back round the ladder, because those *can* differ on a retry.
 
 **Nothing is pre-allowed.** The permission callback allows every tool that is
 not the question tool, so an `allowed_tools` entry would buy one skipped round
@@ -43,6 +45,7 @@ from agl.core.agent.api import (
     AgentBudgetError,
     AgentError,
     AgentOption,
+    AgentOutputError,
     AgentQuestion,
     AgentResult,
     AgentRunner,
@@ -103,7 +106,7 @@ class ClaudeRunner(AgentRunner):
         for _ in range(self._max_attempts):
             try:
                 result = await self._attempt(spec, options, on_activity)
-            except AgentBudgetError:
+            except (AgentBudgetError, AgentOutputError):
                 raise
             except Exception as error:  # noqa: BLE001 - transport, API, or ours
                 failure = error
@@ -123,9 +126,10 @@ class ClaudeRunner(AgentRunner):
     ) -> AgentResult:
         """One call.
 
-        Raises `AgentBudgetError` when the run hit a ceiling, and `AgentError`
-        — from `fold` — for every other way the run failed to complete. Only the
-        first is exempt from the retry ladder.
+        Raises `AgentBudgetError` when the run hit a ceiling, `AgentOutputError`
+        when `output_schema` was set and the text did not parse, and `AgentError`
+        — from `fold` — for every other way the run failed to complete. Only
+        the first two are exempt from the retry ladder.
         """
         stream = self._query(prompt=_streamed(spec.prompt), options=options)
         result = await fold(stream, on_activity, spec.output_schema is not None)

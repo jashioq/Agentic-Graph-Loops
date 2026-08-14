@@ -13,6 +13,12 @@ no way to say "this failed", and a caller handed one as a success would never
 send it back round the retry ladder. Exhaustion is the exception — it is not
 retryable, and the caller has a distinct error and a better message for it — so
 an exhausted run comes back as an ordinary result for the caller to classify.
+
+`expect_json` failures raise `AgentOutputError`, not the bare `AgentError`
+every other failure here raises: a model that answered in prose instead of
+JSON gives the same prose back on an identical retry, so this is the second
+failure — after exhaustion — that a caller should not send back round the
+retry ladder.
 """
 
 import json
@@ -21,7 +27,7 @@ from typing import Any
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent.api import AgentError, AgentResult
+from agl.core.agent.api import AgentError, AgentOutputError, AgentResult
 from agl.core.agent.impl.tools import MCP_PREFIX
 
 __all__ = ["EXHAUSTED", "fold", "summarize_tool_use"]
@@ -81,10 +87,11 @@ async def fold(
 ) -> AgentResult:
     """Consume the stream and return what the run produced.
 
-    Raises `AgentError` if the stream ends without a result message — a run that
-    never resolved is not a result with fields missing — if the result reports
-    an error that is not exhaustion, or if `expect_json` was asked for and the
-    final text does not parse.
+    Raises `AgentError` if the stream ends without a result message — a run
+    that never resolved is not a result with fields missing — or if the
+    result reports an error that is not exhaustion. Raises `AgentOutputError`,
+    an `AgentError` subclass, if `expect_json` was asked for and the final
+    text does not parse.
     """
     text = ""
     session_id: str | None = None
@@ -160,4 +167,4 @@ def _parse(text: str) -> Any:
     try:
         return json.loads(stripped)
     except ValueError as error:
-        raise AgentError(f"expected JSON output, got {text!r}: {error}") from error
+        raise AgentOutputError(f"expected JSON output, got {text!r}: {error}") from error
