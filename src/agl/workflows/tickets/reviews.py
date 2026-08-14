@@ -18,7 +18,7 @@ the interesting one to read later — twenty `MEDIUM`s about the same pattern
 belong in `standards.md`, not in a bug ticket.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -38,6 +38,7 @@ __all__ = [
     "check_coverage",
     "findings_from_json",
     "high",
+    "next_bug_start",
     "review_key",
     "to_bug_tickets",
 ]
@@ -228,6 +229,21 @@ def to_bug_tickets(parent: Ticket, groups: Sequence[BugGroup], start: int) -> tu
         )
         for n, group in enumerate(groups, start=start)
     )
+
+
+def next_bug_start(tickets: Mapping[str, Ticket], parent_id: str) -> int:
+    """One past the highest `<parent_id>-bug-N` id already in `tickets`.
+
+    A second review round must not reuse the first round's ids — the caller
+    passes this to `to_bug_tickets` as `start`.
+    """
+    prefix = f"{parent_id}-bug-"
+    used = [
+        int(ticket_id[len(prefix) :])
+        for ticket_id in tickets
+        if ticket_id.startswith(prefix) and ticket_id[len(prefix) :].isdigit()
+    ]
+    return max(used, default=0) + 1
 
 
 # -- what the triage agent produces ------------------------------------------

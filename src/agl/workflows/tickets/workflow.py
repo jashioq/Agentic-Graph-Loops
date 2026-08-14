@@ -2,8 +2,8 @@
 
 Layer: workflows. This file holds the shape of the loop and nothing else —
 every method delegates to `agents`, `state`, `scheduler`, `merge`, `reviews`,
-`render`, or `tools`. A method that grows past the shape belongs in one of
-those modules, not here.
+`render`, `approval`, `wiring`, `worktrees`, or `tools`. A method that grows
+past the shape belongs in one of those modules, not here.
 
 `Run` owns one run end to end: the `RunState` that is execution truth, the
 `Live` that is display-only, the merge queue, and the live terminal session.
@@ -14,27 +14,27 @@ and it has no local variables, because everything it needs flows through
 
 import asyncio
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 
 from agl.config import ProjectConfig
-from agl.core import paths
-from agl.core.agent import AgentQuestion, AgentRunner
+from agl.core.agent import AgentRunner
 from agl.core.command import ExecResult, run_async
 from agl.core.dag import Dag
 from agl.core.store import Store
-from agl.core.terminal import LiveSession, Option, Question, Row, Rows, Screen, Terminal, Text
+from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
 from agl.workflows.tickets import agents, scheduler, state
 from agl.workflows.tickets import tools as ticket_tools
-from agl.workflows.tickets.agents import AgentContext, Limits
+from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, plain_screen
 from agl.workflows.tickets.merge import MergeQueue, MergeRequest
-from agl.workflows.tickets.models import Status, Ticket, tickets_from_json
+from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import render
-from agl.workflows.tickets.reviews import to_bug_tickets
+from agl.workflows.tickets.reviews import next_bug_start, to_bug_tickets
 from agl.workflows.tickets.state import Halt, Live, RunState
+from agl.workflows.tickets.wiring import Wiring
+from agl.workflows.tickets.worktrees import Work, Worktrees
 
 __all__ = [
     "DecomposeAbortedError",
@@ -44,8 +44,6 @@ __all__ = [
     "Run",
     "Work",
 ]
-
-PROMPTS_DIR = Path(__file__).parent / "prompts"
 
 
 @dataclass(frozen=True)
@@ -59,25 +57,12 @@ class Deps:
     config: ProjectConfig
 
 
-@dataclass(frozen=True)
-class Work:
-    """One ticket, bound to the worktree its work happens in."""
-
-    ticket: Ticket
-    tree: Path
-    branch: str
-
-
 class PreflightError(Exception):
     """Raised when the repository or the label is not in a state to start a run."""
 
 
 class InterviewIncompleteError(Exception):
     """Raised when the interview ended without saving a specification."""
-
-
-class DecomposeAbortedError(Exception):
-    """Raised when the user aborted decomposition before approving any tickets."""
 
 
 class Run:
@@ -94,7 +79,10 @@ class Run:
         self.live: Live | None = None
         self.session: LiveSession | None = None
         self.merge_queue: MergeQueue | None = None
-        self._trees: dict[str, Work] = {}
+        self.worktrees = Worktrees(deps.vcs, deps.config, label, base_branch)
+        self.wiring = Wiring(
+            deps.agent, deps.store, deps.config.repo, self.state, label, lambda: self.live
+        )
         self._pending_merges: dict[str, asyncio.Event] = {}
         self._halted = asyncio.Event()
 
@@ -132,63 +120,19 @@ class Run:
     # -- interview ------------------------------------------------------------
 
     async def interview(self) -> None:
-        async with self.deps.terminal.live(self._plain_screen) as session:
-            ctx = self._ctx(self._ask(session, None))
+        async with self.deps.terminal.live(lambda: plain_screen(self.label)) as session:
+            ctx = self.wiring.ctx(self.wiring.ask(session, None))
             await agents.interview(ctx, self.description)
         if not self.deps.store.exists(ticket_tools.SPEC_KEY):
             raise InterviewIncompleteError("the interview ended without saving a specification")
 
-    def _plain_screen(self) -> Screen:
-        return Screen(content=Rows(Row(Text(self.label))))
-
     # -- decompose --------------------------------------------------------------
 
     async def decompose(self) -> None:
-        tickets: tuple[Ticket, ...] = ()
-
-        def screen() -> Screen:
-            return _decompose_screen(self.label, tickets)
-
-        async with self.deps.terminal.live(screen) as session:
-            revision = ""
-            while True:
-                tickets = await self._propose(session, revision)
-                answer = await self._ask_approval(session, tickets)
-                if answer is None:
-                    break
-                revision = answer
+        approval = Approval(self.deps.terminal, self.deps.store, self.label, self.wiring)
+        tickets = await approval.run()
         self.live = Live(started_at=time.monotonic())
         state.add_tickets(self.state, self.live, tickets)
-
-    async def _propose(self, session: LiveSession, revision: str) -> tuple[Ticket, ...]:
-        if revision:
-            self._append_spec(revision)
-        ctx = self._ctx(self._ask(session, None))
-        await agents.decompose(ctx)
-        payload = self.deps.store.read_json(ticket_tools.TICKETS_KEY)
-        return tickets_from_json(payload)
-
-    async def _ask_approval(self, session: LiveSession, tickets: tuple[Ticket, ...]) -> str | None:
-        question = Question(
-            header=self.label,
-            title=f"Approve these {len(tickets)} tickets?",
-            options=(
-                Option("approve", "Start the run with these tickets"),
-                Option("abort", "Cancel without creating any tickets"),
-            ),
-        )
-        answer = await session.ask(question)
-        if answer.was_free_text:
-            return answer.text
-        if answer.text == "approve":
-            return None
-        raise DecomposeAbortedError("the user aborted decomposition")
-
-    def _append_spec(self, revision: str) -> None:
-        spec = self.deps.store.read(ticket_tools.SPEC_KEY)
-        self.deps.store.write(
-            ticket_tools.SPEC_KEY, f"{spec}\n\n## Decomposition feedback\n\n{revision}\n"
-        )
 
     # -- implement_all ----------------------------------------------------------
 
@@ -266,43 +210,30 @@ class Run:
         )
 
     async def _run_one(self, t: Ticket) -> None:
-        w = self._trees.pop(t.id, None) or self._checkout(t)
+        w = self.worktrees.acquire(t)
         await self.ticket(w)
         if w.ticket.status is Status.PENDING:
-            self._trees[t.id] = w
+            self.worktrees.keep(w)
         else:
-            self.deps.vcs.remove_worktree(w.tree)
-
-    def _checkout(self, ticket: Ticket) -> Work:
-        branch = paths.branch(self.label, ticket.id)
-        base = self._base_for(ticket)
-        tree = self.deps.vcs.add_worktree(self._worktree_dir(ticket.id), branch, base)
-        return Work(ticket=ticket, tree=tree.path, branch=branch)
-
-    def _worktree_dir(self, ticket_id: str) -> Path:
-        return paths.worktree_dir(
-            self.deps.config.trees_root, self.deps.config.name, self.label, ticket_id
-        )
-
-    def _base_for(self, ticket: Ticket) -> str:
-        if ticket.parent is None:
-            return self.state.base_branch
-        return paths.branch(self.label, ticket.parent)
+            self.worktrees.release(w)
 
     # -- one ticket's body --------------------------------------------------
 
     async def implement(self, w: Work) -> None:
-        ctx = self._ctx(self._ticket_ask(w.ticket.id))
-        await agents.implement(ctx, w.ticket, w.tree, self._activity(w.ticket.id))
+        assert self.session is not None
+        ctx = self.wiring.ctx(self.wiring.ticket_ask(self.session, w.ticket.id))
+        await agents.implement(ctx, w.ticket, w.tree, self.wiring.activity(w.ticket.id))
         self.deps.vcs.commit_all(w.tree, f"{w.ticket.id}: {w.ticket.title}")
 
     async def review(self, w: Work) -> tuple[Ticket, ...]:
+        assert self.session is not None
         state.set_status(self.state, self.live, w.ticket.id, Status.IN_REVIEW)
-        ctx = self._ctx(self._ticket_ask(w.ticket.id))
-        activity = self._activity(w.ticket.id)
-        findings = await agents.review(ctx, w.ticket, w.tree, self._base_for(w.ticket), activity)
+        ctx = self.wiring.ctx(self.wiring.ticket_ask(self.session, w.ticket.id))
+        activity = self.wiring.activity(w.ticket.id)
+        base = self.worktrees.base_for(w.ticket)
+        findings = await agents.review(ctx, w.ticket, w.tree, base, activity)
         groups = await agents.triage(ctx, w.ticket, findings, activity)
-        return to_bug_tickets(w.ticket, groups, self._next_bug_start(w.ticket.id))
+        return to_bug_tickets(w.ticket, groups, next_bug_start(self.state.tickets, w.ticket.id))
 
     def file_bugs(self, w: Work, bugs: Sequence[Ticket]) -> None:
         state.file_bugs(self.state, self.live, w.ticket.id, bugs)
@@ -310,25 +241,16 @@ class Run:
 
     async def enqueue_merge(self, w: Work) -> None:
         state.set_status(self.state, self.live, w.ticket.id, Status.MERGING)
-        target = self._base_for(w.ticket)
+        target = self.worktrees.base_for(w.ticket)
         if w.ticket.parent is None:
             cwd = self.deps.config.repo
         else:
-            cwd = self._trees[w.ticket.parent].tree
+            cwd = self.worktrees.tree_of(w.ticket.parent)
         resolved = asyncio.Event()
         self._pending_merges[w.ticket.id] = resolved
         assert self.merge_queue is not None
         self.merge_queue.put(MergeRequest(w.ticket.id, w.branch, target, cwd))
         await resolved.wait()
-
-    def _next_bug_start(self, parent_id: str) -> int:
-        prefix = f"{parent_id}-bug-"
-        used = [
-            int(ticket_id[len(prefix) :])
-            for ticket_id in self.state.tickets
-            if ticket_id.startswith(prefix) and ticket_id[len(prefix) :].isdigit()
-        ]
-        return max(used, default=0) + 1
 
     # -- merge queue callbacks ----------------------------------------------
 
@@ -351,80 +273,3 @@ class Run:
     def _halt(self, halt: Halt) -> None:
         self.state.halt = halt
         self._halted.set()
-
-    # -- agent context and activity ------------------------------------------
-
-    def _ctx(self, ask: Callable[[AgentQuestion], Awaitable[str]]) -> AgentContext:
-        return AgentContext(
-            runner=self.deps.agent,
-            store=self.deps.store,
-            repo=self.deps.config.repo,
-            prompts=PROMPTS_DIR,
-            limits=Limits(),
-            ask=ask,
-        )
-
-    def _activity(self, ticket_id: str) -> Callable[[str], None]:
-        def on_activity(text: str) -> None:
-            assert self.live is not None
-            self.live.activity[ticket_id] = text
-
-        return on_activity
-
-    # -- questions ------------------------------------------------------------
-
-    def _ticket_ask(self, ticket_id: str) -> Callable[[AgentQuestion], Awaitable[str]]:
-        assert self.session is not None
-        return self._ask(self.session, ticket_id)
-
-    def _ask(
-        self, session: LiveSession, ticket_id: str | None
-    ) -> Callable[[AgentQuestion], Awaitable[str]]:
-        async def ask(question: AgentQuestion) -> str:
-            frm = self._suspend(ticket_id)
-            answer = await session.ask(_to_question(ticket_id or self.label, question))
-            self._resume(ticket_id, frm)
-            return answer.text
-
-        return ask
-
-    def _suspend(self, ticket_id: str | None) -> Status | None:
-        if ticket_id is None:
-            return None
-        frm = self.state.tickets[ticket_id].status
-        state.set_status(self.state, self.live, ticket_id, Status.AWAITING_INPUT)
-        return frm
-
-    def _resume(self, ticket_id: str | None, frm: Status | None) -> None:
-        if ticket_id is not None and frm is not None:
-            state.set_status(self.state, self.live, ticket_id, frm)
-
-
-# -- pure -----------------------------------------------------------------
-
-
-def _to_question(header: str, question: AgentQuestion) -> Question:
-    return Question(
-        header=header,
-        title=question.title,
-        options=tuple(Option(o.label, o.description) for o in question.options),
-    )
-
-
-def _decompose_screen(label: str, tickets: tuple[Ticket, ...]) -> Screen:
-    if not tickets:
-        return Screen(content=Rows(Row(Text(label))))
-    dag = Dag()
-    for ticket in tickets:
-        dag.add_node(ticket.id)
-    for ticket in tickets:
-        for blocker in ticket.blocked_by:
-            dag.add_edge(ticket.id, blocker)
-    by_id = {t.id: t for t in tickets}
-    rows = [Row(Text(label))]
-    for level in dag.levels():
-        for ticket_id in level:
-            ticket = by_id[ticket_id]
-            blocked = ", ".join(ticket.blocked_by) if ticket.blocked_by else "—"
-            rows.append(Row(Text(f"{ticket.id}: {ticket.title} (blocked by: {blocked})")))
-    return Screen(content=Rows(*rows))
