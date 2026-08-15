@@ -19,9 +19,9 @@ import asyncio
 import time
 from dataclasses import dataclass, field
 
-from agl.core.dag import Dag
 from agl.core.terminal import Screen
 from agl.core.terminal.impl.rich_terminal import RichTerminal
+from agl.runtime.dag import Dag
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import render
 from agl.workflows.tickets.state import Live, RunState, add_tickets, file_bugs, set_status

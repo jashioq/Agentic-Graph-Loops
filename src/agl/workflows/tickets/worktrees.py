@@ -1,6 +1,6 @@
 """One ticket's worktree, from checkout through the review rounds to teardown.
 
-Layer: workflows. Imports `agl.core.paths` and `agl.core.vcs`, and this
+Layer: workflows. Imports `agl.runtime.paths` and `agl.core.vcs`, and this
 workflow's `models`.
 
 `Worktrees` is the run's only place that creates or removes a worktree. The
@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agl.config import ProjectConfig
-from agl.core import paths
 from agl.core.vcs import Vcs
+from agl.runtime import paths
 from agl.workflows.tickets.models import Ticket
 
 __all__ = ["Work", "Worktrees"]

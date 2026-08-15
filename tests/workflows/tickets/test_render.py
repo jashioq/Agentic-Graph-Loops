@@ -14,9 +14,9 @@ import time
 import pytest
 from rich.console import Console
 
-from agl.core.dag import Dag
 from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
 from agl.core.terminal.impl.screen import to_layout
+from agl.runtime.dag import Dag
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import SESSION_ACTIVITY_WIDTH, render, session_header
 from agl.workflows.tickets.state import (

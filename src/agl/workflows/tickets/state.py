@@ -30,7 +30,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from agl.core.dag import Dag, NodeState
+from agl.runtime.dag import Dag, NodeState
 from agl.workflows.tickets.models import Status, Ticket, can_transition, transition
 
 __all__ = [

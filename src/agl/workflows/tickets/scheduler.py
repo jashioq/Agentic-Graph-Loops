@@ -1,6 +1,6 @@
 """The concurrency loop that turns a ticket graph into running work.
 
-Layer: workflows. Imports `agl.core.dag` and this workflow's `state` and
+Layer: workflows. Imports `agl.runtime.dag` and this workflow's `state` and
 `models`; nothing else from `agl.core`. `body` is what actually does anything —
 worktrees, agents, merges — and this module never learns any of that exists.
 
@@ -31,7 +31,7 @@ that; this module only has to call it correctly.
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from agl.core.dag import Dag, NodeId, NodeState
+from agl.runtime.dag import Dag, NodeId, NodeState
 from agl.workflows.tickets.models import Ticket
 from agl.workflows.tickets.state import RunState
 

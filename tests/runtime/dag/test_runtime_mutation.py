@@ -2,7 +2,7 @@
 
 import pytest
 
-from agl.core.dag import CycleError, Dag, NodeState
+from agl.runtime.dag import CycleError, Dag, NodeState
 
 
 def test_a_new_unblocked_node_is_ready_immediately() -> None:

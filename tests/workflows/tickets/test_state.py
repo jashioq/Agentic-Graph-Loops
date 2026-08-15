@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from agl.core.dag import CycleError, Dag, NodeState
+from agl.runtime.dag import CycleError, Dag, NodeState
 from agl.workflows.tickets.models import IllegalTransitionError, Status, Ticket
 from agl.workflows.tickets.state import (
     DuplicateTicketError,

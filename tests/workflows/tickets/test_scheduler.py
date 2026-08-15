@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from agl.core.dag import Dag, NodeId, NodeState
+from agl.runtime.dag import Dag, NodeId, NodeState
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.scheduler import StalledGraphError, bugs_first, run
 from agl.workflows.tickets.state import Halt, RunState, add_tickets, file_bugs

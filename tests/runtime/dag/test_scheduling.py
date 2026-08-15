@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from agl.core.dag import Dag, NodeId, NodeState, UnknownNodeError
+from agl.runtime.dag import Dag, NodeId, NodeState, UnknownNodeError
 
 
 def chain(*node_ids: str) -> Dag:

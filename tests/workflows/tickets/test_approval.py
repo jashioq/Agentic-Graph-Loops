@@ -10,8 +10,8 @@ from typing import Any
 
 import pytest
 
-from agl.core.dag import Dag
 from agl.core.terminal import Answer
+from agl.runtime.dag import Dag
 from agl.workflows.tickets.approval import Approval, DecomposeAbortedError
 from agl.workflows.tickets.state import Live, RunState
 from agl.workflows.tickets.wiring import Wiring

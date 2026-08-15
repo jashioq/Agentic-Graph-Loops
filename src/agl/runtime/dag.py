@@ -1,6 +1,6 @@
 """A directed acyclic graph of work items and the scheduling questions about it.
 
-Layer: core. A pure data structure — no I/O, no async, no imports from the rest
+Layer: runtime. A pure data structure — no I/O, no async, no imports from the rest
 of `agl`. Node ids are opaque strings; the graph knows nothing about what they
 stand for. A workflow that wants to attach a payload keeps its own dict keyed by
 the same ids.

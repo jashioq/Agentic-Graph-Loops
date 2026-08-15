@@ -1,6 +1,6 @@
 """Depth grouping, used to render the graph during ticket approval."""
 
-from agl.core.dag import Dag
+from agl.runtime.dag import Dag
 
 
 def build(*node_ids: str) -> Dag:

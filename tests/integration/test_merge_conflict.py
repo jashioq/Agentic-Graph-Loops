@@ -23,9 +23,9 @@ from pathlib import Path
 
 import pytest
 
-from agl.core import paths
 from agl.core.vcs import MergeResult
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
 from tests.conftest import commit_file
 from tests.integration.conftest import PROJECT, copy_repo
 

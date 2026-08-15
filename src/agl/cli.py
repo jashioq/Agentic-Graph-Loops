@@ -29,13 +29,13 @@ from agl.config import (
     load_project,
     resolve_agl_home,
 )
-from agl.core import paths
 from agl.core.agent.impl.claude_runner import ClaudeRunner
-from agl.core.paths import InvalidNameError
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal.impl.rich_terminal import RichTerminal
 from agl.core.vcs import Vcs, VcsError
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
+from agl.runtime.paths import InvalidNameError
 
 __all__ = ["main"]
 

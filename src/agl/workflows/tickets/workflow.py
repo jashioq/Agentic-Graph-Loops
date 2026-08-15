@@ -19,13 +19,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 from agl.config import ProjectConfig
-from agl.core import paths
 from agl.core.agent import AgentRunner
 from agl.core.command import ExecResult, run_async
-from agl.core.dag import Dag
 from agl.core.store import Store
 from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
+from agl.runtime import paths
+from agl.runtime.dag import Dag
 from agl.workflows.tickets import agents, scheduler, state
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, session_screen

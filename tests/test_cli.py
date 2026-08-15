@@ -23,8 +23,8 @@ import pytest
 
 from agl.cli import main
 from agl.config import load_project
-from agl.core import paths
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
 from agl.workflows.tickets import workflow as tickets_workflow
 from tests.conftest import git
 

@@ -1,6 +1,6 @@
 """The decompose approval flow: propose tickets, ask approve/revise/abort, loop.
 
-Layer: workflows. Imports `agl.core.dag` and `agl.core.terminal`, and this
+Layer: workflows. Imports `agl.runtime.dag` and `agl.core.terminal`, and this
 workflow's `agents`, `models`, `render`, `tools`, and `wiring`.
 
 Runs before `Run.implement_all` builds the dashboard — the decompose screen
@@ -9,9 +9,9 @@ when there are none yet. `Run.live` exists for the whole session by this
 point, so both states have a timer and an activity string to show.
 """
 
-from agl.core.dag import Dag
 from agl.core.store import Store
 from agl.core.terminal import LiveSession, Option, Question, Row, Rows, Screen, Terminal, Text
+from agl.runtime.dag import Dag
 from agl.workflows.tickets import agents
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket, tickets_from_json

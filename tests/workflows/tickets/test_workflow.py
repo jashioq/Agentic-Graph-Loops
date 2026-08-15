@@ -20,11 +20,11 @@ from typing import Any
 import pytest
 
 from agl.config import ProjectConfig
-from agl.core import paths
 from agl.core.agent import AgentOption, AgentQuestion, AgentResult, AgentRunner, AgentSpec
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Answer, Question, Screen, Terminal
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
 from agl.workflows.tickets import workflow as workflow_module
 from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status

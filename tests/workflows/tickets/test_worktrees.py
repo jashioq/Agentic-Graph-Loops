@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from agl.config import ProjectConfig
-from agl.core import paths
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.worktrees import Worktrees
 from tests.conftest import git

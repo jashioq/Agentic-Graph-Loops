@@ -3,7 +3,7 @@
 import subprocess
 import sys
 
-from agl.core.dag import Dag, NodeId
+from agl.runtime.dag import Dag, NodeId
 
 
 def test_ready_follows_insertion_order_by_default() -> None:
@@ -98,7 +98,7 @@ def test_the_module_imports_and_takes_a_priority_at_runtime() -> None:
     # and not at runtime. In a fresh interpreter, so an earlier import cannot
     # mask a failure here.
     source = (
-        "from agl.core.dag import Dag; "
+        "from agl.runtime.dag import Dag; "
         "d = Dag(priority=lambda node_id: node_id); "
         "d.add_node('B'); d.add_node('A'); print(d.ready())"
     )
