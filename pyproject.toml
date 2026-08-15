@@ -84,10 +84,16 @@ forbidden_modules = ["agl.core", "agl.workflows", "agl.cli", "agl.config"]
 [[tool.importlinter.contracts]]
 name = "Workflows use APIs, never implementations"
 type = "forbidden"
-source_modules = ["agl.workflows"]
+source_modules = ["agl.workflows", "agl.runtime"]
 forbidden_modules = [
   "agl.core.terminal.impl",
   "agl.core.agent.impl",
   "agl.core.store.impl",
   "agl.core.vcs.impl",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Only the cli knows the config file format"
+type = "forbidden"
+source_modules = ["agl.workflows", "agl.runtime"]
+forbidden_modules = ["agl.config"]

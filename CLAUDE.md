@@ -1,32 +1,52 @@
 
 # AGL — Agentic Graph Loops
 
-A runtime for agent workflows. Core modules are reusable building blocks;
-workflows compose them. The first workflow is a ticket orchestrator.
+A runtime for agent workflows. `core` holds the connectors, `runtime` holds the
+reusable machinery a loop is built from, and a workflow assembles them into one
+particular loop. The first workflow is a ticket orchestrator.
 
 ## Architecture rules
 
-1. **No core module imports another core module.** Enforced by import-linter.
-   Cross-module wiring happens in workflows, never in core.
-2. **Core modules report by returning values, not by emitting.** The caller invoked
+1. **Core is connectors.** Every core module talks to something outside AGL —
+   the Claude SDK, git, the filesystem, the terminal, subprocesses — and nothing
+   else does. A module that reaches nothing outside AGL belongs in `runtime`,
+   however low-level it looks: `dag` and `paths` are why the rule exists.
+2. **No core module imports another core module.** Enforced by import-linter
+   over the four connectors — `terminal`, `agent`, `store`, `vcs`. Cross-module
+   wiring happens in `runtime` or a workflow, never between connectors. The one
+   module outside that contract is `core/command.py`, deliberately: it is the
+   shared subprocess runner that `vcs` and the merge build gate both call, and
+   it stays outside by knowing nothing about git, builds or agents.
+3. **Core modules report by returning values, not by emitting.** The caller invoked
    the method and already knows what happened, so there is no `on_event` parameter
    anywhere. The one exception is `agent`: its calls run for minutes, so it takes an
    `on_activity` callback for the dashboard footer. Do not add reporting callbacks to
    any other module.
-3. **Layers:** `cli` → `workflows` → `core`. Never upward.
-4. **Every core module with a stand-in is a package:** `api.py` holds the ABC and
+4. **Runtime reports; the workflow decides.** A runtime module does the work it
+   is asked to do and reports what happened. It never decides what an outcome
+   means and holds no shared mutable run state. Prefer a return value; where a
+   module must ask mid-flight, take a callback the workflow supplied at
+   construction, and give it a safe default. `runtime/merge.py` is the pattern:
+   `MergeQueue` reports `CONFLICT` and asks its `resolve`; the workflow is what
+   knows that means a halt. No `Halt` type exists below `workflows`.
+5. **Layers:** `cli` → `workflows` → `runtime` → `core`. Never upward.
+   `config.py` sits aside, cli-only: nothing below `cli` may import it, so what
+   runtime needs from `config.toml` arrives as `ProjectSettings` data.
+6. **Every core module with a stand-in is a package:** `api.py` holds the ABC and
    its data types; `impl/` holds the implementation. `__init__.py` re-exports the
-   API only. Workflows import from the package root; only `cli.py` imports `impl`.
-5. **`dag` and `paths` are pure single files.** One implementation forever, so no
-   ABC. Do not add a Protocol or ABC for something with one implementation.
-6. **Fakes, not mocks.** Real fake classes in `tests/fakes.py`, inheriting the ABC
+   API only. Workflows and runtime import from the package root; only `cli.py`
+   imports `impl`.
+7. **`dag` and `paths` are pure single files** under `runtime`. One
+   implementation forever, so no ABC. Do not add a Protocol or ABC for something
+   with one implementation. They are leaves: they import nothing else in AGL.
+8. **Fakes, not mocks.** Real fake classes in `tests/fakes.py`, inheriting the ABC
    so an incomplete fake fails at instantiation.
-7. **Test against the real thing where it's cheap.** Git in `tmp_path`, files in
+9. **Test against the real thing where it's cheap.** Git in `tmp_path`, files in
    `tmp_path`. Fake only what is slow, costly, nondeterministic, or interactive.
-8. **Pure where possible.** Rendering, graph algorithms, and conflict
-   classification are pure functions. I/O lives at the edges.
-9. **The ABC describes what workflows need**, not everything the implementation
-   can do. Implementation-only helpers stay private to `impl/`.
+10. **Pure where possible.** Rendering, graph algorithms, and conflict
+    classification are pure functions. I/O lives at the edges.
+11. **The ABC describes what workflows need**, not everything the implementation
+    can do. Implementation-only helpers stay private to `impl/`.
 
 ## Style
 
