@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from agl.core.agent import Model
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Row, Rows, Screen, Text
 from agl.core.vcs.impl.git import Git
@@ -31,7 +32,7 @@ from agl.runtime.context import (
 from agl.runtime.display import Board, live
 from tests.conftest import git
 from tests.fakes import FakeAgentRunner, HeadlessTerminal, MemoryStore
-from tests.runtime.conftest import LABEL, LIMITS, PROJECT, context, feature, settings
+from tests.runtime.conftest import LABEL, PROJECT, context, feature, settings
 
 # -- the context is data ----------------------------------------------------
 
@@ -234,10 +235,11 @@ async def test_the_harness_s_fakes_are_reached_by_the_calls_a_workflow_makes(
             role="interview",
             prompt="what should this do?",
             cwd=ctx.project.repo,
+            model=Model.SONNET,
             limits=ctx.limits,
             on_activity=display.activity(ctx.label),
         )
 
     assert result.text == "the specification"
-    assert agent.specs[0].model == LIMITS.model
+    assert agent.specs[0].model is Model.SONNET
     assert any(LABEL in frame for frame in terminal.frames)

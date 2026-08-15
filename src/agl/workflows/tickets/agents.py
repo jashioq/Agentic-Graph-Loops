@@ -39,13 +39,21 @@ an agent to decide.
 Git writes are denied, not discouraged: Python owns commits and branches, and
 `GIT_WRITES` holds under every permission mode, including `bypassPermissions`,
 so it still applies when a run is unattended.
+
+**Each role names its own model, at its own call site.** `interview`,
+`decompose` and both reviewers are judgement — deciding what to build, how to
+cut it up, and whether what came back is any good — so they run on opus.
+`implement` and `triage` execute against a decision somebody else already made,
+so they run on sonnet. No lookup table: which model a role wants is per-role
+knowledge, which is what this file is for, and a call site that names it is one
+edit away from being reconsidered.
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
-from agl.core.agent import AgentQuestion, Tool
+from agl.core.agent import AgentQuestion, Model, Tool
 from agl.runtime.agents import Prompts, call
 from agl.runtime.context import RunContext
 from agl.workflows.tickets import tools as ticket_tools
@@ -126,6 +134,7 @@ async def interview(
         role="interview",
         prompt=PROMPTS.render("interview", user_input=user_input),
         cwd=ctx.project.repo,
+        model=Model.OPUS,
         agent_tools=ticket_tools.interview_tools(ctx.store),
         permission_mode="plan",
         on_activity=on_activity,
@@ -142,6 +151,7 @@ async def decompose(
         role="decompose",
         prompt=PROMPTS.render("decompose"),
         cwd=ctx.project.repo,
+        model=Model.OPUS,
         agent_tools=ticket_tools.decompose_tools(ctx.store),
         on_activity=on_activity,
         ask=ask,
@@ -162,6 +172,7 @@ async def implement(
         role="implement",
         prompt=PROMPTS.render(prompt_name),
         cwd=tree,
+        model=Model.SONNET,
         agent_tools=ticket_tools.implement_tools(ctx.store, ticket.id),
         disallowed_tools=GIT_WRITES,
         on_activity=on_activity,
@@ -232,6 +243,7 @@ async def triage(
             deliverables=_render_list(ticket.deliverables),
         ),
         cwd=ctx.project.repo,
+        model=Model.SONNET,
         agent_tools=ticket_tools.triage_tools(ctx.store, ticket.id, ticket.review_round, highs),
         disallowed_tools=_NO_FILE_ACCESS,
         on_activity=_prefixed(on_activity, "triage"),
@@ -272,6 +284,7 @@ async def _review(
         role=role,
         prompt=prompt,
         cwd=tree,
+        model=Model.OPUS,
         agent_tools=factory(ctx.store, ticket.id, ticket.review_round),
         disallowed_tools=GIT_WRITES,
         on_activity=_prefixed(on_activity, label),
@@ -295,13 +308,17 @@ async def _call(
     role: str,
     prompt: str,
     cwd: Path,
+    model: Model,
     agent_tools: tuple[Tool, ...],
     disallowed_tools: tuple[str, ...] = (),
     permission_mode: str = "default",
     on_activity: Activity | None = None,
     ask: Ask | None = None,
 ) -> None:
-    """One role's call, with everything the context carries threaded onto it.
+    """One role's call: the model it named, plus what the context carries.
+
+    `model` has no default — every role above states which one it runs on, and
+    a new role that forgets to should not silently inherit somebody else's.
 
     Nothing is returned: every role here reports through a tool, and what it
     wrote is read back from the store rather than from a result.
@@ -314,6 +331,7 @@ async def _call(
         tools=agent_tools,
         disallowed=disallowed_tools,
         permission_mode=permission_mode,
+        model=model,
         limits=ctx.limits,
         on_activity=on_activity,
         ask=ask,

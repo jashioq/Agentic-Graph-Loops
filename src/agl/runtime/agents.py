@@ -3,13 +3,15 @@
 Layer: runtime. Imports `agl.core.agent` and nothing else. It has never heard
 of a role: a role is a workflow's word for one of its calls, and every call
 looks the same from here — a rendered prompt, a directory, some tools, and the
-ceilings the run is under.
+model it runs on.
 
-`Limits` is separate from the call for the same reason a run has one budget and
-many calls: a workflow sets it once, threads it through every call it makes, and
-no call site gets to decide it is the exception. `Prompts` is a directory of
-templates rather than a loader per file, so a workflow points it at its own
-`prompts/` once and names files after that.
+The model is an argument to the call and not a `Limits` field, because roles
+differ: judgement work and execution work do not want the same model, and the
+workflow is the only layer that knows which of the two a call is. `Limits` is
+what a run genuinely does set once and thread through everything — a budget is
+the run's, not the call's. `Prompts` is a directory of templates rather than a
+loader per file, so a workflow points it at its own `prompts/` once and names
+files after that.
 
 Substitution is strict. `Template.substitute` raises on a placeholder nothing
 filled, which is what `PromptError` reports — a `$deliverables` that reached a
@@ -70,6 +72,7 @@ async def call(
     tools: tuple[Tool, ...] = (),
     disallowed: tuple[str, ...] = (),
     permission_mode: str = "default",
+    model: Model,
     limits: Limits,
     on_activity: Callable[[str], None] | None = None,
     ask: Callable[[AgentQuestion], Awaitable[str]] | None = None,
@@ -79,6 +82,9 @@ async def call(
     Keyword-only past the runner: a call has enough of them that positional
     order would be a coin toss at every site, and `tools` and `disallowed` in
     particular are two tuples that would read identically the wrong way round.
+
+    `model` has no default on purpose: a caller that has not decided which
+    model its call wants should not get one picked for it silently.
     """
     spec = AgentSpec(
         prompt=prompt,
@@ -87,7 +93,7 @@ async def call(
         tools=tools,
         disallowed_tools=disallowed,
         permission_mode=permission_mode,
-        model=limits.model,
+        model=model,
         max_turns=limits.max_turns,
         max_budget_usd=limits.max_budget_usd,
     )

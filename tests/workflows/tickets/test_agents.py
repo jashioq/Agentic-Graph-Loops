@@ -549,11 +549,49 @@ async def test_triage_backstop_raises_if_the_store_holds_uncovered_groups(
         await triage(ctx, feature_ticket(), findings, None)
 
 
+# -- each role's model ---------------------------------------------------------
+
+
+async def test_each_role_runs_on_the_model_it_chose(repo: Path) -> None:
+    """The per-role split, pinned: judgement on opus, execution on sonnet.
+
+    Every role is driven once and the assertion is keyed by `spec.role`, so
+    changing any single role's model fails this and names which one.
+    """
+    runner = FakeAgentRunner(
+        {
+            "interview": "ok",
+            "decompose": "ok",
+            "implement": "ok",
+            "review-quality": findings_result(),
+            "review-spec": findings_result(),
+            "triage": groups_result(group()),
+        }
+    )
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
+
+    await interview(ctx, "hello", None)
+    await decompose(ctx, None)
+    await implement(ctx, feature_ticket(), tree, None)
+    await review(ctx, feature_ticket(review_round=1), tree, "main", None)
+    await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
+
+    assert {spec.role: spec.model for spec in runner.specs} == {
+        "interview": Model.OPUS,
+        "decompose": Model.OPUS,
+        "review-quality": Model.OPUS,
+        "review-spec": Model.OPUS,
+        "implement": Model.SONNET,
+        "triage": Model.SONNET,
+    }
+
+
 # -- limits reach every spec ---------------------------------------------------
 
 
 async def test_limits_reach_every_spec(repo: Path) -> None:
-    limits = Limits(model=Model.OPUS, max_turns=12, max_budget_usd=3.5)
+    limits = Limits(max_turns=12, max_budget_usd=3.5)
     runner = FakeAgentRunner(
         {
             "interview": "ok",
@@ -574,7 +612,6 @@ async def test_limits_reach_every_spec(repo: Path) -> None:
     await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
 
     for spec in runner.specs:
-        assert spec.model is Model.OPUS
         assert spec.max_turns == 12
         assert spec.max_budget_usd == 3.5
 
