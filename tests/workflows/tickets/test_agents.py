@@ -391,6 +391,34 @@ async def test_review_propagates_a_failure_rather_than_returning_half_a_review(
     assert ctx.store.exists(review_key("T-03", 1, "quality")) is False
 
 
+# -- review: a role whose report is already on disk is not run again -----------
+
+
+async def test_review_runs_only_the_reviewer_whose_findings_are_missing(repo: Path) -> None:
+    runner = FakeAgentRunner({"review-spec": findings_result(finding(id="S-1"))})
+    ctx = context(repo, runner)
+    ctx.store.write_json(review_key("T-03", 1, "quality"), {"findings": [finding(id="Q-1")]})
+    tree = repo.parent / "tree"
+
+    findings = await review(ctx, feature_ticket(review_round=1), tree, "main", None)
+
+    assert [spec.role for spec in runner.specs] == ["review-spec"]
+    assert {f.id for f in findings} == {"Q-1", "S-1"}
+
+
+async def test_review_with_both_findings_documents_present_calls_neither(repo: Path) -> None:
+    runner = FakeAgentRunner([])
+    ctx = context(repo, runner)
+    ctx.store.write_json(review_key("T-03", 1, "quality"), {"findings": [finding(id="Q-1")]})
+    ctx.store.write_json(review_key("T-03", 1, "spec"), {"findings": [finding(id="S-1")]})
+    tree = repo.parent / "tree"
+
+    findings = await review(ctx, feature_ticket(review_round=1), tree, "main", None)
+
+    assert runner.specs == []
+    assert {f.id for f in findings} == {"Q-1", "S-1"}
+
+
 # -- activity prefixes ---------------------------------------------------------
 
 
@@ -482,6 +510,71 @@ async def test_triage_skips_the_call_for_exactly_one_high_finding(repo: Path) ->
     assert runner.specs == []
     assert len(groups) == 1
     assert groups[0].findings == ("Q-1",)
+
+
+async def test_triage_with_no_high_findings_still_writes_its_document(repo: Path) -> None:
+    runner = FakeAgentRunner([])  # no script needed: nothing should be called
+    ctx = context(repo, runner)
+    findings = (
+        a_finding(id="Q-1", severity=Severity.MEDIUM),
+        a_finding(id="Q-2", severity=Severity.LOW),
+    )
+
+    groups = await triage(ctx, feature_ticket(), findings, None)
+
+    assert groups == ()
+    assert runner.specs == []
+    assert ctx.store.read_json(review_key("T-03", 0, "triage")) == {"groups": []}
+
+
+async def test_triage_with_one_high_finding_writes_the_group_it_built(repo: Path) -> None:
+    runner = FakeAgentRunner([])
+    ctx = context(repo, runner)
+    only = a_finding(id="Q-1", title="Missing null check", detail="auth() can NPE")
+    findings = (only, a_finding(id="Q-2", severity=Severity.LOW))
+
+    await triage(ctx, feature_ticket(), findings, None)
+
+    assert runner.specs == []
+    assert ctx.store.read_json(review_key("T-03", 0, "triage")) == {
+        "groups": [
+            {
+                "title": "Missing null check",
+                "deliverables": ["auth() can NPE"],
+                "findings": ["Q-1"],
+            }
+        ]
+    }
+
+
+async def test_triage_over_an_existing_document_reads_it_back_without_calling(
+    repo: Path,
+) -> None:
+    runner = FakeAgentRunner({"triage": groups_result(group())})
+    ctx = context(repo, runner)
+    findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
+
+    first = await triage(ctx, feature_ticket(), findings, None)
+    second = await triage(ctx, feature_ticket(), findings, None)
+
+    assert len(runner.specs) == 1
+    assert second == first
+
+
+async def test_triage_reads_back_a_recorded_empty_document_without_calling(repo: Path) -> None:
+    # An empty `groups` array is never a legitimate agent result, but it is a
+    # legitimate recorded one: it is how "this round found nothing to fix" is
+    # written down.
+    runner = FakeAgentRunner([])
+    ctx = context(repo, runner)
+    ctx.store.write_json(review_key("T-03", 0, "triage"), {"groups": []})
+
+    findings = (a_finding(id="Q-1", severity=Severity.LOW),)
+
+    groups = await triage(ctx, feature_ticket(), findings, None)
+
+    assert groups == ()
+    assert runner.specs == []
 
 
 async def test_triage_calls_the_agent_for_two_or_more_high_findings(repo: Path) -> None:

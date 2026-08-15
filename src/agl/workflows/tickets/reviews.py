@@ -27,6 +27,7 @@ from agl.workflows.tickets.models import Status, Ticket
 
 __all__ = [
     "FINDINGS_SCHEMA",
+    "GROUPS_KEY",
     "TRIAGE_SCHEMA",
     "BugGroup",
     "CoverageError",
@@ -286,20 +287,26 @@ Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
 than mutating it."""
 
 
-def bug_groups_from_json(data: Any) -> tuple[BugGroup, ...]:
+def bug_groups_from_json(data: Any, *, allow_empty: bool = False) -> tuple[BugGroup, ...]:
     """Parse triage-agent output into groups, raising `InvalidGroupsError`.
 
     Re-checks everything `TRIAGE_SCHEMA` states, the same reasoning as
     `findings_from_json`: a schema handed to a model is a request, not a
     guarantee. Whether the groups it describes actually cover every `HIGH`
     finding is `check_coverage`'s question, not this one's.
+
+    `allow_empty` separates the two readers. An agent that produced no groups
+    was asked to group findings and did not, so the default refuses it. A
+    triage document read back off disk is a *recorded* outcome, and "this round
+    left nothing to fix" is one of the outcomes there is to record — the caller
+    reading its own writing passes `allow_empty=True`.
     """
     payload = _object(data, "output", InvalidGroupsError)
     _known_fields(payload, [GROUPS_KEY], (), "output", InvalidGroupsError)
     raw = payload[GROUPS_KEY]
     if not isinstance(raw, list):
         raise InvalidGroupsError(f"{GROUPS_KEY!r} must be an array, got {_kind(raw)}")
-    if not raw:
+    if not raw and not allow_empty:
         raise InvalidGroupsError(f"{GROUPS_KEY!r} is empty: triage must produce at least one group")
 
     return tuple(_one_group(item, index) for index, item in enumerate(raw))

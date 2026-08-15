@@ -290,6 +290,22 @@ def test_bug_groups_rejects_non_array() -> None:
         bug_groups_from_json({"groups": "nope"})
 
 
+def test_bug_groups_rejects_an_empty_array_by_default() -> None:
+    with pytest.raises(InvalidGroupsError, match="at least one group"):
+        bug_groups_from_json({"groups": []})
+
+
+def test_bug_groups_accepts_an_empty_array_when_asked_to() -> None:
+    # Reading a recorded outcome back, not judging an agent's answer: a round
+    # that produced nothing to fix is written down as an empty `groups` array.
+    assert bug_groups_from_json({"groups": []}, allow_empty=True) == ()
+
+
+def test_bug_groups_still_checks_shape_when_empty_is_allowed() -> None:
+    with pytest.raises(InvalidGroupsError):
+        bug_groups_from_json({"groups": "nope"}, allow_empty=True)
+
+
 # -- schemas are what they claim to be ---------------------------------------
 
 
