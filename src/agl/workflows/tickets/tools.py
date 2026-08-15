@@ -31,10 +31,13 @@ from typing import Any
 
 from agl.core.agent import NO_PARAMS, Tool
 from agl.core.store import MissingKeyError, Store
+from agl.runtime.record import STATE_KEY, StateFile
 from agl.workflows.tickets.models import (
-    TICKETS_KEY as TICKETS_FIELD,  # the field inside the payload, not a store key
+    TICKETS_SCHEMA,
+    InvalidTicketsError,
+    Ticket,
+    tickets_from_json,
 )
-from agl.workflows.tickets.models import TICKETS_SCHEMA, InvalidTicketsError, tickets_from_json
 from agl.workflows.tickets.reviews import (
     FINDINGS_SCHEMA,
     TRIAGE_SCHEMA,
@@ -47,6 +50,8 @@ from agl.workflows.tickets.reviews import (
     findings_from_json,
     review_key,
 )
+from agl.workflows.tickets.snapshot import RunFile
+from agl.workflows.tickets.state import InvalidStateError
 
 __all__ = [
     "SPEC_KEY",
@@ -119,25 +124,34 @@ def read_standards(store: Store) -> Tool:
 def get_ticket(store: Store, ticket_id: str) -> Tool:
     """One ticket, bound at build time. The model is given no way to say which.
 
-    Looked up at call time rather than captured when the tool was built, so a
-    ticket the run has since edited reads as it is now.
+    Answered out of the run's state rather than the decompose agent's output,
+    because the state is where every ticket is. A bug ticket is filed into the
+    state and never appears in `tickets.json`, so a tool reading the
+    decomposition had nothing to say to the bug-fix agents whose prompt opens
+    "Call `get_ticket` first" — it told them their own ticket did not exist.
+
+    Read at call time rather than captured when the tool was built, so a ticket
+    the run has since edited — another round of bugs to wait on, say — reads as
+    it is now.
     """
+
+    state = RunFile(StateFile(store))
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
-            payload = store.read_json(TICKETS_KEY)
-        except MissingKeyError:
-            return f"This run holds no {TICKETS_KEY}: no tickets have been stored yet."
-        except ValueError:
-            return f"The tickets in {TICKETS_KEY} could not be read as JSON."
-        entry = _entry(payload, ticket_id)
-        if entry is None:
+            run = state.load()
+        except InvalidStateError as unreadable:
+            return f"The run's state in {STATE_KEY} could not be read: {unreadable}."
+        if not run.tickets:
+            return f"This run holds no {STATE_KEY}: no tickets have been stored yet."
+        ticket = run.get(ticket_id)
+        if ticket is None:
             return (
-                f"There is no ticket {ticket_id!r} in {TICKETS_KEY}. "
+                f"There is no ticket {ticket_id!r} in this run. "
                 "Nothing you can pass to this tool changes which ticket it answers with, "
                 "so this is something for the run to fix, not you."
             )
-        return json.dumps(entry, indent=2, ensure_ascii=False)
+        return json.dumps(_entry(ticket), indent=2, ensure_ascii=False)
 
     return Tool(
         name="get_ticket",
@@ -360,14 +374,20 @@ def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awa
     return handler
 
 
-def _entry(payload: Any, ticket_id: str) -> dict[str, Any] | None:
-    """One ticket out of the stored payload, by id, tolerating a payload it cannot parse."""
-    if not isinstance(payload, dict):
-        return None
-    entries = payload.get(TICKETS_FIELD)
-    if not isinstance(entries, list):
-        return None
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("id") == ticket_id:
-            return entry
-    return None
+def _entry(ticket: Ticket) -> dict[str, Any]:
+    """One ticket as the role holding it reads it: what to build, and what it waits for.
+
+    The run's own bookkeeping — the status it is parked at, which review round
+    it is on, the sha its branch stood at — is deliberately not here. None of it
+    is anything an agent decides, and a field a role cannot act on is one it can
+    only be misled by. `parent` stays, because on a bug ticket it names the work
+    being fixed, and it is rendered on every ticket rather than only on bugs so
+    that the answer has one shape.
+    """
+    return {
+        "id": ticket.id,
+        "title": ticket.title,
+        "deliverables": list(ticket.deliverables),
+        "blocked_by": list(ticket.blocked_by),
+        "parent": ticket.parent,
+    }
