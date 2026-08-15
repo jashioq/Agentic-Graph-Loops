@@ -1,54 +1,53 @@
 """The ticket workflow: interview, decompose, then drive every ticket to merged.
 
 Layer: workflows. The shape of the loop and this run's policy, and nothing else
-— every step delegates to `agents`, `state`, `screens`, `reviews`, `tools`, or
-the runtime's `scheduler`, `worktrees`, `merge` and `display`. A function that
-grows past the shape belongs in one of those, not here.
+— every step delegates to `agents`, `state`, `snapshot`, `steps`, `screens`,
+`ticket`, or the runtime's `scheduler`, `worktrees`, `merge` and `display`. A
+function that grows past the shape belongs in one of those, not here.
 
-Three things the runtime cannot know are here. `base_for` is the ticket rule
-that a bug branches off its parent. `resolve` with `halt_for` is the whole halt
-policy: what a merge that did not land means, and whether a person pressing
-enter can help. And `failed` is what an exception out of a ticket means.
+**The loop is a reactor over a document.** It does not run the stages in order;
+it asks `stage_of` what the state supports, does that stage, and asks again. The
+difference shows the moment anything is picked back up: a process that died
+between two stages restarts into the one it was owed, because nothing about
+"where we got to" was ever held in a local variable. It is also why deleting a
+document walks the run backwards rather than confusing it.
 
-Everything is a function over `Loop`, the run's collaborators assembled once.
-No object holds the run: the state is a local of `run`, the display is the one
-session `live` yields, and both are passed to the steps that need them. The
-terminal is entered exactly once and each stage swaps the screen on it.
+Two of the three things the runtime cannot know are here. `resolve` with
+`halt_for` is the whole halt policy: what a merge that did not land means, and
+whether a person pressing enter can help. `failed` is what an exception out of a
+ticket means. The third — that a bug branches off its parent — is `base_for`, in
+`ticket.py`, beside the pass that uses it.
+
+Everything is a function over `Loop`, the run's collaborators assembled once. No
+object holds the run: the state is a document, the display is the one session
+`live` yields, and both are passed to the steps that need them. The terminal is
+entered exactly once and each stage swaps the screen on it.
 """
 
 import time
-from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
 
-from agl.core.agent import AgentQuestion
 from agl.core.terminal import Option, Question
 from agl.runtime.context import RunContext, build_gate, preflight
-from agl.runtime.dag import Dag, NodeId, NodeState
+from agl.runtime.dag import NodeId, NodeState
 from agl.runtime.display import Board, Display, live
-from agl.runtime.merge import (
-    MergeConfig,
-    MergeDecision,
-    MergeOutcome,
-    MergeQueue,
-    MergeRequest,
-    MergeStatus,
-)
+from agl.runtime.merge import MergeConfig, MergeDecision, MergeOutcome, MergeQueue
+from agl.runtime.record import RunRecord, StateFile, write_record
 from agl.runtime.scheduler import Claims, drive
-from agl.runtime.worktrees import Work, Worktrees
+from agl.runtime.worktrees import Worktrees
 from agl.workflows.tickets import agents, screens
 from agl.workflows.tickets import tools as ticket_tools
-from agl.workflows.tickets.agents import Activity, Ask
 from agl.workflows.tickets.models import Status, Ticket, tickets_from_json
-from agl.workflows.tickets.reviews import next_bug_start, to_bug_tickets
-from agl.workflows.tickets.state import Halt, RunState, halt_for
+from agl.workflows.tickets.snapshot import RunFile
+from agl.workflows.tickets.state import Halt, dag_of, halt_for, with_halt, with_status, with_tickets
+from agl.workflows.tickets.steps import Stage, Step, look, stage_of, step_for
+from agl.workflows.tickets.ticket import Loop, base_for, one_ticket
 
 __all__ = [
     "DecomposeAbortedError",
     "HaltedError",
     "InterviewIncompleteError",
-    "Job",
-    "Loop",
+    "loop",
     "run",
 ]
 
@@ -73,37 +72,17 @@ class HaltedError(Exception):
         self.halt = halt
 
 
-@dataclass(frozen=True)
-class Loop:
-    """This run's collaborators, assembled by the workflow. Assembly, no behaviour."""
-
-    ctx: RunContext
-    display: Display
-    state: RunState
-    trees: Worktrees
-    merges: MergeQueue
-
-
-@dataclass(frozen=True)
-class Job:
-    """One ticket, bound to the worktree its work happens in and its two callbacks.
-
-    Built once in `one_ticket` and handed to each step below it, so neither
-    callback has to be threaded through every signature. Both close over the
-    ticket id: concurrent tickets sharing either would report into each other's
-    rows and answer each other's questions.
-
-    `ticket` is the snapshot this pass began from — id, title, deliverables and
-    the review round the steps below are running, none of which move while it
-    runs. Where the ticket *is* moves constantly, so anything asking about its
-    status asks the state instead.
-    """
-
-    ticket: Ticket
-    tree: Path
-    branch: str
-    on_activity: Activity
-    ask: Ask
+# The status a ticket is claimed into, per step it is owed. What the dashboard
+# says about a row the instant it is admitted is the truth about that row, on a
+# resumed run as much as on a fresh one — a ticket whose work is already done
+# and only needs merging is claimed as `MERGING`, not started over as
+# `IN_PROGRESS`.
+_STATUS_FOR: dict[Step, Status] = {
+    Step.IMPLEMENT: Status.IN_PROGRESS,
+    Step.REVIEW: Status.IN_REVIEW,
+    Step.MERGE: Status.MERGING,
+    Step.DONE: Status.MERGED,
+}
 
 
 # -- the run --------------------------------------------------------------
@@ -112,21 +91,49 @@ class Job:
 async def run(ctx: RunContext) -> None:
     """One run, end to end. Edit this function to change the shape of the loop."""
     preflight(ctx.vcs, ctx.store, ctx.label)
+    write_record(
+        ctx.store,
+        RunRecord(
+            workflow=ctx.workflow,
+            label=ctx.label,
+            request=ctx.request,
+            base_branch=ctx.base_branch,
+            project=ctx.project.name,
+            max_concurrent=ctx.max_concurrent,
+        ),
+    )
+    await loop(ctx)
+
+
+async def loop(ctx: RunContext) -> None:
+    """React to the state until it says the run is done, or a halt outlives a stage.
+
+    The whole run is this: ask what stage the state supports, do it, ask again.
+    No stage knows what comes after it, and none of them returns anything the
+    next one needs — what one stage produced is a document the next one reads.
+    """
     board = Board(started_at=time.monotonic())
+    state = RunFile(StateFile(ctx.store))
     async with live(ctx.terminal, board) as display:
-        display.show(lambda: screens.session(ctx.label, board))
-        await interview(ctx, display)
-        state = RunState(ctx.label, ctx.base_branch, board)
-        state.add(await decompose(ctx, display, board))
-        board.mark(screens.APPROVED)
-        display.show(lambda: screens.dashboard(state, time.monotonic()))
-        await implement_all(ctx, display, state)
-    if state.halt is not None:
-        raise HaltedError(state.halt)
+        while True:
+            match stage_of(state.load(), ctx.store):
+                case Stage.INTERVIEW:
+                    await interview(ctx, display, board)
+                case Stage.DECOMPOSE:
+                    await decompose(ctx, display, state, board)
+                case Stage.IMPLEMENT:
+                    await implement_all(ctx, display, state, board)
+                case Stage.DONE:
+                    break
+            if state.load().halt is not None:
+                break
+    if (halt := state.load().halt) is not None:
+        raise HaltedError(halt)
 
 
-async def interview(ctx: RunContext, display: Display) -> None:
+async def interview(ctx: RunContext, display: Display, board: Board) -> None:
     """Interrogate the user until the run has a specification to work from."""
+    display.show(lambda: screens.session(ctx.label, board))
     await agents.interview(
         ctx, ctx.request, display.activity(ctx.label), partial(display.ask_agent, ctx.label)
     )
@@ -134,12 +141,13 @@ async def interview(ctx: RunContext, display: Display) -> None:
         raise InterviewIncompleteError("the interview ended without saving a specification")
 
 
-async def decompose(ctx: RunContext, display: Display, board: Board) -> tuple[Ticket, ...]:
+async def decompose(ctx: RunContext, display: Display, state: RunFile, board: Board) -> None:
     """Propose tickets, ask for approval, and loop on a revision until settled.
 
     A revision is appended to the spec rather than passed to the next call, so
     the agent re-reads one document that says everything and the feedback is
-    still there when a later role reads it.
+    still there when a later role reads it. Approval is the write that ends the
+    stage: the tickets go into the state, and the state is what says so.
     """
     tickets: tuple[Ticket, ...] = ()
     display.show(lambda: screens.decompose(ctx.label, board, tickets))
@@ -160,7 +168,9 @@ async def decompose(ctx: RunContext, display: Display, board: Board) -> tuple[Ti
         )
         if not answer.was_free_text:
             if answer.text == "approve":
-                return tickets
+                state.update(partial(with_tickets, tickets=tickets))
+                board.mark(screens.APPROVED)
+                return
             raise DecomposeAbortedError("the user aborted decomposition")
         spec = ctx.store.read(ticket_tools.SPEC_KEY)
         ctx.store.write(
@@ -169,8 +179,13 @@ async def decompose(ctx: RunContext, display: Display, board: Board) -> tuple[Ti
         )
 
 
-async def implement_all(ctx: RunContext, display: Display, state: RunState) -> None:
+async def implement_all(
+    ctx: RunContext, display: Display, state: RunFile, board: Board
+) -> None:
     """Every approved ticket to merged, at most `max_concurrent` at a time."""
+    display.show(
+        lambda: screens.dashboard(state.latest(), board, ctx.label, time.monotonic())
+    )
     merges = MergeQueue(
         ctx.vcs,
         MergeConfig(
@@ -178,33 +193,74 @@ async def implement_all(ctx: RunContext, display: Display, state: RunState) -> N
             resolve=partial(resolve, display, state, ctx.label),
         ),
     )
-    loop = Loop(ctx, display, state, _trees(ctx), merges)
+    run_loop = Loop(ctx, display, state, board, _trees(ctx), merges)
     async with merges.running():
         # A ticket whose merge did not land is parked in `submit` until
         # `resolve` deals with it, so a halt still set when a pass returns is
         # one nothing resolved — exactly `drive`'s stopping condition.
         await drive(
-            _claims(state.dag),
-            partial(one_ticket, loop),
+            claims(run_loop),
+            partial(one_ticket, run_loop),
             ctx.max_concurrent,
             partial(failed, state),
-            state.is_halted,
+            lambda: state.load().halt is not None,
         )
 
 
-def _claims(dag: Dag) -> Claims:
-    """The graph this run holds, as the scheduler's four questions. Temporary:
-    it goes when the workflow's state moves into a document."""
+def claims(run_loop: Loop) -> Claims:
+    """The scheduler's four questions, answered off the state document every time.
+
+    Nothing is held between them. Each derives a graph, asks it one thing, and
+    throws it away, so a state a person edited mid-run — or one another pass
+    just wrote — is what the next admission is decided from.
+    """
+    state = run_loop.state
+
+    def next_() -> NodeId | None:
+        """Claim one ticket, atomically: load, decide, write, no `await`."""
+        current = state.load()
+        node = dag_of(current).claim_next()
+        if node is None:
+            return None
+        ticket = current.ticket(node)
+        step = step_for(
+            look(
+                run_loop.ctx.vcs,
+                run_loop.ctx.store,
+                ticket,
+                run_loop.trees.branch_for(node),
+                base_for(run_loop, ticket),
+            )
+        )
+        state.write(with_status(current, node, _STATUS_FOR[step]))
+        return node
+
+    def release(node: NodeId) -> None:
+        """Hand a ticket whose pass raised back to the queue.
+
+        A merged ticket is left alone: it is terminal, and a resumed run can
+        admit one — a ticket whose branch was already on its base is claimed as
+        `MERGED` — so a pass that raised over one would otherwise ask for a move
+        the life cycle forbids. This runs inside the scheduler's own error
+        handler, where an exception would leave the loop waiting on a slot that
+        nothing is ever going to free.
+        """
+        state.update(
+            lambda run: run
+            if run.ticket(node).status is Status.MERGED
+            else with_status(run, node, Status.PENDING)
+        )
 
     def stalled() -> tuple[NodeId, ...] | None:
+        dag = dag_of(state.load())
         if not dag.is_stalled():
             return None
         return tuple(n for n in dag.nodes() if dag.state(n) is NodeState.PENDING)
 
     return Claims(
-        next=dag.claim_next,
-        release=dag.release,
-        complete=dag.is_complete,
+        next=next_,
+        release=release,
+        complete=lambda: dag_of(state.load()).is_complete(),
         stalled=stalled,
     )
 
@@ -213,7 +269,7 @@ def _claims(dag: Dag) -> Claims:
 
 
 async def resolve(
-    display: Display, state: RunState, label: str, outcome: MergeOutcome
+    display: Display, state: RunFile, label: str, outcome: MergeOutcome
 ) -> MergeDecision:
     """What a merge that did not land means to this run: the halt policy.
 
@@ -222,120 +278,20 @@ async def resolve(
     cannot ends the queue, which answers every ticket still waiting on a merge
     so the run can come back with the halt still set.
     """
-    state.halt = halt_for(outcome)  # the dashboard shows it on the next frame
-    if not state.halt.resumable:
+    halt = halt_for(outcome)
+    state.update(lambda run: with_halt(run, halt))  # the dashboard shows it next frame
+    if not halt.resumable:
         return MergeDecision.STOP
     await display.confirm(label, "press enter to continue")
-    state.halt = None
+    state.update(lambda run: with_halt(run, None))
     return MergeDecision.RETRY
 
 
-def failed(state: RunState, node_id: NodeId | None, error: BaseException) -> None:
+def failed(state: RunFile, node_id: NodeId | None, error: BaseException) -> None:
     """An exception out of a ticket, or out of the loop itself: a halt to restart from."""
     who = node_id if node_id is not None else "the run"
-    state.halt = Halt(f"{who} failed: {error}", str(error), resumable=False)
-
-
-def base_for(loop: Loop, ticket: Ticket) -> str:
-    """The branch a ticket's own branch is cut from: the run's base, or its parent's."""
-    if ticket.parent is None:
-        return loop.state.base_branch
-    return loop.trees.branch_for(ticket.parent)
-
-
-# -- one ticket -----------------------------------------------------------
-
-
-async def one_ticket(loop: Loop, node_id: NodeId) -> None:
-    """One pass over one ticket: implement it, review it, then merge or file bugs.
-
-    Anything but a merged ticket keeps its worktree — work still to do, or a
-    merge that did not land — so a halted run leaves what a person may want to
-    look at where it is.
-    """
-    ticket = loop.state.tickets[node_id]
-    work = loop.trees.acquire(ticket.id, loop.trees.branch_for(ticket.id), base_for(loop, ticket))
-    task = job(loop, ticket, work)
-    loop.state.set_status(ticket.id, Status.IN_PROGRESS)
-    if ticket.first_pass:
-        await implement(loop, task)
-    if bugs := await review(loop, task):
-        loop.state.file_bugs(ticket.id, bugs)
-    else:
-        await merge_it(loop, task)
-    # `ticket` is the snapshot this pass started from, and every step above has
-    # moved the run's copy since; where the ticket ended up is a question only
-    # the state can answer.
-    if loop.state.tickets[ticket.id].status is Status.MERGED:
-        loop.trees.release(work)
-    else:
-        loop.trees.keep(work)
-
-
-def job(loop: Loop, ticket: Ticket, work: Work) -> Job:
-    """One ticket bound to its worktree and to the two callbacks its calls need."""
-    return Job(
-        ticket=ticket,
-        tree=work.tree,
-        branch=work.branch,
-        on_activity=loop.display.activity(ticket.id),
-        ask=asker(loop.state, loop.display, ticket.id),
-    )
-
-
-def asker(state: RunState, display: Display, ticket_id: str) -> Ask:
-    """The `ask` one ticket's calls are given, closed over the ticket it is for.
-
-    The ticket is suspended into `AWAITING_INPUT` for as long as the question is
-    open, so the dashboard says which row is waiting and the question says who
-    is asking. A shared `ask` would land answers on the wrong agent in a log
-    that looks perfectly well-formed, so every ticket gets its own.
-    """
-
-    async def ask(question: AgentQuestion) -> str:
-        with state.awaiting(ticket_id):
-            return await display.ask_agent(ticket_id, question)
-
-    return ask
-
-
-async def implement(loop: Loop, job: Job) -> None:
-    """The implementation agent, and the one commit its work becomes."""
-    await agents.implement(loop.ctx, job.ticket, job.tree, job.on_activity, job.ask)
-    loop.ctx.vcs.commit_all(job.tree, f"{job.ticket.id}: {job.ticket.title}")
-
-
-async def review(loop: Loop, job: Job) -> tuple[Ticket, ...]:
-    """Both reviewers and triage, as the bug tickets they come to."""
-    loop.state.set_status(job.ticket.id, Status.IN_REVIEW)
-    base = base_for(loop, job.ticket)
-    findings = await agents.review(
-        loop.ctx, job.ticket, job.tree, base, job.on_activity, job.ask
-    )
-    groups = await agents.triage(loop.ctx, job.ticket, findings, job.on_activity, job.ask)
-    start = next_bug_start(loop.state.tickets, job.ticket.id)
-    return to_bug_tickets(job.ticket, groups, start)
-
-
-async def merge_it(loop: Loop, job: Job) -> None:
-    """Hand the ticket's branch to the queue and record what became of it.
-
-    A bug merges into its parent's branch, in the parent's still-open worktree;
-    everything else into the run's base branch, in the repository root.
-    `STOPPED` is the queue saying nobody will ever deal with this one — the run
-    is already ending on somebody else's halt — so the ticket is left `MERGING`,
-    which is what the last frame shows.
-    """
-    loop.state.set_status(job.ticket.id, Status.MERGING)
-    parent = job.ticket.parent
-    cwd = loop.ctx.project.repo if parent is None else loop.trees.tree_of(parent)
-    outcome = await loop.merges.submit(
-        MergeRequest(job.ticket.id, job.branch, base_for(loop, job.ticket), cwd)
-    )
-    if outcome.status is MergeStatus.MERGED:
-        loop.state.set_status(job.ticket.id, Status.MERGED)
-    elif outcome.status is MergeStatus.ABANDONED:
-        loop.state.board.activity[job.ticket.id] = "merge abandoned"
+    halt = Halt(f"{who} failed: {error}", str(error), resumable=False)
+    state.update(lambda run: with_halt(run, halt))
 
 
 def _trees(ctx: RunContext) -> Worktrees:

@@ -18,7 +18,7 @@ the interesting one to read later — twenty `MEDIUM`s about the same pattern
 belong in `standards.md`, not in a bug ticket.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -28,6 +28,7 @@ from agl.workflows.tickets.models import Status, Ticket
 __all__ = [
     "FINDINGS_SCHEMA",
     "GROUPS_KEY",
+    "REVIEWERS",
     "TRIAGE_SCHEMA",
     "BugGroup",
     "CoverageError",
@@ -43,6 +44,18 @@ __all__ = [
     "review_key",
     "to_bug_tickets",
 ]
+
+
+REVIEWERS: tuple[str, ...] = ("quality", "spec")
+"""The two reviewers, named by the findings document each one writes.
+
+Every other name a reviewer has is this one with something around it — its role
+is `review-<source>`, its prompt is `review_<source>`, its activity is prefixed
+with it — so the document a role is checked for and the role that would write it
+cannot drift apart. It lives here, beside `review_key`, because two callers ask
+about those documents: `agents` runs the roles that write them, and `steps`
+reads their presence to decide whether a ticket's review is finished.
+"""
 
 
 class Severity(Enum):
@@ -232,16 +245,17 @@ def to_bug_tickets(parent: Ticket, groups: Sequence[BugGroup], start: int) -> tu
     )
 
 
-def next_bug_start(tickets: Mapping[str, Ticket], parent_id: str) -> int:
-    """One past the highest `<parent_id>-bug-N` id already in `tickets`.
+def next_bug_start(ticket_ids: Iterable[str], parent_id: str) -> int:
+    """One past the highest `<parent_id>-bug-N` id already among `ticket_ids`.
 
     A second review round must not reuse the first round's ids — the caller
-    passes this to `to_bug_tickets` as `start`.
+    passes this to `to_bug_tickets` as `start`. Ids alone, because that is all
+    the answer depends on: the caller has whatever it holds them in.
     """
     prefix = f"{parent_id}-bug-"
     used = [
         int(ticket_id[len(prefix) :])
-        for ticket_id in tickets
+        for ticket_id in ticket_ids
         if ticket_id.startswith(prefix) and ticket_id[len(prefix) :].isdigit()
     ]
     return max(used, default=0) + 1

@@ -70,6 +70,15 @@ LEGAL = [
     (Status.AWAITING_INPUT, Status.IN_PROGRESS),
     (Status.AWAITING_INPUT, Status.IN_REVIEW),
     (Status.AWAITING_INPUT, Status.MERGING),
+    # A pending ticket is one nobody is working, not one nothing has been done
+    # to: a run picked back up reads git and claims it straight into whatever
+    # status the repository already implies.
+    (Status.PENDING, Status.IN_REVIEW),
+    (Status.PENDING, Status.MERGING),
+    (Status.PENDING, Status.MERGED),
+    # And the other direction: a claim can always be given back, which is what
+    # the scheduler does with a ticket whose pass raised.
+    (Status.IN_PROGRESS, Status.PENDING),
     # Re-entry: a status a ticket is already in can be set again, which is what
     # lets the caller re-stamp how long it has been there.
     (Status.PENDING, Status.PENDING),
@@ -79,10 +88,6 @@ LEGAL = [
 ]
 
 ILLEGAL = [
-    # Nothing skips straight past the work.
-    (Status.PENDING, Status.IN_REVIEW),
-    (Status.PENDING, Status.MERGING),
-    (Status.PENDING, Status.MERGED),
     # An agent has to be running for a question to exist.
     (Status.PENDING, Status.AWAITING_INPUT),
     (Status.AWAITING_INPUT, Status.AWAITING_INPUT),
@@ -90,8 +95,8 @@ ILLEGAL = [
     (Status.IN_PROGRESS, Status.MERGED),
     (Status.IN_REVIEW, Status.MERGED),
     (Status.AWAITING_INPUT, Status.MERGED),
-    # Work does not run backwards; findings go through PENDING and bug tickets.
-    (Status.IN_PROGRESS, Status.PENDING),
+    # Work does not run backwards within a claim: a ticket that is under review
+    # is not sent back to an implementation agent, it is given back to the queue.
     (Status.IN_REVIEW, Status.IN_PROGRESS),
     (Status.MERGING, Status.IN_PROGRESS),
     (Status.MERGING, Status.IN_REVIEW),
@@ -121,17 +126,12 @@ def test_fields_the_agent_does_not_supply_come_back_with_their_defaults() -> Non
     assert parsed.parent is None
     assert parsed.blocked_by == ()
     assert parsed.resume_to is None
+    assert parsed.base_sha is None
 
 
 def test_is_bug_is_exactly_having_a_parent() -> None:
     assert ticket().is_bug is False
     assert ticket(id="T-01-bug-1", parent="T-01").is_bug is True
-
-
-def test_first_pass_is_exactly_the_zeroth_review_round() -> None:
-    assert ticket().first_pass is True
-    assert ticket(review_round=1).first_pass is False
-    assert ticket(review_round=2).first_pass is False
 
 
 # -- transitions ----------------------------------------------------------
@@ -186,7 +186,7 @@ def test_an_illegal_transition_raises_and_builds_nothing() -> None:
     subject = ticket()
 
     with pytest.raises(IllegalTransitionError):
-        transition(subject, Status.MERGED)
+        transition(subject, Status.AWAITING_INPUT)
 
     assert subject.status is Status.PENDING
 

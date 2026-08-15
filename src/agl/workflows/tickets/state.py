@@ -1,45 +1,43 @@
-"""One run's state, and the operations that move it without letting it drift.
+"""One run's state as a value, and the pure transitions that move it.
 
-Layer: workflows. Pure — no I/O, no async, and nothing from below but `dag`,
-the display's `Board`, and the merge queue's vocabulary of outcomes. Every
-method is a plain operation over the two structures a run holds, so a test can
-build any situation by hand and assert on it.
+Layer: workflows. Pure — no I/O, no async, and nothing from below but `dag` and
+the merge queue's vocabulary of outcomes. Every function here is a plain
+operation over a `Run`, so a test can build any situation by hand and assert on
+it, and so a caller can decide what to do with a new state before committing to
+it.
 
-`RunState` is execution truth: delete it and the run cannot proceed. The `Board`
-it carries is ephemeral and read only by rendering: nothing here ever reads it
-back to decide anything, so a run whose board is thrown away still finishes
-correctly, you just cannot watch it. It is held here rather than threaded
-through every call because the single writer below has to stamp it, and a
-caller that has to remember to pass the board is a caller that will forget.
+`Run` is a frozen snapshot: the tickets, and the halt. Nothing moves in place.
+Every transition takes a `Run` and returns a new one, which is what makes the
+document in `snapshot.py` the only writer and read-modify-write the only shape a
+mutation can take. The label and the base branch are deliberately *not* here —
+they are what a run was asked for, they live in `run.json`, and they reach every
+use site through `RunContext`.
 
-Two structures answer questions about the same tickets. `Dag` holds scheduling
-state and `Ticket` holds workflow state; both are true at once, and the
-invariant is that they never contradict each other — a `PENDING` node is a
-`PENDING` ticket, a `CLAIMED` node is one an agent or the merge queue has
-(`IN_PROGRESS`, `IN_REVIEW`, `MERGING`, `AWAITING_INPUT`), and a `DONE` node is
-a `MERGED` ticket. `_NODE_STATE` below is that table, and `check_consistent`
-enforces it.
+**Everything derivable is derived.** The graph is not stored; `dag_of` builds one
+from `blocked_by` plus the status table, and nothing keeps it, so a graph cannot
+contradict the tickets it came from. `blocked_by` *is* the graph: `with_bugs`
+records its parent→bug edges by appending the bug ids to the parent's blockers,
+and there is no second structure to keep in step. Display order is recomputed
+too, for the same reason.
 
-The invariant is the one most likely to drift once a scheduler is driving all
-this, and here is the cheapest place to catch the drift. `set_status` is the
-single writer for every part of it — ticket status, graph state, and the board
-stamp — so the three move as one and no caller can update two and forget the
-third.
+`check` is the other half of that trade. With the state in a document a person
+can open and edit, the shapes that used to be impossible by construction are now
+merely unwritten, so they are checked instead — once, at the point a document
+becomes a `Run`, with a message naming what is wrong rather than halfway through
+a run that has already started worktrees.
 
-`halt_for` is the other thing here: pure, and message-writing. The merge queue
+`halt_for` is the last thing here: pure, and message-writing. The merge queue
 reports facts about git and the build, and this is where they become the halt a
 person reads. It sits with the run that shows it rather than in the runtime,
 because "resumable" is a statement about what this run can do about an outcome,
 which no queue can know.
 """
 
-from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from agl.core.command import ExecResult
-from agl.runtime.dag import Dag, NodeId, NodeState
-from agl.runtime.display import Board
+from agl.runtime.dag import CycleError, Dag, NodeId, NodeState
 from agl.runtime.merge import MergeOutcome, MergeStatus
 from agl.workflows.tickets.models import Status, Ticket, transition
 
@@ -47,11 +45,19 @@ __all__ = [
     "TAIL_LINES",
     "DuplicateTicketError",
     "Halt",
-    "InconsistentStateError",
-    "RunState",
+    "InvalidStateError",
+    "Run",
     "UnknownTicketError",
     "bugs_first",
+    "check",
+    "dag_of",
+    "display_order",
     "halt_for",
+    "with_base_sha",
+    "with_bugs",
+    "with_halt",
+    "with_status",
+    "with_tickets",
 ]
 
 
@@ -73,8 +79,8 @@ class Halt:
     resumable: bool = True
 
 
-class InconsistentStateError(Exception):
-    """Raised when the graph and the tickets disagree about the same ticket."""
+class InvalidStateError(Exception):
+    """Raised when a `Run` does not describe a state this workflow could reach."""
 
 
 class UnknownTicketError(Exception):
@@ -93,8 +99,152 @@ class DuplicateTicketError(Exception):
         self.ticket_id = ticket_id
 
 
-# The invariant, as data. Read one way it says what graph state a status
-# implies; read the other it is the table `check_consistent` enforces.
+@dataclass(frozen=True)
+class Run:
+    """One run's whole state, as a value. Every change produces a new one.
+
+    Tickets are a tuple in insertion order rather than a mapping, because the
+    order is itself state — it is what `display_order` and the graph's node
+    ordering are built from, and a document round trip has to preserve it.
+    Lookup by id is a scan over a list that is tens of entries long at most.
+    """
+
+    tickets: tuple[Ticket, ...] = ()
+    halt: Halt | None = None
+
+    def ticket(self, ticket_id: str) -> Ticket:
+        """The ticket, or `UnknownTicketError`."""
+        found = self.get(ticket_id)
+        if found is None:
+            raise UnknownTicketError(ticket_id)
+        return found
+
+    def get(self, ticket_id: str) -> Ticket | None:
+        """The ticket, or `None` — for a caller that is asking rather than assuming."""
+        for ticket in self.tickets:
+            if ticket.id == ticket_id:
+                return ticket
+        return None
+
+
+# -- transitions ----------------------------------------------------------
+
+
+def with_tickets(run: Run, tickets: Sequence[Ticket]) -> Run:
+    """`run` plus `tickets`: the approved set, or a round of bugs.
+
+    Every id has to be new and every blocker has to resolve — to a ticket
+    already in the run or to another one in this batch, so a batch may name its
+    blockers in any order. A new ticket joins `PENDING`, because nothing has
+    happened to it yet, and `check` at the end is what catches the one thing no
+    up-front pass can see: a cycle closed within the batch.
+    """
+    incoming = tuple(tickets)
+    seen: set[str] = set()
+    known = {ticket.id for ticket in run.tickets}
+    for ticket in incoming:
+        if ticket.id in known or ticket.id in seen:
+            raise DuplicateTicketError(ticket.id)
+        if ticket.status is not Status.PENDING:
+            raise InvalidStateError(
+                f"ticket {ticket.id!r} joins the run as {ticket.status.value}, "
+                "but a new ticket is pending"
+            )
+        seen.add(ticket.id)
+    for ticket in incoming:
+        for blocker in ticket.blocked_by:
+            if blocker not in known | seen:
+                raise UnknownTicketError(blocker)
+
+    widened = replace(run, tickets=(*run.tickets, *incoming))
+    check(widened)
+    return widened
+
+
+def with_status(run: Run, ticket_id: str, status: Status) -> Run:
+    """`run` with one ticket moved to `status`, through the life cycle's own rules.
+
+    Raises `UnknownTicketError` for an id the run does not hold and
+    `IllegalTransitionError` for a move the life cycle forbids. Nothing is built
+    in either case, which is the freedom a frozen ticket buys.
+    """
+    return _replaced(run, transition(run.ticket(ticket_id), status))
+
+
+def with_bugs(run: Run, parent_id: str, bugs: Sequence[Ticket]) -> Run:
+    """Fold review findings into the run as work the parent now waits on.
+
+    One function because it is one write. The old graph mutation had a
+    load-bearing ordering — add the nodes, add the edges, *then* release the
+    parent, or a scheduler looking in the gap claims it out from under the very
+    work meant to block it — and that ordering is invisible here: a reader only
+    ever sees the whole result, because the whole result is what gets written.
+
+    The parent's `review_round` advances here too, because the review that
+    produced these findings is the review that just finished. Bumping it
+    anywhere else would leave a window in which the parent is back in the graph
+    carrying a round it has completed, and the next round's findings would be
+    written over the last round's documents.
+
+    Every bug has to name `parent_id` as its parent, and none may be blocked by
+    it — a bug waiting on the ticket that is waiting on the bug is the one way
+    this graph can cycle. A bug can still reach the parent the long way round,
+    through some other ticket that already waits on it, and `check` refuses
+    that; the caller is left holding the run it had.
+    """
+    parent = run.ticket(parent_id)
+    incoming = tuple(bugs)
+    if not incoming:
+        raise ValueError(f"no bugs to file against {parent_id!r}")
+    for bug in incoming:
+        if bug.parent != parent_id:
+            raise ValueError(f"bug {bug.id!r} names parent {bug.parent!r}, not {parent_id!r}")
+        if parent_id in bug.blocked_by:
+            raise ValueError(
+                f"bug {bug.id!r} cannot be blocked by {parent_id!r}, the ticket it fixes"
+            )
+
+    waiting = transition(
+        replace(
+            parent,
+            blocked_by=(*parent.blocked_by, *(bug.id for bug in incoming)),
+            review_round=parent.review_round + 1,
+        ),
+        Status.PENDING,
+    )
+    filed = _replaced(with_tickets(run, incoming), waiting)
+    check(filed)
+    return filed
+
+
+def with_halt(run: Run, halt: Halt | None) -> Run:
+    """`run` stopped for the reason `halt` gives, or carrying on when it is `None`."""
+    return replace(run, halt=halt)
+
+
+def with_base_sha(run: Run, ticket_id: str, sha: str) -> Run:
+    """`run` with one ticket remembering where its branch stood before its work.
+
+    Written in the same synchronous step that opens the ticket's worktree, and
+    never again: re-taking it after a commit has landed would erase the very
+    difference it exists to measure.
+    """
+    return _replaced(run, replace(run.ticket(ticket_id), base_sha=sha))
+
+
+def _replaced(run: Run, ticket: Ticket) -> Run:
+    """`run` with `ticket` in the place the ticket of that id already had."""
+    return replace(
+        run,
+        tickets=tuple(ticket if held.id == ticket.id else held for held in run.tickets),
+    )
+
+
+# -- derivations ----------------------------------------------------------
+
+# What graph state a status implies. Read the other way it is why no invariant
+# is enforced any more: with the graph derived through this table on every
+# question, it cannot disagree with the tickets it was built from.
 _NODE_STATE: dict[Status, NodeState] = {
     Status.PENDING: NodeState.PENDING,
     Status.IN_PROGRESS: NodeState.CLAIMED,
@@ -105,263 +255,108 @@ _NODE_STATE: dict[Status, NodeState] = {
 }
 
 
-class RunState:
-    """One run's tickets and graph, moved only through the methods below."""
+def dag_of(run: Run) -> Dag:
+    """The run's dependency graph, built fresh and thrown away by the caller.
 
-    def __init__(self, label: str, base_branch: str, board: Board) -> None:
-        self.label = label
-        self.base_branch = base_branch
-        self.board = board
-        self.tickets: dict[str, Ticket] = {}
-        self.dag = Dag(priority=bugs_first(self))
-        self.halt: Halt | None = None
-
-    # -- the invariant ----------------------------------------------------
-
-    def check_consistent(self) -> None:
-        """Raise `InconsistentStateError` unless the graph and the tickets agree.
-
-        Checks both that the two hold the same ids and that every id's two
-        states are the pair the table allows. Cheap enough to call after every
-        mutation, and tests do.
-        """
-        ticket_ids = set(self.tickets)
-        node_ids = set(self.dag.nodes())
-        for missing in sorted(ticket_ids - node_ids):
-            raise InconsistentStateError(f"ticket {missing!r} has no node in the graph")
-        for missing in sorted(node_ids - ticket_ids):
-            raise InconsistentStateError(f"node {missing!r} has no ticket")
-        for ticket_id, ticket in self.tickets.items():
-            expected = _NODE_STATE[ticket.status]
-            actual = self.dag.state(ticket_id)
-            if actual is not expected:
-                raise InconsistentStateError(
-                    f"ticket {ticket_id!r} is {ticket.status.value} but its node is "
-                    f"{actual.value}, expected {expected.value}"
-                )
-
-    def is_halted(self) -> bool:
-        """The predicate the scheduler asks before admitting more work."""
-        return self.halt is not None
-
-    # -- operations -------------------------------------------------------
-
-    def add(self, tickets: Sequence[Ticket], *, now: float | None = None) -> None:
-        """Put `tickets` into the run and build the graph edges from `blocked_by`.
-
-        Every id has to be new and every blocker has to resolve — to a ticket
-        already in the run or to another one in this batch, so a batch may name
-        its blockers in any order. Validates before it touches anything, and
-        unwinds if the graph refuses an edge, so a raising call leaves the run
-        as it was.
-        """
-        incoming = tuple(tickets)
-        self._check_new(incoming)
-
-        added: list[str] = []
-        try:
-            for ticket in incoming:
-                self.tickets[ticket.id] = ticket
-                self.dag.add_node(ticket.id)
-                added.append(ticket.id)
-            for ticket in incoming:
-                for blocker in ticket.blocked_by:
-                    self.dag.add_edge(ticket.id, blocker)
-        except Exception:
-            # An edge can still be refused for a reason no up-front check can
-            # see — a cycle within the batch. The graph unwinds its own failed
-            # mutation; this unwinds the ones that already succeeded.
-            self._drop(added)
-            raise
-
-        for ticket in incoming:
-            self.board.stamp(ticket.id, now)
-
-    def set_status(self, ticket_id: str, status: Status, *, now: float | None = None) -> None:
-        """Move a ticket to `status`, moving the graph and the stamp with it.
-
-        The single writer for all three, so they cannot drift apart. The graph
-        move is whatever the table demands and nothing when the status stays on
-        the same row — a question and its answer both sit on `CLAIMED`, so
-        asking one does not give the ticket back to the scheduler.
-
-        Raises `UnknownTicketError` for an id the run does not hold,
-        `IllegalTransitionError` for a move the life cycle forbids, and
-        `ValueError` from the graph when a ticket is started while something
-        still blocks it. Nothing is written in any of those cases: the moved
-        ticket is built first and only stored once the graph has accepted the
-        move, which is the freedom a frozen ticket buys.
-        """
-        moved = transition(self._ticket(ticket_id), status)
-        self._move_node(ticket_id, status)
-        self.tickets[ticket_id] = moved
-        self.board.stamp(ticket_id, now)
-
-    def file_bugs(
-        self, parent_id: str, bugs: Sequence[Ticket], *, now: float | None = None
-    ) -> None:
-        """Fold review findings into a running graph as work the parent waits on.
-
-        The runtime mutation, and the ordering is load-bearing: **add the nodes,
-        add the edges, then release the parent.** Releasing first leaves the
-        parent ready for a beat, and a scheduler that looks in that window
-        claims it out from under the very work meant to block it. `Dag`'s module
-        docstring documents this; the last step here is the release.
-
-        The parent's `review_round` advances here too, because the review that
-        produced these findings is the review that just finished. Bumping it in
-        the caller would leave a window in which the parent is already back in
-        the graph carrying a round it has completed, and the next round's
-        findings would be written over the last round's documents.
-
-        Every bug has to name `parent_id` as its parent, and none may be blocked
-        by it — a bug waiting on the ticket that is waiting on the bug is the one
-        way this graph can cycle. A bug can still reach the parent the long way
-        round, through some other ticket that already waits on it, and the graph
-        refuses that edge; the run unwinds to where it was and the finding is
-        not lost.
-        """
-        self._ticket(parent_id)  # an unknown parent fails before anything is built
-        incoming = tuple(bugs)
-        if not incoming:
-            raise ValueError(f"no bugs to file against {parent_id!r}")
-        for bug in incoming:
-            if bug.parent != parent_id:
-                raise ValueError(
-                    f"bug {bug.id!r} names parent {bug.parent!r}, not {parent_id!r}"
-                )
-            if parent_id in bug.blocked_by:
-                raise ValueError(
-                    f"bug {bug.id!r} cannot be blocked by {parent_id!r}, the ticket it fixes"
-                )
-
-        self.add(incoming, now=now)
-        try:
-            for bug in incoming:
-                self.dag.add_edge(parent_id, bug.id)
-        except Exception:
-            self._drop([bug.id for bug in incoming])
-            raise
-
-        parent = self._ticket(parent_id)
-        self.tickets[parent_id] = replace(parent, review_round=parent.review_round + 1)
-        # Last, and only now that the bugs are in place to hold it back.
-        self.set_status(parent_id, Status.PENDING, now=now)
-
-    @contextmanager
-    def awaiting(self, ticket_id: str) -> Iterator[None]:
-        """Suspend a ticket into `AWAITING_INPUT` for the length of the block.
-
-        Symmetric by construction: whatever the ticket was doing is what it
-        goes back to, so its status history reads as a straight line with one
-        detour rather than a fork. The resume is in a `finally` because a
-        question that failed still leaves a ticket that is no longer waiting on
-        anybody.
-        """
-        was = self._ticket(ticket_id).status
-        self.set_status(ticket_id, Status.AWAITING_INPUT)
-        try:
-            yield
-        finally:
-            self.set_status(ticket_id, was)
-
-    def display_order(self) -> tuple[str, ...]:
-        """Every ticket in insertion order, each bug directly under its parent.
-
-        Pure, and recomputed rather than stored: a stored order is one more
-        thing to keep in sync with `file_bugs`, and this is deterministic from
-        what the run already holds. A bug whose parent is not in the run — which
-        nothing here can produce — keeps its own place rather than disappearing.
-        """
-        children: dict[str, list[str]] = {}
-        for ticket_id, ticket in self.tickets.items():
-            if ticket.parent is not None and ticket.parent in self.tickets:
-                children.setdefault(ticket.parent, []).append(ticket_id)
-
-        order: list[str] = []
-
-        def emit(ticket_id: str) -> None:
-            order.append(ticket_id)
-            for child in children.get(ticket_id, ()):
-                emit(child)
-
-        for ticket_id, ticket in self.tickets.items():
-            if ticket.parent is None or ticket.parent not in self.tickets:
-                emit(ticket_id)
-        return tuple(order)
-
-    # -- internals --------------------------------------------------------
-
-    def _ticket(self, ticket_id: str) -> Ticket:
-        """The ticket, or `UnknownTicketError`."""
-        ticket = self.tickets.get(ticket_id)
-        if ticket is None:
-            raise UnknownTicketError(ticket_id)
-        return ticket
-
-    def _check_new(self, incoming: tuple[Ticket, ...]) -> None:
-        """Everything about a batch that can be decided before touching anything."""
-        ids: set[str] = set()
-        for ticket in incoming:
-            if ticket.id in self.tickets or ticket.id in ids:
-                raise DuplicateTicketError(ticket.id)
-            if ticket.status is not Status.PENDING:
-                raise InconsistentStateError(
-                    f"ticket {ticket.id!r} joins the run as {ticket.status.value}, "
-                    "but a new ticket is pending"
-                )
-            ids.add(ticket.id)
-        known = set(self.tickets) | ids
-        for ticket in incoming:
-            for blocker in ticket.blocked_by:
-                if blocker not in known:
-                    raise UnknownTicketError(blocker)
-
-    def _drop(self, ticket_ids: Sequence[str]) -> None:
-        """Take tickets back out of the run, undoing an addition a later step refused.
-
-        What the board holds goes too: a stamp for a ticket that is no longer in
-        the run is a row rendering would have nothing to draw.
-        """
-        for ticket_id in ticket_ids:
-            self.dag.remove_node(ticket_id)
-            del self.tickets[ticket_id]
-            self.board.drop(ticket_id)
-
-    def _move_node(self, ticket_id: str, status: Status) -> None:
-        """Put the graph node where `status` says it belongs, or leave it alone."""
-        target = _NODE_STATE[status]
-        current = self.dag.state(ticket_id)
-        if current is target:
-            return
-        if target is NodeState.CLAIMED:
-            self.dag.claim(ticket_id)
-        elif target is NodeState.PENDING:
-            self.dag.release(ticket_id)
-        else:
-            self.dag.complete(ticket_id)
+    A node per ticket, stated at the state its status implies, then an edge per
+    `blocked_by` entry. Nothing is kept between calls, so there is no graph to
+    fall out of step with the tickets — the cost is rebuilding one per question,
+    which is a pass over a few dozen strings.
+    """
+    dag = Dag(priority=bugs_first(run))
+    for ticket in run.tickets:
+        dag.add_node(ticket.id, _NODE_STATE[ticket.status])
+    for ticket in run.tickets:
+        for blocker in ticket.blocked_by:
+            dag.add_edge(ticket.id, blocker)
+    return dag
 
 
-def bugs_first(state: RunState) -> Callable[[NodeId], bool]:
+def bugs_first(run: Run) -> Callable[[NodeId], bool]:
     """A `Dag` priority key that puts every ready bug ahead of every ready feature.
 
     Ticket knowledge, so it lives here rather than in the scheduler: what the
     graph is asked for is a key over node ids, and only this run knows which of
     its nodes are bugs.
 
-    `Dag.ready()` sorts with this key using a stable sort, so ties — bug vs
-    bug, feature vs feature — keep insertion order for free; the key only has
-    to say which of the two groups a node belongs to.
+    `Dag.ready()` sorts with this key using a stable sort, so ties — bug vs bug,
+    feature vs feature — keep insertion order for free; the key only has to say
+    which of the two groups a node belongs to.
 
     A run that keeps generating bugs can leave feature tickets waiting a long
-    time even though they became ready first. That is intended: finishing
-    what is already open takes priority over opening more.
+    time even though they became ready first. That is intended: finishing what
+    is already open takes priority over opening more.
     """
+    bugs = {ticket.id: ticket.is_bug for ticket in run.tickets}
 
     def priority(node_id: NodeId) -> bool:
-        return not state.tickets[node_id].is_bug
+        return not bugs[node_id]
 
     return priority
+
+
+def display_order(run: Run) -> tuple[str, ...]:
+    """Every ticket in insertion order, each bug directly under its parent.
+
+    Pure, and recomputed rather than stored: a stored order is one more thing to
+    keep in sync with `with_bugs`, and this is deterministic from what the run
+    already holds. A bug whose parent is not in the run — which `check` refuses
+    — keeps its own place rather than disappearing.
+    """
+    children: dict[str, list[str]] = {}
+    held = {ticket.id for ticket in run.tickets}
+    for ticket in run.tickets:
+        if ticket.parent is not None and ticket.parent in held:
+            children.setdefault(ticket.parent, []).append(ticket.id)
+
+    order: list[str] = []
+
+    def emit(ticket_id: str) -> None:
+        order.append(ticket_id)
+        for child in children.get(ticket_id, ()):
+            emit(child)
+
+    for ticket in run.tickets:
+        if ticket.parent is None or ticket.parent not in held:
+            emit(ticket.id)
+    return tuple(order)
+
+
+# -- validation -----------------------------------------------------------
+
+
+def check(run: Run) -> None:
+    """Raise `InvalidStateError` unless `run` is a state this workflow could reach.
+
+    A hand-edited document is a supported input, so every shape that used to be
+    impossible by construction is checked here instead, and the message names
+    the ticket and the field a person has to go and fix. Called on every
+    transition and at the end of every parse, which is cheap: it is one pass
+    plus a graph build.
+    """
+    seen: set[str] = set()
+    for ticket in run.tickets:
+        if ticket.id in seen:
+            raise InvalidStateError(f"duplicate ticket id {ticket.id!r}")
+        seen.add(ticket.id)
+    for ticket in run.tickets:
+        for blocker in ticket.blocked_by:
+            if blocker not in seen:
+                raise InvalidStateError(
+                    f"ticket {ticket.id!r} is blocked by {blocker!r}, which is not in the run"
+                )
+        if ticket.parent is not None and ticket.parent not in seen:
+            raise InvalidStateError(
+                f"ticket {ticket.id!r} names parent {ticket.parent!r}, which is not in the run"
+            )
+        if ticket.status is Status.AWAITING_INPUT and ticket.resume_to is None:
+            raise InvalidStateError(
+                f"ticket {ticket.id!r} is waiting on the user with no status to return to"
+            )
+    try:
+        dag_of(run)
+    except CycleError as cycle:
+        raise InvalidStateError(f"the tickets block each other in a cycle: {cycle}") from cycle
 
 
 # -- what a merge outcome means to this run --------------------------------

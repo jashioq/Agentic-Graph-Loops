@@ -28,7 +28,7 @@ from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text,
 from agl.runtime.dag import Dag
 from agl.runtime.display import Board
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.state import Halt, RunState
+from agl.workflows.tickets.state import Halt, Run, display_order
 
 __all__ = [
     "APPROVED",
@@ -117,23 +117,28 @@ def decompose(label: str, board: Board, tickets: Sequence[Ticket]) -> Screen:
     return Screen(header=session_header(label, board), content=Rows(*rows))
 
 
-def dashboard(state: RunState, now: float) -> Screen:
+def dashboard(run: Run, board: Board, label: str, now: float) -> Screen:
     """The whole dashboard as of `now`: label and markers, one row per ticket, elapsed.
 
+    The three arguments are the three separate things a frame is made of, and
+    keeping them apart is the point: `run` is the state document, `board` is
+    ephemeral and display-only, and `label` is what the run was called, which
+    lives in the record and never changes. Nothing here can write to any of
+    them.
+
     Reads the board for what it holds and tolerates what it does not. The board
-    is ephemeral and may be empty — a fresh one, or one that lost a ticket to an
-    unwound mutation — and a missing stamp costs that row its timer rather than
-    the frame.
+    may be empty — a fresh one, or one belonging to a process that did not start
+    this run — and a missing stamp costs that row its timer rather than the
+    frame.
 
     `now` reaches no row: every elapsed reading on the screen belongs to a
     `Timer`, which is handed a stamp and works the rest out when it is drawn.
     What `now` is for is the guarantee that a frame is a function of its
     arguments, so a test can demand a row reading exactly `0:38`.
     """
-    board = state.board
     return Screen(
-        header=_header(state),
-        content=Rows(*(_row(state, state.tickets[t]) for t in state.display_order())),
+        header=_header(run, label),
+        content=Rows(*(_row(run, run.ticket(t), board) for t in display_order(run))),
         footer=_footer(board),
     )
 
@@ -159,17 +164,17 @@ def session_header(label: str, board: Board) -> Row:
 # -- the header -----------------------------------------------------------
 
 
-def _header(state: RunState) -> Rows:
+def _header(run: Run, label: str) -> Rows:
     """The run label, whatever a person must not miss, and a blank line under it."""
-    label = Text(f"{state.label:<{LABEL_WIDTH + STATUS_WIDTH}}", Color.CYAN)
-    waiting = _waiting_marker(state)
-    title = Row(label, waiting) if waiting is not None else Row(Text(state.label, Color.CYAN))
-    if state.halt is None:
+    padded = Text(f"{label:<{LABEL_WIDTH + STATUS_WIDTH}}", Color.CYAN)
+    waiting = _waiting_marker(run)
+    title = Row(padded, waiting) if waiting is not None else Row(Text(label, Color.CYAN))
+    if run.halt is None:
         return Rows(title, Row())
-    return Rows(title, *_halt_banner(state.halt), Row())
+    return Rows(title, *_halt_banner(run.halt), Row())
 
 
-def _waiting_marker(state: RunState) -> Text | None:
+def _waiting_marker(run: Run) -> Text | None:
     """`⏸ T-04 needs input`, or a count once one row cannot say it.
 
     The one state a person has to act on, so it is said twice: on the row and
@@ -183,7 +188,7 @@ def _waiting_marker(state: RunState) -> Text | None:
     moment it does show, it costs nothing, and it becomes load-bearing the day a
     question can be skipped and left waiting while the run carries on.
     """
-    waiting = [t.id for t in state.tickets.values() if t.status is Status.AWAITING_INPUT]
+    waiting = [t.id for t in run.tickets if t.status is Status.AWAITING_INPUT]
     if not waiting:
         return None
     if len(waiting) == 1:
@@ -216,15 +221,14 @@ def _halt_banner(halt: Halt) -> tuple[Row, Row]:
 # -- one ticket -----------------------------------------------------------
 
 
-def _row(state: RunState, ticket: Ticket) -> Row:
+def _row(run: Run, ticket: Ticket, board: Board) -> Row:
     """A ticket's line: id, title, status, and what is happening to it right now.
 
     Takes no `now`, and wants none: a `Timer` works out its own elapsed at draw
     time, so a row hands over the stamp and stays a description of what to draw
     rather than a reading of how long it has been.
     """
-    board = state.board
-    cells: list[Component] = [*_label(ticket), _status_cell(state, ticket)]
+    cells: list[Component] = [*_label(ticket), _status_cell(run, ticket)]
     stamp = board.status_since.get(ticket.id) if ticket.status in _TICKING else None
     activity = board.activity.get(ticket.id)
     if stamp is not None:
@@ -276,10 +280,10 @@ def _fit(content: str, width: int) -> str:
     return content[: width - 1] + "…" if width > 1 else content[:width]
 
 
-def _status_cell(state: RunState, ticket: Ticket) -> Text:
+def _status_cell(run: Run, ticket: Ticket) -> Text:
     """What a row says it is doing, which is not always what its status is called."""
     if ticket.status is Status.PENDING:
-        bugs = _open_bugs(state, ticket.id)
+        bugs = _open_bugs(run, ticket.id)
         if bugs:
             plural = "s" if bugs != 1 else ""
             return Text(f"{f'pending ({bugs} bug{plural})':<{STATUS_WIDTH}}", Color.RED)
@@ -287,7 +291,7 @@ def _status_cell(state: RunState, ticket: Ticket) -> Text:
     return Text(f"{shown:<{STATUS_WIDTH}}", _STATUS_COLOR[ticket.status])
 
 
-def _open_bugs(state: RunState, parent_id: str) -> int:
+def _open_bugs(run: Run, parent_id: str) -> int:
     """How many bugs filed against a ticket have yet to merge.
 
     Counted from the tickets rather than the graph edges: the parent's blockers
@@ -295,9 +299,7 @@ def _open_bugs(state: RunState, parent_id: str) -> int:
     what makes a row worth looking at.
     """
     return sum(
-        1
-        for t in state.tickets.values()
-        if t.parent == parent_id and t.status is not Status.MERGED
+        1 for t in run.tickets if t.parent == parent_id and t.status is not Status.MERGED
     )
 
 

@@ -72,6 +72,7 @@ from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket
 from agl.workflows.tickets.reviews import (
     GROUPS_KEY,
+    REVIEWERS,
     BugGroup,
     Finding,
     bug_groups_from_json,
@@ -113,15 +114,6 @@ Not a policy that discourages — a scoped deny that holds in every permission
 mode, including `bypassPermissions`. An agent running `git checkout main`
 inside its worktree silently moves it off the ticket branch, and a stray
 `git commit` breaks the one-commit guarantee.
-"""
-
-_REVIEWERS: tuple[str, ...] = ("quality", "spec")
-"""The two reviewers, named by the findings document each one writes.
-
-Every other name a reviewer has is this one with something around it — its
-role is `review-<source>`, its prompt is `review_<source>`, its activity is
-prefixed with it — so the document a role is checked for and the role that
-would write it cannot drift apart.
 """
 
 _NO_FILE_ACCESS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit")
@@ -224,7 +216,7 @@ async def review(
     """
     owed = tuple(
         source
-        for source in _REVIEWERS
+        for source in REVIEWERS
         if not ctx.store.exists(review_key(ticket.id, ticket.review_round, source))
     )
     # Every prompt is rendered before any call starts, so a template bug fails
@@ -238,7 +230,7 @@ async def review(
     )
 
     findings: tuple[Finding, ...] = ()
-    for source in _REVIEWERS:
+    for source in REVIEWERS:
         findings += _read_findings(ctx, ticket, source)
     return findings
 

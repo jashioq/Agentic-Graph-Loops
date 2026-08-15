@@ -4,11 +4,14 @@ Layer: workflows. Pure — no I/O, no async, and nothing imported from `agl`. It
 is the vocabulary the rest of the ticket workflow is written in, so it has to be
 readable on its own.
 
-A `Ticket` holds only what cannot be recomputed. `is_bug` and `first_pass` are
-properties rather than fields because a stored copy of something derivable is a
-second source of truth waiting to disagree with the first. The branch a ticket's
-work lands on is not here at all: it is `paths.branch(label, id)`, computed
-where it is needed from two things already known.
+A `Ticket` holds only what cannot be recomputed. `is_bug` is a property rather
+than a field because a stored copy of something derivable is a second source of
+truth waiting to disagree with the first. The branch a ticket's work lands on is
+not here at all: it is `paths.branch(label, id)`, computed where it is needed
+from two things already known. Whether a ticket has been implemented, reviewed
+or merged is not here either, and for the same reason one step further out: git
+and the review documents already answer it, and `steps.look` is where they are
+asked.
 
 The status machine has no `fixing` state. A ticket whose review filed findings
 goes back to `PENDING` with `blocked_by` edges to the bug tickets that carry
@@ -65,6 +68,13 @@ class Ticket:
     On a bug ticket — one with a `parent` — `deliverables` are the findings it
     has to fix. Same field, read differently by context, because a second field
     that is empty on every feature ticket would carry no more information.
+
+    `base_sha` is the one thing here that is not a decision but a measurement:
+    where this ticket's branch stood before any of its work landed on it. It
+    exists because git cannot answer without it — a branch with no commits yet
+    and a branch whose commits have already been merged away are both ancestors
+    of their base — and it is taken in the same synchronous step that creates
+    the worktree. `None` means no tree has ever been opened for this ticket.
     """
 
     id: str
@@ -76,20 +86,12 @@ class Ticket:
     review_round: int = 0
     # Only ever non-None while `status is AWAITING_INPUT`; see `transition`.
     resume_to: "Status | None" = None
+    base_sha: str | None = None
 
     @property
     def is_bug(self) -> bool:
         """Whether this ticket fixes findings against another one."""
         return self.parent is not None
-
-    @property
-    def first_pass(self) -> bool:
-        """Whether nobody has reviewed this yet.
-
-        Reads better at the call site than the comparison, and it is what
-        decides whether an implementation agent runs at all.
-        """
-        return self.review_round == 0
 
 
 class IllegalTransitionError(Exception):
@@ -111,10 +113,40 @@ _RUNNING = (Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING)
 # been where it is. `MERGED` is terminal and has no moves at all, and
 # `AWAITING_INPUT` has no re-entry because it is a suspension of another status
 # rather than one a ticket rests in.
+#
+# `PENDING` is every claimed status' way in and out, and that is not the life
+# cycle sagging — it is what the status field now means. A status says who is
+# working a ticket and at what, never how far the work got; how far it got is a
+# question for git, asked afresh through `steps.look`. So `PENDING` is exactly
+# "nobody is working this right now", and two moves follow from that.
+#
+# Out of it, anywhere: a run picked back up asks git where each ticket reached
+# and claims it straight into whatever the answer implies. A ticket whose commit
+# is already on its base is claimed as `MERGED` without a merge ever being run in
+# this process, and refusing that move would only mean refusing to notice.
+#
+# Into it, from every status an agent runs in: a claim can always be given back.
+# The scheduler does exactly that when a ticket's pass raises, and a ticket that
+# went back to the queue has lost nothing — its branch is still where its work
+# left it.
 _MOVES: dict[Status, frozenset[Status]] = {
-    Status.PENDING: frozenset({Status.PENDING, Status.IN_PROGRESS}),
+    Status.PENDING: frozenset(
+        {
+            Status.PENDING,
+            Status.IN_PROGRESS,
+            Status.IN_REVIEW,
+            Status.MERGING,
+            Status.MERGED,
+        }
+    ),
     Status.IN_PROGRESS: frozenset(
-        {Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING, Status.AWAITING_INPUT}
+        {
+            Status.IN_PROGRESS,
+            Status.IN_REVIEW,
+            Status.MERGING,
+            Status.PENDING,
+            Status.AWAITING_INPUT,
+        }
     ),
     Status.IN_REVIEW: frozenset(
         {Status.IN_REVIEW, Status.PENDING, Status.MERGING, Status.AWAITING_INPUT}

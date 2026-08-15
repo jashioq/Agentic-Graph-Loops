@@ -1,32 +1,39 @@
-"""One run's state: the graph, the tickets, and keeping the two from disagreeing."""
+"""One run's state as a value: the transitions, the derivations, and `check`.
 
-from collections.abc import Sequence
+Every function under test is pure, so every test here is "build a `Run`, apply
+one thing, look at what came back" — and the run that went in is looked at too,
+because a transition that mutated its argument would be a second writer nobody
+asked for.
+"""
+
 from dataclasses import replace
 from typing import Any
 
 import pytest
 
 from agl.core.command import ExecResult
-from agl.runtime.dag import CycleError, NodeState
-from agl.runtime.display import Board
+from agl.runtime.dag import NodeState
 from agl.runtime.merge import MergeOutcome, MergeStatus
 from agl.workflows.tickets.models import IllegalTransitionError, Status, Ticket
 from agl.workflows.tickets.state import (
     TAIL_LINES,
     DuplicateTicketError,
     Halt,
-    InconsistentStateError,
-    RunState,
+    InvalidStateError,
+    Run,
     UnknownTicketError,
+    check,
+    dag_of,
+    display_order,
     halt_for,
+    with_base_sha,
+    with_bugs,
+    with_halt,
+    with_status,
+    with_tickets,
 )
 
 # -- helpers --------------------------------------------------------------
-
-
-def new_state() -> RunState:
-    """An empty run, before anything has been decomposed."""
-    return RunState("add-auth", "main", Board(started_at=100.0))
 
 
 def feature(ticket_id: str, *blocked_by: str) -> Ticket:
@@ -52,557 +59,443 @@ def bug(ticket_id: str, parent: str, *blocked_by: str) -> Ticket:
     )
 
 
-def snapshot(state: RunState) -> tuple[Any, ...]:
-    """Everything in a `RunState` that a run's correctness depends on.
-
-    `RunState` cannot be compared with `==` because a `Dag` is compared by
-    identity, so the graph is flattened into something that can be.
-    """
-    return (
-        state.label,
-        state.base_branch,
-        state.halt,
-        dict(state.tickets),
-        tuple(
-            (node, state.dag.state(node), state.dag.blockers(node))
-            for node in state.dag.nodes()
-        ),
-    )
+def run_of(*tickets: Ticket) -> Run:
+    """A run holding `tickets`, built the way an approval builds one."""
+    return with_tickets(Run(), tickets)
 
 
-def two_tickets() -> RunState:
+def two_tickets() -> Run:
     """`T-01`, and `T-02` waiting on it."""
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02", "T-01")))
-    return state
+    return run_of(feature("T-01"), feature("T-02", "T-01"))
 
 
-def claimed_in_review(state: RunState, ticket_id: str) -> None:
+def in_review(run: Run, ticket_id: str) -> Run:
     """Walk a ticket from pending to under review, as the workflow would."""
-    state.set_status(ticket_id, Status.IN_PROGRESS)
-    state.set_status(ticket_id, Status.IN_REVIEW)
+    return with_status(with_status(run, ticket_id, Status.IN_PROGRESS), ticket_id, Status.IN_REVIEW)
 
 
-# Every pairing of graph state and ticket status the invariant permits.
-CONSISTENT = {
-    (NodeState.PENDING, Status.PENDING),
-    (NodeState.CLAIMED, Status.IN_PROGRESS),
-    (NodeState.CLAIMED, Status.IN_REVIEW),
-    (NodeState.CLAIMED, Status.MERGING),
-    (NodeState.CLAIMED, Status.AWAITING_INPUT),
-    (NodeState.DONE, Status.MERGED),
-}
-
-PAIRS = [(node, status) for node in NodeState for status in Status]
+def merged(run: Run, ticket_id: str) -> Run:
+    """Walk a ticket all the way to merged."""
+    for status in (Status.IN_PROGRESS, Status.MERGING, Status.MERGED):
+        run = with_status(run, ticket_id, status)
+    return run
 
 
-# -- add_tickets ----------------------------------------------------------
+def states(run: Run) -> dict[str, NodeState]:
+    node = dag_of(run)
+    return {n: node.state(n) for n in node.nodes()}
 
 
-def test_add_tickets_builds_a_dag_whose_edges_match_blocked_by() -> None:
-    state = new_state()
-
-    state.add((feature("T-01"), feature("T-02", "T-01"), feature("T-03", "T-01")))
-
-    assert state.dag.nodes() == ("T-01", "T-02", "T-03")
-    assert state.dag.blockers("T-02") == ("T-01",)
-    assert state.dag.blockers("T-03") == ("T-01",)
-    assert state.dag.blockers("T-01") == ()
-    assert set(state.tickets) == {"T-01", "T-02", "T-03"}
+# -- with_tickets ---------------------------------------------------------
 
 
-def test_add_tickets_leaves_only_the_unblocked_tickets_ready() -> None:
-    state = two_tickets()
+def test_with_tickets_keeps_insertion_order() -> None:
+    run = run_of(feature("T-01"), feature("T-02", "T-01"), feature("T-03", "T-01"))
 
-    assert state.dag.ready() == ("T-01",)
-
-
-def test_add_tickets_accepts_a_blocker_defined_later_in_the_same_batch() -> None:
-    state = new_state()
-
-    state.add((feature("T-01", "T-02"), feature("T-02")))
-
-    assert state.dag.blockers("T-01") == ("T-02",)
-    assert state.dag.ready() == ("T-02",)
+    assert [t.id for t in run.tickets] == ["T-01", "T-02", "T-03"]
 
 
-def test_add_tickets_stamps_every_new_ticket() -> None:
-    state = new_state()
+def test_the_run_that_went_in_is_left_alone() -> None:
+    empty = Run()
 
-    state.add((feature("T-01"), feature("T-02", "T-01")), now=101.0)
+    with_tickets(empty, (feature("T-01"),))
 
-    assert state.board.status_since == {"T-01": 101.0, "T-02": 101.0}
+    assert empty.tickets == ()
 
 
-def test_add_tickets_refuses_an_id_the_run_already_holds() -> None:
-    state = two_tickets()
-    before = snapshot(state)
+def test_blocked_by_becomes_the_graphs_edges() -> None:
+    run = run_of(feature("T-01"), feature("T-02", "T-01"))
+    graph = dag_of(run)
+
+    assert graph.blockers("T-02") == ("T-01",)
+    assert graph.blockers("T-01") == ()
+    assert graph.ready() == ("T-01",)
+
+
+def test_a_blocker_may_be_defined_later_in_the_same_batch() -> None:
+    run = run_of(feature("T-01", "T-02"), feature("T-02"))
+
+    assert dag_of(run).blockers("T-01") == ("T-02",)
+    assert dag_of(run).ready() == ("T-02",)
+
+
+def test_a_second_batch_may_name_a_blocker_already_in_the_run() -> None:
+    run = with_tickets(run_of(feature("T-01")), (feature("T-02", "T-01"),))
+
+    assert dag_of(run).blockers("T-02") == ("T-01",)
+
+
+def test_an_id_the_run_already_holds_is_refused() -> None:
+    run = two_tickets()
 
     with pytest.raises(DuplicateTicketError, match="T-01"):
-        state.add((feature("T-04"), feature("T-01")))
+        with_tickets(run, (feature("T-04"), feature("T-01")))
 
-    assert snapshot(state) == before
+    assert run == two_tickets()
 
 
-def test_add_tickets_refuses_a_batch_that_repeats_an_id() -> None:
-    state = new_state()
-
+def test_a_batch_that_repeats_an_id_is_refused() -> None:
     with pytest.raises(DuplicateTicketError, match="T-01"):
-        state.add((feature("T-01"), feature("T-01")))
-
-    assert snapshot(state) == snapshot(new_state())
+        with_tickets(Run(), (feature("T-01"), feature("T-01")))
 
 
-def test_add_tickets_refuses_a_blocker_no_ticket_answers_to() -> None:
-    state = new_state()
-
+def test_a_blocker_no_ticket_answers_to_is_refused() -> None:
     with pytest.raises(UnknownTicketError, match="T-99"):
-        state.add((feature("T-01", "T-99"),))
-
-    assert state.dag.nodes() == ()
+        with_tickets(Run(), (feature("T-01", "T-99"),))
 
 
-def test_add_tickets_refuses_a_ticket_that_is_not_pending() -> None:
-    state = new_state()
+def test_a_ticket_that_is_not_pending_is_refused() -> None:
     started = replace(feature("T-01"), status=Status.IN_PROGRESS)
 
-    with pytest.raises(InconsistentStateError, match="T-01"):
-        state.add((started,))
-
-    assert state.dag.nodes() == ()
+    with pytest.raises(InvalidStateError, match="T-01"):
+        with_tickets(Run(), (started,))
 
 
-def test_a_cycle_in_the_batch_leaves_the_run_untouched() -> None:
-    state = two_tickets()
-    before = snapshot(state)
+def test_a_cycle_within_the_batch_is_refused() -> None:
+    run = two_tickets()
 
-    with pytest.raises(CycleError):
-        state.add((feature("T-03", "T-04"), feature("T-04", "T-03")))
+    with pytest.raises(InvalidStateError, match="cycle"):
+        with_tickets(run, (feature("T-03", "T-04"), feature("T-04", "T-03")))
 
-    assert snapshot(state) == before
-
-
-# -- the invariant --------------------------------------------------------
+    assert run == two_tickets()
 
 
-def test_a_fresh_state_is_consistent() -> None:
-    new_state().check_consistent()
-    two_tickets().check_consistent()
+# -- with_status ----------------------------------------------------------
 
 
-def test_check_consistent_passes_through_a_whole_life_cycle() -> None:
-    state = two_tickets()
-    state.check_consistent()
+def test_with_status_moves_the_ticket_and_the_derived_graph_together() -> None:
+    run = with_status(two_tickets(), "T-01", Status.IN_PROGRESS)
 
-    for status in (Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING, Status.MERGED):
-        state.set_status("T-01", status)
-        state.check_consistent()
-
-    for status in (Status.IN_PROGRESS, Status.AWAITING_INPUT, Status.IN_PROGRESS):
-        state.set_status("T-02", status)
-        state.check_consistent()
+    assert run.ticket("T-01").status is Status.IN_PROGRESS
+    assert states(run)["T-01"] is NodeState.CLAIMED
 
 
-@pytest.mark.parametrize(("node", "status"), PAIRS)
-def test_check_consistent_holds_the_table_exactly(node: NodeState, status: Status) -> None:
-    state = new_state()
-    state.add((feature("T-01"),))
-    if node is not NodeState.PENDING:
-        state.dag.claim("T-01")
-    if node is NodeState.DONE:
-        state.dag.complete("T-01")
-    # Straight past `set_status`, which is the only way to build the mismatch.
-    state.tickets["T-01"] = replace(state.tickets["T-01"], status=status)
-
-    if (node, status) in CONSISTENT:
-        state.check_consistent()
-    else:
-        with pytest.raises(InconsistentStateError, match="T-01"):
-            state.check_consistent()
-
-
-def test_check_consistent_catches_a_ticket_with_no_node() -> None:
-    state = two_tickets()
-    state.tickets["T-99"] = feature("T-99")
-
-    with pytest.raises(InconsistentStateError, match="T-99"):
-        state.check_consistent()
-
-
-def test_check_consistent_catches_a_node_with_no_ticket() -> None:
-    state = two_tickets()
-    state.dag.add_node("T-99")
-
-    with pytest.raises(InconsistentStateError, match="T-99"):
-        state.check_consistent()
-
-
-# -- set_status -----------------------------------------------------------
-
-
-def test_set_status_moves_the_ticket_and_the_graph_together() -> None:
-    state = two_tickets()
-
-    state.set_status("T-01", Status.IN_PROGRESS)
-
-    assert state.tickets["T-01"].status is Status.IN_PROGRESS
-    assert state.dag.state("T-01") is NodeState.CLAIMED
-    state.check_consistent()
-
-
-def test_set_status_stamps_status_since() -> None:
-    state = two_tickets()
-
-    state.set_status("T-01", Status.IN_PROGRESS, now=140.0)
-
-    assert state.board.status_since["T-01"] == 140.0
-
-
-def test_re_entering_a_status_re_stamps_it() -> None:
-    state = two_tickets()
-    state.set_status("T-01", Status.IN_PROGRESS, now=140.0)
-
-    state.set_status("T-01", Status.IN_PROGRESS, now=200.0)
-
-    assert state.board.status_since["T-01"] == 200.0
-    assert state.tickets["T-01"].status is Status.IN_PROGRESS
-    state.check_consistent()
-
-
-def test_set_status_stamps_a_real_clock_when_it_is_not_given_one() -> None:
-    state = two_tickets()
-
-    state.set_status("T-01", Status.IN_PROGRESS)
-
-    assert state.board.status_since["T-01"] > 0.0
-
-
-def test_set_status_rejects_an_illegal_transition_and_changes_nothing() -> None:
-    state = two_tickets()
-    state.set_status("T-01", Status.IN_PROGRESS, now=140.0)
-    before = snapshot(state)
+def test_with_status_refuses_an_illegal_move_and_builds_nothing() -> None:
+    run = with_status(two_tickets(), "T-01", Status.IN_PROGRESS)
 
     with pytest.raises(IllegalTransitionError):
-        state.set_status("T-01", Status.MERGED, now=200.0)
+        with_status(run, "T-01", Status.MERGED)
 
-    assert snapshot(state) == before
-    assert state.board.status_since["T-01"] == 140.0
-
-
-def test_set_status_refuses_to_start_a_ticket_that_is_still_blocked() -> None:
-    state = two_tickets()
-    before = snapshot(state)
-
-    with pytest.raises(ValueError, match="T-02"):
-        state.set_status("T-02", Status.IN_PROGRESS)
-
-    assert snapshot(state) == before
+    assert run.ticket("T-01").status is Status.IN_PROGRESS
 
 
-def test_set_status_on_an_unknown_ticket_raises() -> None:
-    state = two_tickets()
-
+def test_with_status_on_an_unknown_ticket_raises() -> None:
     with pytest.raises(UnknownTicketError, match="T-99"):
-        state.set_status("T-99", Status.IN_PROGRESS)
+        with_status(two_tickets(), "T-99", Status.IN_PROGRESS)
 
 
 def test_a_question_and_its_answer_leave_the_graph_where_it_was() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
+    run = in_review(two_tickets(), "T-01")
 
-    state.set_status("T-01", Status.AWAITING_INPUT)
-    assert state.dag.state("T-01") is NodeState.CLAIMED
-    state.check_consistent()
+    waiting = with_status(run, "T-01", Status.AWAITING_INPUT)
+    assert states(waiting)["T-01"] is NodeState.CLAIMED
+    assert waiting.ticket("T-01").resume_to is Status.IN_REVIEW
 
-    state.set_status("T-01", Status.IN_REVIEW)
-    assert state.dag.state("T-01") is NodeState.CLAIMED
-    state.check_consistent()
+    back = with_status(waiting, "T-01", Status.IN_REVIEW)
+    assert states(back)["T-01"] is NodeState.CLAIMED
+    assert back.ticket("T-01").resume_to is None
 
 
 def test_a_merge_failure_hands_the_ticket_back_to_the_queue() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    state.set_status("T-01", Status.MERGING)
+    run = with_status(in_review(two_tickets(), "T-01"), "T-01", Status.MERGING)
 
-    state.set_status("T-01", Status.PENDING)
+    given_back = with_status(run, "T-01", Status.PENDING)
 
-    assert state.dag.state("T-01") is NodeState.PENDING
-    assert state.dag.ready() == ("T-01",)
-    state.check_consistent()
+    assert states(given_back)["T-01"] is NodeState.PENDING
+    assert dag_of(given_back).ready() == ("T-01",)
 
 
-# -- file_bugs ------------------------------------------------------------
+def test_a_pending_ticket_may_be_claimed_straight_into_any_status() -> None:
+    """A resumed run reads git and claims a ticket where the repository says it is."""
+    run = two_tickets()
+
+    for status in (Status.IN_REVIEW, Status.MERGING, Status.MERGED):
+        assert with_status(run, "T-01", status).ticket("T-01").status is status
 
 
-def test_file_bugs_puts_the_parent_behind_both_bugs() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
+@pytest.mark.parametrize("claimed", [Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING])
+def test_a_claim_can_be_given_back_from_wherever_it_got_to(claimed: Status) -> None:
+    """What the scheduler does with a ticket whose pass raised: it goes back in
+    the queue, and its branch is still where its work left it."""
+    run = with_status(two_tickets(), "T-01", claimed)
 
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01")))
+    given_back = with_status(run, "T-01", Status.PENDING)
 
-    assert state.tickets["T-01"].status is Status.PENDING
-    assert state.dag.unsatisfied_blockers("T-01") == ("T-01-bug-1", "T-01-bug-2")
-    assert "T-01" not in state.dag.ready()
-    assert state.dag.ready() == ("T-01-bug-1", "T-01-bug-2")
-    assert state.dag.is_stalled() is False
-    state.check_consistent()
+    assert states(given_back)["T-01"] is NodeState.PENDING
 
 
-def test_the_parent_becomes_ready_once_both_bugs_are_merged() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01")))
+# -- with_bugs ------------------------------------------------------------
+
+
+def filed(count: int = 2) -> Run:
+    """`T-01` under review, sent back behind `count` bugs."""
+    run = in_review(two_tickets(), "T-01")
+    return with_bugs(run, "T-01", [bug(f"T-01-bug-{n}", "T-01") for n in range(1, count + 1)])
+
+
+def test_with_bugs_puts_the_parent_behind_every_bug() -> None:
+    run = filed()
+
+    assert run.ticket("T-01").status is Status.PENDING
+    assert run.ticket("T-01").blocked_by == ("T-01-bug-1", "T-01-bug-2")
+    assert dag_of(run).unsatisfied_blockers("T-01") == ("T-01-bug-1", "T-01-bug-2")
+    assert dag_of(run).ready() == ("T-01-bug-1", "T-01-bug-2")
+    assert dag_of(run).is_stalled() is False
+
+
+def test_blocked_by_is_the_graph_so_the_edges_survive_a_round_trip() -> None:
+    """Nothing keeps the parent→bug edges but the parent's own `blocked_by`."""
+    run = filed()
+
+    rebuilt = Run(tickets=run.tickets)
+
+    assert dag_of(rebuilt).unsatisfied_blockers("T-01") == ("T-01-bug-1", "T-01-bug-2")
+
+
+def test_the_parent_becomes_ready_once_every_bug_is_merged() -> None:
+    run = filed()
 
     for bug_id in ("T-01-bug-1", "T-01-bug-2"):
-        # Bugs are not reviewed; the parent's next round covers them.
-        for status in (Status.IN_PROGRESS, Status.MERGING, Status.MERGED):
-            state.set_status(bug_id, status)
-        state.check_consistent()
+        run = merged(run, bug_id)
 
-    assert state.dag.ready() == ("T-01",)
+    assert dag_of(run).ready() == ("T-01",)
 
 
-def test_file_bugs_advances_the_parents_review_round() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    assert state.tickets["T-01"].review_round == 0
+def test_with_bugs_advances_the_parents_review_round() -> None:
+    run = filed(1)
 
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
-
-    assert state.tickets["T-01"].review_round == 1
-    assert state.tickets["T-01-bug-1"].review_round == 0
+    assert run.ticket("T-01").review_round == 1
+    assert run.ticket("T-01-bug-1").review_round == 0
 
 
-def test_a_second_round_of_bugs_advances_the_round_again() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
-    for status in (Status.IN_PROGRESS, Status.MERGING, Status.MERGED):
-        state.set_status("T-01-bug-1", status)
-    claimed_in_review(state, "T-01")
+def test_a_second_round_advances_the_round_again() -> None:
+    run = merged(filed(1), "T-01-bug-1")
+    run = in_review(run, "T-01")
 
-    state.file_bugs("T-01", (bug("T-01-bug-2", "T-01"),))
+    run = with_bugs(run, "T-01", (bug("T-01-bug-2", "T-01"),))
 
-    assert state.tickets["T-01"].review_round == 2
+    assert run.ticket("T-01").review_round == 2
+    assert run.ticket("T-01").blocked_by == ("T-01-bug-1", "T-01-bug-2")
 
 
-def test_a_refused_filing_leaves_the_review_round_where_it_was() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
+def test_a_refused_filing_leaves_the_run_exactly_as_it_was() -> None:
+    run = in_review(two_tickets(), "T-01")
 
     with pytest.raises(DuplicateTicketError, match="T-02"):
-        state.file_bugs("T-01", (bug("T-02", "T-01"),))
+        with_bugs(run, "T-01", (bug("T-02", "T-01"),))
 
-    assert state.tickets["T-01"].review_round == 0
-
-
-def test_file_bugs_stamps_the_bugs_and_the_parent() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    state.set_status("T-01", Status.IN_REVIEW, now=140.0)
-
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),), now=200.0)
-
-    assert state.board.status_since["T-01"] == 200.0
-    assert state.board.status_since["T-01-bug-1"] == 200.0
-
-
-def test_file_bugs_with_a_colliding_id_raises_and_changes_nothing() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    before = snapshot(state)
-
-    with pytest.raises(DuplicateTicketError, match="T-02"):
-        state.file_bugs("T-01", (bug("T-02", "T-01"),))
-
-    assert snapshot(state) == before
+    assert run.ticket("T-01").review_round == 0
+    assert run == in_review(two_tickets(), "T-01")
 
 
 def test_a_bug_may_not_be_blocked_by_the_ticket_it_fixes() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    before = snapshot(state)
+    run = in_review(two_tickets(), "T-01")
 
     with pytest.raises(ValueError, match="T-01"):
-        state.file_bugs("T-01", (bug("T-01-bug-1", "T-01", "T-01"),))
-
-    assert snapshot(state) == before
-
-
-def test_file_bugs_refuses_a_ticket_that_is_not_a_bug_against_this_parent() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-
-    with pytest.raises(ValueError, match="T-02"):
-        state.file_bugs("T-01", (bug("T-01-bug-1", "T-02"),))
-
-    with pytest.raises(ValueError):
-        state.file_bugs("T-01", (feature("T-01-bug-1"),))
-
-
-def test_file_bugs_refuses_an_empty_set_of_findings() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-
-    with pytest.raises(ValueError, match="no bugs"):
-        state.file_bugs("T-01", ())
+        with_bugs(run, "T-01", (bug("T-01-bug-1", "T-01", "T-01"),))
 
 
 def test_a_bug_that_reaches_its_parent_the_long_way_round_is_refused() -> None:
     # T-02 already waits on T-01, so a bug on T-01 that waits on T-02 would
     # close the loop through a ticket rather than directly.
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-    before = snapshot(state)
-    stamps = dict(state.board.status_since)
+    run = in_review(two_tickets(), "T-01")
 
-    with pytest.raises(CycleError):
-        state.file_bugs("T-01", (bug("T-01-bug-1", "T-01", "T-02"),), now=200.0)
+    with pytest.raises(InvalidStateError, match="cycle"):
+        with_bugs(run, "T-01", (bug("T-01-bug-1", "T-01", "T-02"),))
 
-    assert snapshot(state) == before
-    assert state.board.status_since == stamps
-    state.check_consistent()
+    assert run == in_review(two_tickets(), "T-01")
 
 
-def test_file_bugs_on_an_unknown_parent_raises() -> None:
-    state = two_tickets()
+def test_with_bugs_refuses_a_ticket_that_is_not_a_bug_against_this_parent() -> None:
+    run = in_review(two_tickets(), "T-01")
 
+    with pytest.raises(ValueError, match="T-02"):
+        with_bugs(run, "T-01", (bug("T-01-bug-1", "T-02"),))
+
+    with pytest.raises(ValueError):
+        with_bugs(run, "T-01", (feature("T-01-bug-1"),))
+
+
+def test_with_bugs_refuses_an_empty_set_of_findings() -> None:
+    with pytest.raises(ValueError, match="no bugs"):
+        with_bugs(in_review(two_tickets(), "T-01"), "T-01", ())
+
+
+def test_with_bugs_on_an_unknown_parent_raises() -> None:
     with pytest.raises(UnknownTicketError, match="T-99"):
-        state.file_bugs("T-99", (bug("T-99-bug-1", "T-99"),))
+        with_bugs(two_tickets(), "T-99", (bug("T-99-bug-1", "T-99"),))
 
 
 def test_bugs_may_be_blocked_by_each_other() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
+    run = in_review(two_tickets(), "T-01")
 
-    state.file_bugs("T-01",
-        (bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01", "T-01-bug-1")),
+    run = with_bugs(
+        run, "T-01", (bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01", "T-01-bug-1"))
     )
 
-    assert state.dag.ready() == ("T-01-bug-1",)
-    state.check_consistent()
+    assert dag_of(run).ready() == ("T-01-bug-1",)
+
+
+# -- with_halt and with_base_sha ------------------------------------------
+
+
+def test_with_halt_sets_and_clears() -> None:
+    halt = Halt(reason="merge conflict")
+    stopped = with_halt(two_tickets(), halt)
+
+    assert stopped.halt == halt
+    assert with_halt(stopped, None).halt is None
+    assert two_tickets().halt is None
+
+
+def test_with_base_sha_records_the_mark_on_one_ticket_only() -> None:
+    run = with_base_sha(two_tickets(), "T-01", "abc123")
+
+    assert run.ticket("T-01").base_sha == "abc123"
+    assert run.ticket("T-02").base_sha is None
+
+
+def test_with_base_sha_on_an_unknown_ticket_raises() -> None:
+    with pytest.raises(UnknownTicketError, match="T-99"):
+        with_base_sha(two_tickets(), "T-99", "abc123")
+
+
+# -- ticket lookup --------------------------------------------------------
+
+
+def test_get_answers_none_rather_than_raising() -> None:
+    run = two_tickets()
+
+    assert run.get("T-01") is not None
+    assert run.get("T-99") is None
+
+
+def test_ticket_raises_for_an_id_the_run_does_not_hold() -> None:
+    with pytest.raises(UnknownTicketError, match="T-99"):
+        two_tickets().ticket("T-99")
+
+
+# -- dag_of ---------------------------------------------------------------
+
+
+def test_a_graph_is_derived_fresh_and_never_kept() -> None:
+    run = two_tickets()
+
+    first = dag_of(run)
+    first.claim("T-01")
+
+    assert dag_of(run).state("T-01") is NodeState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("status", "node"),
+    [
+        (Status.PENDING, NodeState.PENDING),
+        (Status.IN_PROGRESS, NodeState.CLAIMED),
+        (Status.IN_REVIEW, NodeState.CLAIMED),
+        (Status.MERGING, NodeState.CLAIMED),
+        (Status.AWAITING_INPUT, NodeState.CLAIMED),
+        (Status.MERGED, NodeState.DONE),
+    ],
+)
+def test_every_status_states_its_node(status: Status, node: NodeState) -> None:
+    run = Run(tickets=(replace(feature("T-01"), status=status, resume_to=Status.IN_PROGRESS),))
+
+    assert dag_of(run).state("T-01") is node
+
+
+def test_bugs_first_puts_ready_bugs_ahead_of_ready_features() -> None:
+    run = run_of(feature("F1"), feature("F2"), bug("B1", "F1"), feature("F3"), bug("B2", "F1"))
+
+    assert dag_of(run).ready() == ("B1", "B2", "F1", "F2", "F3")
+
+
+def test_bugs_first_preserves_insertion_order_within_each_group() -> None:
+    run = run_of(feature("F2"), bug("B2", "F2"), feature("F1"), bug("B1", "F1"))
+
+    assert dag_of(run).ready() == ("B2", "B1", "F2", "F1")
 
 
 # -- display_order --------------------------------------------------------
 
 
 def test_display_order_is_insertion_order_when_there_are_no_bugs() -> None:
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02"), feature("T-03")))
+    run = run_of(feature("T-01"), feature("T-02"), feature("T-03"))
 
-    assert state.display_order() == ("T-01", "T-02", "T-03")
+    assert display_order(run) == ("T-01", "T-02", "T-03")
 
 
 def test_display_order_puts_bugs_immediately_after_their_parent() -> None:
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02"), feature("T-03")))
-    claimed_in_review(state, "T-02")
-    state.file_bugs("T-02", (bug("T-02-bug-1", "T-02"), bug("T-02-bug-2", "T-02")))
+    run = run_of(feature("T-01"), feature("T-02"), feature("T-03"))
+    run = with_bugs(
+        in_review(run, "T-02"), "T-02", (bug("T-02-bug-1", "T-02"), bug("T-02-bug-2", "T-02"))
+    )
 
-    assert state.display_order() == ("T-01", "T-02", "T-02-bug-1", "T-02-bug-2", "T-03")
+    assert display_order(run) == ("T-01", "T-02", "T-02-bug-1", "T-02-bug-2", "T-03")
 
 
 def test_a_bug_filed_later_still_appears_under_its_parent() -> None:
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02")))
-    claimed_in_review(state, "T-01")
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
-    claimed_in_review(state, "T-02")
-    state.file_bugs("T-02", (bug("T-02-bug-1", "T-02"),))
+    run = run_of(feature("T-01"), feature("T-02"))
+    run = with_bugs(in_review(run, "T-01"), "T-01", (bug("T-01-bug-1", "T-01"),))
+    run = with_bugs(in_review(run, "T-02"), "T-02", (bug("T-02-bug-1", "T-02"),))
 
-    assert state.display_order() == ("T-01", "T-01-bug-1", "T-02", "T-02-bug-1")
-
-
-def test_display_order_is_stable_across_calls() -> None:
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02")))
-    claimed_in_review(state, "T-01")
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
-
-    assert state.display_order() == state.display_order() == state.display_order()
+    assert display_order(run) == ("T-01", "T-01-bug-1", "T-02", "T-02-bug-1")
 
 
 def test_display_order_covers_every_ticket_exactly_once() -> None:
-    state = new_state()
-    state.add((feature("T-01"), feature("T-02")))
-    claimed_in_review(state, "T-01")
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
+    run = filed()
 
-    order = state.display_order()
+    order = display_order(run)
 
-    assert sorted(order) == sorted(state.tickets)
+    assert sorted(order) == sorted(t.id for t in run.tickets)
     assert len(set(order)) == len(order)
 
 
-# -- bugs_first -----------------------------------------------------------
+# -- check ----------------------------------------------------------------
 
 
-def prioritised(tickets: Sequence[Ticket]) -> RunState:
-    """A run holding `tickets`. Every `RunState` sorts its ready set bugs-first."""
-    state = new_state()
-    state.add(tickets)
-    return state
+def test_a_run_the_transitions_built_always_checks_out() -> None:
+    check(Run())
+    check(two_tickets())
+    check(filed())
 
 
-def test_bugs_first_puts_ready_bugs_ahead_of_ready_features() -> None:
-    tickets = [feature("F1"), feature("F2"), bug("B1", "F1"), feature("F3"), bug("B2", "F1")]
-    state = prioritised(tickets)
+def test_check_catches_a_duplicate_id() -> None:
+    run = Run(tickets=(feature("T-01"), feature("T-01")))
 
-    assert state.dag.ready() == ("B1", "B2", "F1", "F2", "F3")
-
-
-def test_bugs_first_preserves_insertion_order_within_each_group() -> None:
-    tickets = [feature("F2"), bug("B2", "F2"), feature("F1"), bug("B1", "F1")]
-    state = prioritised(tickets)
-
-    assert state.dag.ready() == ("B2", "B1", "F2", "F1")
+    with pytest.raises(InvalidStateError, match="T-01"):
+        check(run)
 
 
-# -- the lifetime split ---------------------------------------------------
+def test_check_catches_a_blocker_that_is_not_in_the_run() -> None:
+    run = Run(tickets=(feature("T-01", "T-99"),))
+
+    with pytest.raises(InvalidStateError, match="T-99"):
+        check(run)
 
 
-def run_a_sequence(state: RunState) -> None:
-    """Everything a run does to its state, in the order a run would do it."""
-    state.add((feature("T-01"), feature("T-02", "T-01")))
-    state.set_status("T-01", Status.IN_PROGRESS)
-    state.set_status("T-01", Status.AWAITING_INPUT)
-    state.set_status("T-01", Status.IN_PROGRESS)
-    state.set_status("T-01", Status.IN_REVIEW)
-    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
-    for status in (Status.IN_PROGRESS, Status.MERGING, Status.MERGED):
-        state.set_status("T-01-bug-1", status)
-    state.halt = Halt(reason="asked", detail="the user stopped the run")
+def test_check_catches_a_parent_that_is_not_in_the_run() -> None:
+    run = Run(tickets=(bug("T-01-bug-1", "T-01"),))
+
+    with pytest.raises(InvalidStateError, match="T-01"):
+        check(run)
 
 
-def test_the_run_state_does_not_depend_on_what_the_board_holds() -> None:
-    """Nothing on the board is ever read back to decide anything.
+def test_check_catches_a_waiting_ticket_with_nowhere_to_return_to() -> None:
+    run = Run(tickets=(replace(feature("T-01"), status=Status.AWAITING_INPUT),))
 
-    Two identical runs, one watched through a board somebody else has been
-    scribbling on, and the state they arrive at is the same — which is what
-    keeps the display-only rule real rather than aspirational.
-    """
-    watched = new_state()
-    scribbled = RunState("add-auth", "main", Board(started_at=100.0))
-    scribbled.board.mark("approved", 100.0)
-    scribbled.board.activity["T-01"] = "reading src/auth/store.py"
-    scribbled.board.status_since["T-99"] = 1.0
-
-    run_a_sequence(watched)
-    run_a_sequence(scribbled)
-
-    assert snapshot(watched) == snapshot(scribbled)
-    assert watched.display_order() == scribbled.display_order()
-    scribbled.check_consistent()
+    with pytest.raises(InvalidStateError, match="return to"):
+        check(run)
 
 
-def test_the_board_ends_up_holding_a_stamp_for_every_ticket() -> None:
-    state = new_state()
-    run_a_sequence(state)
+def test_check_catches_a_cycle() -> None:
+    run = Run(tickets=(feature("T-01", "T-02"), feature("T-02", "T-01")))
 
-    state.board.activity["T-01"] = "reading src/auth/store.py"
+    with pytest.raises(InvalidStateError, match="cycle"):
+        check(run)
 
-    assert set(state.board.status_since) == set(state.tickets)
-    state.check_consistent()
+
+# -- halt -----------------------------------------------------------------
 
 
 def test_halt_carries_a_reason_and_a_detail() -> None:
@@ -610,62 +503,11 @@ def test_halt_carries_a_reason_and_a_detail() -> None:
 
     assert halt.reason == "budget"
     assert halt.detail == "ran out at $4.10"
-    assert new_state().halt is None
 
 
 def test_halt_defaults_to_resumable() -> None:
     assert Halt(reason="budget").resumable is True
-
-
-def test_halt_resumable_can_be_set_false() -> None:
     assert Halt(reason="budget", resumable=False).resumable is False
-
-
-# -- awaiting -------------------------------------------------------------
-
-
-def test_awaiting_suspends_and_puts_the_ticket_back_where_it_was() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-
-    with state.awaiting("T-01"):
-        assert state.tickets["T-01"].status is Status.AWAITING_INPUT
-        assert state.dag.state("T-01") is NodeState.CLAIMED
-        state.check_consistent()
-
-    assert state.tickets["T-01"].status is Status.IN_REVIEW
-    state.check_consistent()
-
-
-def test_awaiting_puts_the_ticket_back_even_when_the_block_raises() -> None:
-    state = two_tickets()
-    claimed_in_review(state, "T-01")
-
-    with pytest.raises(RuntimeError), state.awaiting("T-01"):
-        raise RuntimeError("the question failed")
-
-    assert state.tickets["T-01"].status is Status.IN_REVIEW
-    state.check_consistent()
-
-
-def test_awaiting_an_unknown_ticket_raises_before_anything_moves() -> None:
-    state = two_tickets()
-
-    with pytest.raises(UnknownTicketError, match="T-99"), state.awaiting("T-99"):
-        pass  # pragma: no cover - the context manager never opens
-
-
-# -- is_halted ------------------------------------------------------------
-
-
-def test_is_halted_follows_the_halt() -> None:
-    state = new_state()
-
-    assert state.is_halted() is False
-
-    state.halt = Halt(reason="merge conflict")
-
-    assert state.is_halted() is True
 
 
 # -- halt_for -------------------------------------------------------------

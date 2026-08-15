@@ -7,11 +7,15 @@ worktree, the way a real agent's file tools would. Everything else — git,
 worktrees, the store — is real, in `tmp_path`, and assembled by the harness in
 `tests/runtime/conftest.py`.
 
-`run(ctx)` keeps its state in a local, so nothing here reaches into it. What a
-run did is read off what it left behind: the files that landed on the base
-branch, the worktrees it released, the frames it painted — the dashboard is the
-window onto every ticket's status — and the exception it raised. That is also
-what the cli sees, so these tests exercise the same surface it does.
+Nothing here reaches into a running loop. What a run did is read off what it
+left behind: the files that landed on the base branch, the worktrees it
+released, the frames it painted — the dashboard is the window onto every
+ticket's status — the documents in its store, and the exception it raised. That
+is also what the cli sees, so these tests exercise the same surface it does.
+
+The state document is now one of those things to read, and the one that says
+most: `run.json` records what the run was asked for, and `state.json` is every
+ticket at the moment the run stopped writing to it.
 
 The policy the loop is built from is plain functions, tested as such at the foot
 of the file: `resolve` (what a merge that did not land means), `failed` (what an
@@ -23,12 +27,14 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from agl.core.agent import AgentOption, AgentQuestion, AgentResult, AgentRunner, AgentSpec
+from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Answer, LiveSession, Question, Screen
 from agl.runtime import paths
 from agl.runtime.context import PreflightError, RunContext
@@ -41,17 +47,17 @@ from agl.runtime.merge import (
     MergeRequest,
     MergeStatus,
 )
+from agl.runtime.record import StateFile, read_record
 from agl.runtime.worktrees import Worktrees
 from agl.workflows.tickets import workflow as workflow_module
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.state import RunState
+from agl.workflows.tickets.snapshot import RunFile
+from agl.workflows.tickets.state import Run, with_bugs, with_status, with_tickets
+from agl.workflows.tickets.ticket import Loop, asker, base_for
 from agl.workflows.tickets.workflow import (
     DecomposeAbortedError,
     HaltedError,
     InterviewIncompleteError,
-    Loop,
-    asker,
-    base_for,
     failed,
     resolve,
     run,
@@ -63,7 +69,7 @@ from tests.fakes import (
     ScriptedRun,
     _HeadlessSession,
 )
-from tests.runtime.conftest import LABEL, context, feature
+from tests.runtime.conftest import LABEL, PROJECT, REQUEST, context, feature
 
 NOW = 1_000.0
 GATE = "press enter to continue"
@@ -80,10 +86,10 @@ class Gate:
     """Two events around the resume prompt, so a test can stand where a person does.
 
     `asked` fires when the run puts the prompt up, which is the observable
-    "this run has halted" — the state that carries the halt is a local of
-    `run`. `ready` is the test saying the repository has been fixed, so the
-    scripted answer means "somebody looked" rather than "an answer happened to
-    be queued".
+    "this run has halted" from outside — the halt is in a document, but waiting
+    on the prompt is what says the run has got as far as showing it. `ready` is
+    the test saying the repository has been fixed, so the scripted answer means
+    "somebody looked" rather than "an answer happened to be queued".
     """
 
     asked: asyncio.Event = field(default_factory=asyncio.Event)
@@ -284,6 +290,11 @@ def worktrees_of(ctx: RunContext) -> list[Path]:
     return [w.path for w in ctx.vcs.list_worktrees()]
 
 
+def state_of(ctx: RunContext) -> RunFile:
+    """The state document a finished run left in its store, read from outside."""
+    return RunFile(StateFile(ctx.store))
+
+
 def landed(repo: Path, *ticket_ids: str) -> bool:
     """Every named ticket's file is on the base branch — which is what merged means."""
     return all(
@@ -315,6 +326,104 @@ async def test_one_ticket_end_to_end(repo: Path) -> None:
     assert worktrees_of(ctx) == [repo.resolve()]
     assert ctx.vcs.current_branch() == "feature"
     assert ctx.store.exists("spec.md")
+
+    finished = state_of(ctx).load()
+    assert [(t.id, t.status) for t in finished.tickets] == [("T-01", Status.MERGED)]
+    assert finished.halt is None
+
+
+async def test_the_run_writes_its_record_once_and_its_state_all_the_way_through(
+    repo: Path,
+) -> None:
+    """The two documents a next process would have to work from.
+
+    `run.json` is what the run was asked for and never moves. `state.json` is
+    every ticket as the run last left it — including the `base_sha` each one was
+    marked with, which is the only reason git can be asked whether a branch has
+    been worked on at all.
+    """
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    runner = WritingAgentRunner(
+        FakeAgentRunner(
+            opening(
+                ticket_json("T-01", "Add auth", ("auth.py",)),
+                ticket_json("T-02", "Add checks", ("check.py",), blocked_by=("T-01",)),
+                implement=ScriptedRun("done"),
+                **clean_review(),
+            )
+        )
+    )
+    ctx = context(repo, agent=runner, terminal=terminal, max_concurrent=2)
+
+    await run(ctx)
+
+    record = read_record(ctx.store)
+    assert (record.workflow, record.label, record.base_branch) == ("tickets", LABEL, "feature")
+    assert (record.request, record.project, record.max_concurrent) == (REQUEST, PROJECT, 2)
+
+    finished = state_of(ctx).load()
+    assert [t.id for t in finished.tickets] == ["T-01", "T-02"]
+    assert all(t.status is Status.MERGED for t in finished.tickets)
+    assert finished.ticket("T-02").blocked_by == ("T-01",)
+    assert all(t.base_sha is not None for t in finished.tickets)
+
+
+async def test_an_implementation_that_committed_nothing_stops_the_run(repo: Path) -> None:
+    """An agent that changed nothing is a failure, not a diff to review.
+
+    Nothing wraps the fake here, so "implement" leaves the worktree exactly as
+    it found it. Without this the ticket would answer `IMPLEMENT` forever and
+    the run would go round again on the same empty tree.
+    """
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    ctx = context(
+        repo,
+        agent=FakeAgentRunner(
+            opening(
+                ticket_json("T-01", "Add auth", ("auth.py",)),
+                implement=ScriptedRun("done"),
+                **clean_review(),
+            )
+        ),
+        terminal=terminal,
+        max_concurrent=1,
+    )
+
+    with pytest.raises(HaltedError) as raised:
+        await run(ctx)
+
+    assert "T-01" in raised.value.halt.reason
+    assert "unchanged" in raised.value.halt.reason
+    assert raised.value.halt.resumable is False
+
+
+async def test_a_halted_run_leaves_the_halt_in_the_state_document(repo: Path) -> None:
+    """What `HaltedError` carries is also what a next process would read."""
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    fake = FakeAgentRunner(
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **clean_review(),
+        )
+    )
+    ctx = context(
+        repo,
+        agent=WritingAgentRunner(fake),
+        terminal=terminal,
+        max_concurrent=1,
+        build=(str(repo / "no-such-build"),),
+    )
+
+    with pytest.raises(HaltedError) as raised:
+        await run(ctx)
+
+    halt = state_of(ctx).load().halt
+    assert halt == raised.value.halt
+    assert halt is not None and halt.resumable is False
 
 
 async def test_the_run_opens_one_session_and_swaps_the_screen_on_it(repo: Path) -> None:
@@ -756,10 +865,17 @@ async def test_a_bug_merge_conflict_halts_resumably_and_resuming_lets_the_parent
 
 
 async def decompose_with(ctx: RunContext, terminal: HeadlessTerminal) -> tuple[Ticket, ...]:
-    """`decompose`, over a display opened the way `run` opens one."""
+    """`decompose`, over a display opened the way `run` opens one.
+
+    It returns nothing now — approval is a write to the state document, and the
+    tickets it approved are read back out of it, which is the same thing the
+    reactor does on its next turn round.
+    """
     board = Board(started_at=NOW)
+    state = RunFile(StateFile(ctx.store))
     async with live(terminal, board) as display:
-        return await workflow_module.decompose(ctx, display, board)
+        await workflow_module.decompose(ctx, display, state, board)
+    return state.load().tickets
 
 
 def a_decompose_run(*tickets: dict[str, Any], **extra: Any) -> ScriptedRun:
@@ -906,12 +1022,15 @@ async def test_a_run_aborted_at_decompose_creates_no_worktrees_or_branches(repo:
 
 
 # -- this run's policy, as functions -------------------------------------------
+#
+# Every one of these takes the state document rather than an object, so each is
+# exercised over a real store: what they write is what a next process would read.
 
 
-def a_state(*tickets: Ticket) -> RunState:
-    state = RunState(LABEL, "feature", Board(started_at=NOW))
-    if tickets:
-        state.add(tickets, now=NOW)
+def a_state(tmp_path: Path, *tickets: Ticket) -> RunFile:
+    """A state document in a real store, holding `tickets`."""
+    state = RunFile(StateFile(FileStore(tmp_path / "state")))
+    state.write(with_tickets(Run(), tickets))
     return state
 
 
@@ -925,88 +1044,94 @@ def a_ticket(ticket_id: str, parent: str | None = None) -> Ticket:
     )
 
 
-def a_loop(ctx: RunContext, display: Display, state: RunState) -> Loop:
+def a_loop(ctx: RunContext, display: Display, state: RunFile, board: Board) -> Loop:
     trees = Worktrees(
         ctx.vcs, trees_root=ctx.project.trees_root, project=ctx.project.name, label=ctx.label
     )
-    return Loop(ctx, display, state, trees, MergeQueue(ctx.vcs, MergeConfig()))
+    return Loop(ctx, display, state, board, trees, MergeQueue(ctx.vcs, MergeConfig()))
 
 
-async def test_resolve_holds_the_run_at_a_resumable_halt_and_then_retries(repo: Path) -> None:
+async def test_resolve_holds_the_run_at_a_resumable_halt_and_then_retries(
+    tmp_path: Path,
+) -> None:
     """A conflict is shown, a person is asked, and the halt is cleared to retry."""
     terminal = HeadlessTerminal(answers=[Answer("continue", was_free_text=False)])
-    state = a_state(a_ticket("T-01"))
+    state = a_state(tmp_path, a_ticket("T-01"))
     outcome = MergeOutcome("T-01", MergeStatus.CONFLICT, conflicted=("shared.py",))
 
-    async with live(terminal, state.board) as display:
+    async with live(terminal, Board(started_at=NOW)) as display:
         decision = await resolve(display, state, LABEL, outcome)
 
     assert decision is MergeDecision.RETRY
-    assert state.halt is None
-    assert state.is_halted() is False
+    assert state.load().halt is None
     assert [q.title for q in terminal.questions] == [GATE]
 
 
-async def test_resolve_stops_the_queue_on_a_halt_nobody_can_act_on(repo: Path) -> None:
+async def test_resolve_stops_the_queue_on_a_halt_nobody_can_act_on(tmp_path: Path) -> None:
     """Nothing to press enter on, so the halt stays set and the queue ends."""
     terminal = HeadlessTerminal()
-    state = a_state(a_ticket("T-01"))
+    state = a_state(tmp_path, a_ticket("T-01"))
     outcome = MergeOutcome("T-01", MergeStatus.VCS_ERROR, error="refusing to merge")
 
-    async with live(terminal, state.board) as display:
+    async with live(terminal, Board(started_at=NOW)) as display:
         decision = await resolve(display, state, LABEL, outcome)
 
     assert decision is MergeDecision.STOP
-    assert state.halt is not None
-    assert state.halt.resumable is False
-    assert state.is_halted() is True
+    halt = state.load().halt
+    assert halt is not None
+    assert halt.resumable is False
     assert terminal.questions == []
 
 
-def test_failed_names_the_node_and_is_not_resumable() -> None:
-    state = a_state(a_ticket("T-01"))
+def test_failed_names_the_node_and_is_not_resumable(tmp_path: Path) -> None:
+    state = a_state(tmp_path, a_ticket("T-01"))
 
     failed(state, "T-01", RuntimeError("the agent blew up"))
 
-    assert state.halt is not None
-    assert "T-01" in state.halt.reason
-    assert "the agent blew up" in state.halt.reason
-    assert state.halt.resumable is False
+    halt = state.load().halt
+    assert halt is not None
+    assert "T-01" in halt.reason
+    assert "the agent blew up" in halt.reason
+    assert halt.resumable is False
 
 
-def test_failed_without_a_node_blames_the_run_itself() -> None:
-    state = a_state()
+def test_failed_without_a_node_blames_the_run_itself(tmp_path: Path) -> None:
+    state = a_state(tmp_path)
 
     failed(state, None, RuntimeError("the loop blew up"))
 
-    assert state.halt is not None
-    assert "the run" in state.halt.reason
-    assert state.halt.resumable is False
+    halt = state.load().halt
+    assert halt is not None
+    assert "the run" in halt.reason
+    assert halt.resumable is False
 
 
 async def test_a_feature_branches_off_the_runs_base_and_a_bug_off_its_parent(
-    repo: Path,
+    repo: Path, tmp_path: Path
 ) -> None:
     """The one piece of ticket knowledge the worktree pool was not given."""
     feature(repo)
     terminal = HeadlessTerminal()
     ctx = context(repo, terminal=terminal)
-    state = a_state(a_ticket("T-01"))
-    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
-    state.set_status("T-01", Status.IN_REVIEW, now=NOW)
-    state.file_bugs("T-01", [a_ticket("T-01-bug-1", parent="T-01")], now=NOW)
+    state = a_state(tmp_path, a_ticket("T-01"))
+    state.update(lambda r: with_status(r, "T-01", Status.IN_PROGRESS))
+    state.update(lambda r: with_status(r, "T-01", Status.IN_REVIEW))
+    state.update(lambda r: with_bugs(r, "T-01", [a_ticket("T-01-bug-1", parent="T-01")]))
+    run_state = state.load()
 
-    async with live(terminal, state.board) as display:
-        loop = a_loop(ctx, display, state)
-        assert base_for(loop, state.tickets["T-01"]) == "feature"
-        assert base_for(loop, state.tickets["T-01-bug-1"]) == paths.branch(LABEL, "T-01")
+    async with live(terminal, Board(started_at=NOW)) as display:
+        loop = a_loop(ctx, display, state, Board(started_at=NOW))
+        assert base_for(loop, run_state.ticket("T-01")) == "feature"
+        assert base_for(loop, run_state.ticket("T-01-bug-1")) == paths.branch(LABEL, "T-01")
 
 
 class WatchingTerminal(HeadlessTerminal):
     """Reads the run's state at the moment a question is put to a person.
 
     What `asker` guarantees holds only while the question is open, which is
-    gone by the time the call returns — so it is looked at from here.
+    gone by the time the call returns — so it is looked at from here. It is
+    read off the document, because that is where a concurrent pass would read
+    it too.
     """
 
     def __init__(self, watch: Callable[[], None], **kwargs: Any) -> None:
@@ -1018,41 +1143,42 @@ class WatchingTerminal(HeadlessTerminal):
         return super().answer(question)
 
 
-async def test_asker_suspends_only_its_own_ticket_and_puts_it_back() -> None:
+async def test_asker_suspends_only_its_own_ticket_and_puts_it_back(tmp_path: Path) -> None:
     """Two tickets in flight; a question moves the one it belongs to and no other."""
     seen: list[tuple[Status, Status]] = []
-    state = a_state(a_ticket("T-01"), a_ticket("T-02"))
-    terminal = WatchingTerminal(
-        lambda: seen.append((state.tickets["T-01"].status, state.tickets["T-02"].status)),
-        answers=[Answer("memory", was_free_text=False)],
-    )
-    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
-    state.set_status("T-02", Status.IN_PROGRESS, now=NOW)
+    state = a_state(tmp_path, a_ticket("T-01"), a_ticket("T-02"))
 
-    async with live(terminal, state.board) as display:
+    def watch() -> None:
+        run_state = state.load()
+        seen.append((run_state.ticket("T-01").status, run_state.ticket("T-02").status))
+
+    terminal = WatchingTerminal(watch, answers=[Answer("memory", was_free_text=False)])
+    for ticket_id in ("T-01", "T-02"):
+        state.update(partial(with_status, ticket_id=ticket_id, status=Status.IN_PROGRESS))
+
+    async with live(terminal, Board(started_at=NOW)) as display:
         answer = await asker(state, display, "T-01")(
             AgentQuestion(title="Which store?", options=(AgentOption("memory", "In process"),))
         )
 
     assert answer == "memory"
     assert seen == [(Status.AWAITING_INPUT, Status.IN_PROGRESS)]
-    assert state.tickets["T-01"].status is Status.IN_PROGRESS
+    assert state.load().ticket("T-01").status is Status.IN_PROGRESS
+    assert state.load().ticket("T-01").resume_to is None
     assert terminal.questions[0].header == "T-01"
-    state.check_consistent()
 
 
-async def test_a_question_that_fails_still_gives_the_ticket_back() -> None:
+async def test_a_question_that_fails_still_gives_the_ticket_back(tmp_path: Path) -> None:
     """The resume is in a `finally`: a ticket is no longer waiting on anybody."""
     terminal = HeadlessTerminal()
-    state = a_state(a_ticket("T-01"))
-    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
-    state.set_status("T-01", Status.IN_REVIEW, now=NOW)
+    state = a_state(tmp_path, a_ticket("T-01"))
+    state.update(lambda r: with_status(r, "T-01", Status.IN_PROGRESS))
+    state.update(lambda r: with_status(r, "T-01", Status.IN_REVIEW))
 
-    async with live(terminal, state.board) as display:
+    async with live(terminal, Board(started_at=NOW)) as display:
         ask = asker(state, display, "T-01")
         with pytest.raises(AssertionError):
             # `HeadlessTerminal` fails loudly with no scripted answer left.
             await ask(AgentQuestion(title="Which store?", options=()))
 
-    assert state.tickets["T-01"].status is Status.IN_REVIEW
-    state.check_consistent()
+    assert state.load().ticket("T-01").status is Status.IN_REVIEW
