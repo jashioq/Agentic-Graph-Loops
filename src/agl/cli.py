@@ -2,11 +2,17 @@
 
 Layer: cli. This is the only file that constructs concrete `impl` classes;
 everything below it takes them injected. `run` resolves a project, takes a
-label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and hands a built
-`Deps` to that workflow's `Run`. `clean` removes what a label left behind —
-worktrees, branches, and its run directory — tolerating anything already gone.
-`init` writes the `config.toml` and `standards.md` a project needs before
-`run` can find it.
+label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and
+hands a `RunContext` to that workflow's `run`. A workflow is exactly that: a
+package under `agl.workflows` exposing `workflow.run(ctx)`. Nothing here reaches
+into a run afterwards — the exception `run` raises is the exit status.
+`clean` removes what a label left behind — worktrees, branches, and its run
+directory — tolerating anything already gone. `init` writes the `config.toml`
+and `standards.md` a project needs before `run` can find it.
+
+`_settings` is the only place `ProjectConfig` and `ProjectSettings` meet, which
+is what keeps the config file format a cli concern: below this file a project is
+five fields of data, and nothing knows they came out of a TOML file.
 """
 
 import argparse
@@ -17,8 +23,6 @@ import shutil
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from types import ModuleType
-from typing import Any
 
 from agl import workflows as workflows_pkg
 from agl.config import (
@@ -35,6 +39,8 @@ from agl.core.terminal.impl.rich_terminal import RichTerminal
 from agl.core.vcs import Vcs, VcsError
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
+from agl.runtime.agents import Limits
+from agl.runtime.context import ProjectSettings, RunContext
 from agl.runtime.paths import InvalidNameError
 
 __all__ = ["main"]
@@ -128,20 +134,30 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _fail("give a description, either as an argument or piped on stdin")
 
     module = importlib.import_module(f"agl.workflows.{args.workflow}.workflow")
-    deps = _build_deps(module, home, label, config, vcs)
-    run_obj = module.Run(deps, label, description, args.max_concurrent)
 
+    # Assembling the context is inside the try because it is already doing real
+    # work — reading the current branch, creating the run directory — and a
+    # failure there is the same kind of thing to a person as a failure in the
+    # run itself: a message, not a traceback.
     try:
-        asyncio.run(run_obj.go())
+        ctx = RunContext(
+            label=label,
+            request=description,
+            base_branch=vcs.current_branch(),
+            max_concurrent=args.max_concurrent,
+            project=_settings(config),
+            limits=Limits(model="sonnet"),
+            agent=ClaudeRunner(settings_path=None),
+            vcs=vcs,
+            store=FileStore(paths.run_dir(home, label)),
+            terminal=RichTerminal(),
+        )
+        asyncio.run(module.run(ctx))
     except KeyboardInterrupt:
         _print_interrupted(vcs, label)
         return 1
     except Exception as error:  # noqa: BLE001 - surfaced to the user, never a traceback
         return _fail(error)
-
-    halt = getattr(getattr(run_obj, "state", None), "halt", None)
-    if halt is not None:
-        return _fail(getattr(halt, "reason", str(halt)))
 
     return 0
 
@@ -162,15 +178,19 @@ def _read_description(args: argparse.Namespace) -> str | None:
     return text if text.strip() else None
 
 
-def _build_deps(
-    module: ModuleType, home: Path, label: str, config: ProjectConfig, vcs: Vcs
-) -> Any:
-    return module.Deps(
-        agent=ClaudeRunner(settings_path=None),
-        vcs=vcs,
-        store=FileStore(paths.run_dir(home, label)),
-        terminal=RichTerminal(),
-        config=config,
+def _settings(config: ProjectConfig) -> ProjectSettings:
+    """The project a run is against, as the data a workflow takes.
+
+    Everything `config.toml` holds that a run may use, and nothing of where it
+    came from: `standards` and `config_dir` are the cli's own bookkeeping and
+    stop here.
+    """
+    return ProjectSettings(
+        name=config.name,
+        repo=config.repo,
+        trees_root=config.trees_root,
+        build=config.build,
+        build_timeout=config.build_timeout,
     )
 
 

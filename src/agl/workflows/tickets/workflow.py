@@ -22,13 +22,9 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-from agl.config import ProjectConfig
-from agl.core.agent import AgentQuestion, AgentRunner
-from agl.core.store import Store
-from agl.core.terminal import Option, Question, Terminal
-from agl.core.vcs import Vcs
-from agl.runtime.agents import Limits
-from agl.runtime.context import ProjectSettings, RunContext, build_gate, preflight
+from agl.core.agent import AgentQuestion
+from agl.core.terminal import Option, Question
+from agl.runtime.context import RunContext, build_gate, preflight
 from agl.runtime.dag import NodeId
 from agl.runtime.display import Board, Display, live
 from agl.runtime.merge import (
@@ -332,55 +328,3 @@ def _trees(ctx: RunContext) -> Worktrees:
         project=ctx.project.name,
         label=ctx.label,
     )
-
-
-# -- the seam the cli still comes in through ------------------------------
-#
-# Temporary. A workflow's entry point is `run(ctx)` and building the
-# `RunContext` — including turning `config.toml` into a `ProjectSettings` — is
-# the cli's job. Until it does that, the translation happens here, the one
-# place that still knows both.
-
-
-@dataclass(frozen=True)
-class Deps:
-    """What the cli hands a run today, before it hands a `RunContext`."""
-
-    agent: AgentRunner
-    vcs: Vcs
-    store: Store
-    terminal: Terminal
-    config: ProjectConfig
-
-
-class Run:
-    """The cli's current entry point: a `RunContext` and one call to `run`."""
-
-    def __init__(self, deps: Deps, label: str, description: str, max_concurrent: int) -> None:
-        self.deps = deps
-        self.label = label
-        self.description = description
-        self.max_concurrent = max_concurrent
-
-    async def go(self) -> None:
-        config = self.deps.config
-        await run(
-            RunContext(
-                label=self.label,
-                request=self.description,
-                base_branch=self.deps.vcs.current_branch(),
-                max_concurrent=self.max_concurrent,
-                project=ProjectSettings(
-                    name=config.name,
-                    repo=config.repo,
-                    trees_root=config.trees_root,
-                    build=config.build,
-                    build_timeout=config.build_timeout,
-                ),
-                limits=Limits(model="sonnet"),
-                agent=self.deps.agent,
-                vcs=self.deps.vcs,
-                store=self.deps.store,
-                terminal=self.deps.terminal,
-            )
-        )
