@@ -1,9 +1,13 @@
 """The ticket workflow's graph: interview, decompose, then drive every ticket to merged.
 
 Layer: workflows. This file holds the shape of the loop and nothing else —
-every method delegates to `agents`, `state`, `scheduler`, `merge`, `reviews`,
-`render`, `approval`, `wiring`, `worktrees`, or `tools`. A method that grows
-past the shape belongs in one of those modules, not here.
+every method delegates to `agents`, `state`, `merge`, `reviews`, `render`,
+`approval`, `wiring`, `tools`, or the runtime's `scheduler` and `worktrees`. A
+method that grows past the shape belongs in one of those modules, not here.
+
+The two things the runtime cannot know are here: `_base_for`, which is the
+ticket rule that a bug branches off its parent, and `_is_halted`, the predicate
+that turns this run's `Halt` into the yes-or-no the scheduler asks for.
 
 `Run` owns one run end to end: the `RunState` that is execution truth, the
 `Live` that is display-only, the merge queue, and the live terminal session.
@@ -17,6 +21,7 @@ import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 from agl.config import ProjectConfig
 from agl.core.agent import AgentRunner
@@ -25,17 +30,18 @@ from agl.core.store import Store
 from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
 from agl.runtime import paths
-from agl.runtime.dag import Dag
-from agl.workflows.tickets import agents, scheduler, state
+from agl.runtime.dag import Dag, NodeId
+from agl.runtime.scheduler import drive
+from agl.runtime.worktrees import Worktrees
+from agl.workflows.tickets import agents, state
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, session_screen
 from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import render
 from agl.workflows.tickets.reviews import next_bug_start, to_bug_tickets
-from agl.workflows.tickets.state import Halt, Live, RunState
+from agl.workflows.tickets.state import Halt, Live, RunState, bugs_first
 from agl.workflows.tickets.wiring import Wiring
-from agl.workflows.tickets.worktrees import Work, Worktrees
 
 __all__ = [
     "DecomposeAbortedError",
@@ -45,6 +51,20 @@ __all__ = [
     "Run",
     "Work",
 ]
+
+
+@dataclass(frozen=True)
+class Work:
+    """One ticket, bound to the worktree its work happens in.
+
+    The runtime pool is keyed by node id and knows nothing of tickets, so this
+    is where the two are put back together — once, in `_run_one`, rather than
+    threaded through every step below it.
+    """
+
+    ticket: Ticket
+    tree: Path
+    branch: str
 
 
 @dataclass(frozen=True)
@@ -76,7 +96,7 @@ class Run:
         self.max_concurrent = max_concurrent
         base_branch = deps.vcs.current_branch()
         self.state = RunState(label=label, base_branch=base_branch, dag=Dag(), tickets={})
-        self.state.dag = Dag(priority=scheduler.bugs_first(self.state))
+        self.state.dag = Dag(priority=bugs_first(self.state))
         # Created here, not after approval: `started_at` has to cover the
         # whole session for the interview and decompose headers to have a
         # timer, and `activity` has to have somewhere to go the moment either
@@ -85,7 +105,12 @@ class Run:
         self.live: Live | None = Live(started_at=time.monotonic())
         self.session: LiveSession | None = None
         self.merge_queue: MergeQueue | None = None
-        self.worktrees = Worktrees(deps.vcs, deps.config, label, base_branch)
+        self.worktrees = Worktrees(
+            deps.vcs,
+            trees_root=deps.config.trees_root,
+            project=deps.config.name,
+            label=label,
+        )
         self.wiring = Wiring(
             deps.agent, deps.store, deps.config.repo, self.state, label, lambda: self.live
         )
@@ -174,15 +199,20 @@ class Run:
 
     async def _drive(self) -> None:
         # A halted ticket's own task does not return until it is resumed, so
-        # `scheduler.run` cannot return on its own while one is stuck waiting
-        # — `_resume_loop`, running alongside it, is what unsticks it. This
-        # loop only has to notice work `scheduler.run` returned early from: a
-        # resolved halt that left something newly ready to claim.
-        while not self.state.dag.is_complete():
-            await scheduler.run(self.state, self._run_one, self.max_concurrent, self._on_error)
-            halt = self.state.halt
-            if halt is not None and not halt.resumable:
-                return
+        # a pass cannot return on its own while one is stuck waiting —
+        # `_resume_loop`, running alongside it, is what unsticks it. A halt
+        # that is still set when a pass returns is therefore one nothing
+        # resolved, which is exactly `drive`'s stopping condition.
+        await drive(
+            self.state.dag,
+            self._run_one,
+            self.max_concurrent,
+            self._on_error,
+            self._is_halted,
+        )
+
+    def _is_halted(self) -> bool:
+        return self.state.halt is not None
 
     async def _resume_loop(self) -> None:
         while True:
@@ -221,13 +251,22 @@ class Run:
             timeout=self.deps.config.build_timeout,
         )
 
-    async def _run_one(self, t: Ticket) -> None:
-        w = self.worktrees.acquire(t)
-        await self.ticket(w)
-        if w.ticket.status is Status.PENDING:
-            self.worktrees.keep(w)
+    async def _run_one(self, ticket_id: NodeId) -> None:
+        t = self.state.tickets[ticket_id]
+        held = self.worktrees.acquire(
+            t.id, self.worktrees.branch_for(t.id), self._base_for(t)
+        )
+        await self.ticket(Work(ticket=t, tree=held.tree, branch=held.branch))
+        if t.status is Status.PENDING:
+            self.worktrees.keep(held)
         else:
-            self.worktrees.release(w)
+            self.worktrees.release(held)
+
+    def _base_for(self, ticket: Ticket) -> str:
+        """The branch a ticket's own branch is cut from: the run's base, or its parent's."""
+        if ticket.parent is None:
+            return self.state.base_branch
+        return self.worktrees.branch_for(ticket.parent)
 
     # -- one ticket's body --------------------------------------------------
 
@@ -242,7 +281,7 @@ class Run:
         state.set_status(self.state, self.live, w.ticket.id, Status.IN_REVIEW)
         ctx = self.wiring.ctx(self.wiring.ticket_ask(self.session, w.ticket.id))
         activity = self.wiring.activity(w.ticket.id)
-        base = self.worktrees.base_for(w.ticket)
+        base = self._base_for(w.ticket)
         findings = await agents.review(ctx, w.ticket, w.tree, base, activity)
         groups = await agents.triage(ctx, w.ticket, findings, activity)
         return to_bug_tickets(w.ticket, groups, next_bug_start(self.state.tickets, w.ticket.id))
@@ -253,7 +292,7 @@ class Run:
 
     async def enqueue_merge(self, w: Work) -> None:
         state.set_status(self.state, self.live, w.ticket.id, Status.MERGING)
-        target = self.worktrees.base_for(w.ticket)
+        target = self._base_for(w.ticket)
         if w.ticket.parent is None:
             cwd = self.deps.config.repo
         else:
@@ -278,8 +317,8 @@ class Run:
             self.live.activity[ticket_id] = "merge abandoned"
         self._pending_merges.pop(ticket_id).set()
 
-    def _on_error(self, ticket: Ticket | None, error: BaseException) -> None:
-        who = ticket.id if ticket is not None else "the run"
+    def _on_error(self, ticket_id: NodeId | None, error: BaseException) -> None:
+        who = ticket_id if ticket_id is not None else "the run"
         self._halt(Halt(f"{who} failed: {error}", str(error), resumable=False))
 
     def _halt(self, halt: Halt) -> None:

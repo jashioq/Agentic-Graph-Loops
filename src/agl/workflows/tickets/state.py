@@ -27,10 +27,10 @@ third.
 """
 
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from agl.runtime.dag import Dag, NodeState
+from agl.runtime.dag import Dag, NodeId, NodeState
 from agl.workflows.tickets.models import Status, Ticket, can_transition, transition
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     "RunState",
     "UnknownTicketError",
     "add_tickets",
+    "bugs_first",
     "check_consistent",
     "display_order",
     "file_bugs",
@@ -304,6 +305,28 @@ def display_order(state: RunState) -> tuple[str, ...]:
         if ticket.parent is None or ticket.parent not in state.tickets:
             emit(ticket_id)
     return tuple(order)
+
+
+def bugs_first(state: RunState) -> Callable[[NodeId], bool]:
+    """A `Dag` priority key that puts every ready bug ahead of every ready feature.
+
+    Ticket knowledge, so it lives here rather than in the scheduler: what the
+    graph is asked for is a key over node ids, and only this run knows which of
+    its nodes are bugs.
+
+    `Dag.ready()` sorts with this key using a stable sort, so ties — bug vs
+    bug, feature vs feature — keep insertion order for free; the key only has
+    to say which of the two groups a node belongs to.
+
+    A run that keeps generating bugs can leave feature tickets waiting a long
+    time even though they became ready first. That is intended: finishing
+    what is already open takes priority over opening more.
+    """
+
+    def priority(node_id: NodeId) -> bool:
+        return not state.tickets[node_id].is_bug
+
+    return priority
 
 
 # -- internals ------------------------------------------------------------

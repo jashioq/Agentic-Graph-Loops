@@ -1,5 +1,6 @@
 """One run's state: the graph, the tickets, and keeping the two from disagreeing."""
 
+from collections.abc import Sequence
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from agl.workflows.tickets.state import (
     RunState,
     UnknownTicketError,
     add_tickets,
+    bugs_first,
     check_consistent,
     display_order,
     file_bugs,
@@ -508,6 +510,31 @@ def test_display_order_covers_every_ticket_exactly_once() -> None:
 
     assert sorted(order) == sorted(state.tickets)
     assert len(set(order)) == len(order)
+
+
+# -- bugs_first -----------------------------------------------------------
+
+
+def prioritised(tickets: Sequence[Ticket]) -> RunState:
+    """A run whose graph sorts its ready set with `bugs_first`."""
+    state = new_state()
+    state.dag = Dag(priority=bugs_first(state))
+    add_tickets(state, None, tickets)
+    return state
+
+
+def test_bugs_first_puts_ready_bugs_ahead_of_ready_features() -> None:
+    tickets = [feature("F1"), feature("F2"), bug("B1", "F1"), feature("F3"), bug("B2", "F1")]
+    state = prioritised(tickets)
+
+    assert state.dag.ready() == ("B1", "B2", "F1", "F2", "F3")
+
+
+def test_bugs_first_preserves_insertion_order_within_each_group() -> None:
+    tickets = [feature("F2"), bug("B2", "F2"), feature("F1"), bug("B1", "F1")]
+    state = prioritised(tickets)
+
+    assert state.dag.ready() == ("B2", "B1", "F2", "F1")
 
 
 # -- the lifetime split ---------------------------------------------------
