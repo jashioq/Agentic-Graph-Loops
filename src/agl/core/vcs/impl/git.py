@@ -44,6 +44,13 @@ class Git(MergeOps, Vcs):
     def status(self, cwd: Path | None = None) -> tuple[FileStatus, ...]:
         return tuple(sorted(self._porcelain(cwd), key=lambda entry: entry.path))
 
+    def discard_changes(self, cwd: Path) -> None:
+        # Two commands because git has no one command for it: `reset --hard`
+        # only speaks for what is tracked, and `clean` only for what is not.
+        # `-fd` and not `-fdx`, so what `.gitignore` covers survives.
+        self._run(["reset", "--hard"], cwd)
+        self._run(["clean", "-fd"], cwd)
+
     # -- refs -------------------------------------------------------------
 
     def rev_parse(self, ref: str) -> str:
@@ -110,6 +117,19 @@ class Git(MergeOps, Vcs):
                 # failed add must not leave a half-created branch behind.
                 self._run(["branch", "-D", "--", branch], None, check=False)
                 raise VcsError(f"cannot add worktree at {path}: {self._reason(result)}")
+            return Worktree(path=path.resolve(), branch=branch)
+
+    def attach_worktree(self, path: Path, branch: str) -> Worktree:
+        with self._lock:
+            # Asked in advance, unlike everywhere else in this file: git says
+            # the same thing when the branch is missing as when it is held by
+            # another tree, and those are different answers to the caller.
+            if not self.branch_exists(branch):
+                raise UnknownRefError(branch)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            result = self._run(["worktree", "add", str(path), branch], None, check=False)
+            if result.code != 0:
+                raise VcsError(f"cannot attach worktree at {path}: {self._reason(result)}")
             return Worktree(path=path.resolve(), branch=branch)
 
     def remove_worktree(self, path: Path, force: bool = False) -> None:

@@ -6,9 +6,15 @@ from pathlib import Path
 
 import pytest
 
-from agl.core.vcs import BranchExistsError, DirtyWorktreeError, VcsError, Worktree
+from agl.core.vcs import (
+    BranchExistsError,
+    DirtyWorktreeError,
+    UnknownRefError,
+    VcsError,
+    Worktree,
+)
 from agl.core.vcs.impl.git import Git
-from tests.conftest import commit_file
+from tests.conftest import commit_file, git
 
 
 @pytest.fixture
@@ -103,6 +109,91 @@ def test_add_worktree_onto_an_occupied_path_raises(vcs: Git, trees: Path) -> Non
     vcs.add_worktree(tree, "agl/x/T-03", "main")
     with pytest.raises(VcsError):
         vcs.add_worktree(tree, "agl/x/other", "main")
+
+
+# -- attaching ------------------------------------------------------------
+
+
+def test_attach_worktree_checks_the_branch_out(vcs: Git, trees: Path) -> None:
+    vcs.create_branch("feat", "main")
+    tree = trees / "T-03"
+    vcs.attach_worktree(tree, "feat")
+    assert tree.is_dir()
+    assert vcs.current_branch(cwd=tree) == "feat"
+
+
+def test_attach_worktree_returns_the_worktree(vcs: Git, trees: Path) -> None:
+    vcs.create_branch("feat", "main")
+    tree = trees / "T-03"
+    assert vcs.attach_worktree(tree, "feat") == Worktree(path=tree.resolve(), branch="feat")
+
+
+def test_attach_worktree_registers_it(vcs: Git, trees: Path) -> None:
+    vcs.create_branch("feat", "main")
+    tree = trees / "T-03"
+    vcs.attach_worktree(tree, "feat")
+    assert Worktree(tree.resolve(), "feat") in vcs.list_worktrees()
+
+
+def test_an_attached_tree_holds_the_branch_content(repo: Path, vcs: Git, trees: Path) -> None:
+    # The point of attaching: the work that branch already holds comes back.
+    git(repo, "checkout", "-q", "-b", "feat")
+    commit_file(repo, "a.txt", "a\n", "work on feat")
+    git(repo, "checkout", "-q", "main")
+    tree = trees / "T-03"
+    vcs.attach_worktree(tree, "feat")
+    assert (tree / "a.txt").read_text(encoding="utf-8") == "a\n"
+
+
+def test_attach_worktree_creates_missing_parent_directories(vcs: Git, tmp_path: Path) -> None:
+    vcs.create_branch("feat", "main")
+    tree = tmp_path / "deep" / "nested" / "T-03"
+    vcs.attach_worktree(tree, "feat")
+    assert tree.is_dir()
+
+
+def test_attaching_a_branch_that_does_not_exist_raises(vcs: Git, trees: Path) -> None:
+    with pytest.raises(UnknownRefError):
+        vcs.attach_worktree(trees / "T-03", "no-such-branch")
+
+
+def test_a_refused_attach_leaves_no_directory_behind(vcs: Git, trees: Path) -> None:
+    tree = trees / "T-03"
+    with pytest.raises(UnknownRefError):
+        vcs.attach_worktree(tree, "no-such-branch")
+    assert not tree.exists()
+    assert len(vcs.list_worktrees()) == 1
+
+
+def test_attaching_a_branch_checked_out_elsewhere_raises(vcs: Git, trees: Path) -> None:
+    vcs.add_worktree(trees / "T-03", "feat", "main")
+    with pytest.raises(VcsError):
+        vcs.attach_worktree(trees / "T-04", "feat")
+
+
+def test_attaching_the_branch_the_main_repo_holds_raises(vcs: Git, trees: Path) -> None:
+    with pytest.raises(VcsError):
+        vcs.attach_worktree(trees / "T-03", "main")
+
+
+def test_attach_worktree_onto_an_occupied_path_raises(vcs: Git, trees: Path) -> None:
+    vcs.create_branch("feat", "main")
+    vcs.create_branch("other", "main")
+    tree = trees / "T-03"
+    vcs.attach_worktree(tree, "feat")
+    with pytest.raises(VcsError):
+        vcs.attach_worktree(tree, "other")
+
+
+def test_a_removed_worktree_can_be_attached_again(vcs: Git, trees: Path) -> None:
+    # What resume does: the branch outlives the tree, so the tree comes back.
+    tree = trees / "T-03"
+    vcs.add_worktree(tree, "feat", "main")
+    sha = commit_file(tree, "a.txt", "a\n", "work")
+    vcs.remove_worktree(tree)
+    vcs.attach_worktree(tree, "feat")
+    assert vcs.rev_parse("feat") == sha
+    assert (tree / "a.txt").read_text(encoding="utf-8") == "a\n"
 
 
 # -- listing --------------------------------------------------------------

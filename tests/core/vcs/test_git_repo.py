@@ -153,6 +153,72 @@ def test_status_is_scoped_to_the_given_worktree(repo: Path, tmp_path: Path, vcs:
     assert vcs.is_dirty() is False
 
 
+# -- discarding -----------------------------------------------------------
+
+
+def test_discard_changes_reverts_a_tracked_edit(repo: Path, vcs: Git) -> None:
+    (repo / "README.md").write_text("edited\n", encoding="utf-8")
+    vcs.discard_changes(repo)
+    assert (repo / "README.md").read_text(encoding="utf-8") == "# repo\n"
+
+
+def test_discard_changes_reverts_a_staged_edit(repo: Path, vcs: Git) -> None:
+    (repo / "README.md").write_text("edited\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    vcs.discard_changes(repo)
+    assert vcs.is_dirty() is False
+
+
+def test_discard_changes_deletes_an_untracked_file(repo: Path, vcs: Git) -> None:
+    (repo / "scratch.txt").write_text("x\n", encoding="utf-8")
+    vcs.discard_changes(repo)
+    assert not (repo / "scratch.txt").exists()
+
+
+def test_discard_changes_deletes_an_untracked_directory(repo: Path, vcs: Git) -> None:
+    (repo / "scratch").mkdir()
+    (repo / "scratch" / "x.txt").write_text("x\n", encoding="utf-8")
+    vcs.discard_changes(repo)
+    assert not (repo / "scratch").exists()
+
+
+def test_discard_changes_keeps_ignored_files(repo: Path, vcs: Git) -> None:
+    # Build output is not uncommitted work, and rebuilding it is expensive.
+    commit_file(repo, ".gitignore", "build/\n", "ignore build output")
+    (repo / "build").mkdir()
+    (repo / "build" / "artifact.bin").write_text("compiled\n", encoding="utf-8")
+    vcs.discard_changes(repo)
+    assert (repo / "build" / "artifact.bin").read_text(encoding="utf-8") == "compiled\n"
+
+
+def test_discard_changes_leaves_a_clean_tree_alone(repo: Path, vcs: Git) -> None:
+    head = vcs.rev_parse("HEAD")
+    vcs.discard_changes(repo)
+    assert vcs.rev_parse("HEAD") == head
+    assert vcs.is_dirty() is False
+    assert (repo / "README.md").read_text(encoding="utf-8") == "# repo\n"
+
+
+def test_discard_changes_keeps_committed_work(repo: Path, vcs: Git) -> None:
+    sha = commit_file(repo, "a.txt", "a\n", "add a")
+    (repo / "a.txt").write_text("edited\n", encoding="utf-8")
+    vcs.discard_changes(repo)
+    assert vcs.rev_parse("HEAD") == sha
+    assert (repo / "a.txt").read_text(encoding="utf-8") == "a\n"
+
+
+def test_discard_changes_is_scoped_to_the_tree_it_is_given(
+    repo: Path, tmp_path: Path, vcs: Git
+) -> None:
+    tree = tmp_path / "tree"
+    vcs.add_worktree(tree, "feat", "main")
+    (tree / "scratch.txt").write_text("x\n", encoding="utf-8")
+    (repo / "scratch.txt").write_text("x\n", encoding="utf-8")
+    vcs.discard_changes(tree)
+    assert not (tree / "scratch.txt").exists()
+    assert (repo / "scratch.txt").exists()
+
+
 # -- refs -----------------------------------------------------------------
 
 

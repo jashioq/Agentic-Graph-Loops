@@ -108,6 +108,16 @@ class Vcs(ABC):
     def status(self, cwd: Path | None = None) -> tuple[FileStatus, ...]:
         """Every changed path with its porcelain code, sorted by path."""
 
+    @abstractmethod
+    def discard_changes(self, cwd: Path) -> None:
+        """Throw away everything uncommitted in this tree.
+
+        Tracked edits and untracked files alike. Ignored files are left alone —
+        build output is not uncommitted work, and it is expensive to make
+        again. `cwd` is required: discarding is never something to do to the
+        main repository by accident.
+        """
+
     # -- refs -------------------------------------------------------------
 
     @abstractmethod
@@ -164,6 +174,15 @@ class Vcs(ABC):
         Raises `BranchExistsError` if the branch is already there,
         `UnknownRefError` if `base` does not resolve, and `VcsError` if the
         path is taken.
+        """
+
+    @abstractmethod
+    def attach_worktree(self, path: Path, branch: str) -> Worktree:
+        """Check an existing branch out at `path`.
+
+        The counterpart to `add_worktree`, which creates one. Raises
+        `UnknownRefError` if the branch does not exist and `VcsError` if the
+        path is taken or the branch is checked out in another tree.
         """
 
     @abstractmethod
