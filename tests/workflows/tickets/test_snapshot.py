@@ -118,6 +118,18 @@ def test_a_halt_survives_with_all_three_of_its_fields() -> None:
     assert from_json(to_json(run)).halt == Halt("build failed", "line 40", resumable=False)
 
 
+def test_a_halt_with_nothing_to_add_survives_its_empty_detail() -> None:
+    """`detail` defaults to empty, so the document it produces has to read back.
+
+    A halt whose reason says everything is an ordinary halt — and one written
+    into a document that then refused to parse would take the whole state with
+    it, which is every ticket in the run.
+    """
+    run = with_halt(Run(), Halt("the run failed"))
+
+    assert from_json(to_json(run)).halt == Halt("the run failed")
+
+
 def test_no_halt_round_trips_as_no_halt() -> None:
     assert from_json(to_json(Run())).halt is None
 

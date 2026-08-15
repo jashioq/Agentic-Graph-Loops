@@ -41,6 +41,7 @@ __all__ = [
     "asker",
     "base_for",
     "one_ticket",
+    "trees_for",
 ]
 
 
@@ -86,6 +87,25 @@ class Job:
     branch: str
     on_activity: Activity
     ask: Ask
+
+
+def trees_for(ctx: RunContext) -> Worktrees:
+    """This run's worktree pool, under the project's trees root.
+
+    Here rather than beside the loop that uses it because a resume builds one
+    too, before any pass has run, and two processes over the same run have to
+    name the same trees. A pool is addressed by project and label alone, so
+    they do: the same three fields, in one place, whoever is asking.
+
+    The pool comes back owning nothing. Taking over what is already on disk is
+    `reopen`, which the caller asks for when it wants the answer.
+    """
+    return Worktrees(
+        ctx.vcs,
+        trees_root=ctx.project.trees_root,
+        project=ctx.project.name,
+        label=ctx.label,
+    )
 
 
 def base_for(loop: Loop, ticket: Ticket) -> str:

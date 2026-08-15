@@ -182,9 +182,15 @@ def _halt(value: Any) -> Halt | None:
     resumable = fields.get("resumable", True)
     if not isinstance(resumable, bool):
         raise InvalidStateError(f"halt: resumable must be true or false, got {resumable!r}")
+    # `detail` is the one text field that may be empty: a halt whose reason says
+    # everything carries no detail, and `to_json` writes the empty string it
+    # holds rather than omitting the field.
+    detail = fields.get("detail") or ""
+    if not isinstance(detail, str):
+        raise InvalidStateError(f"halt: detail must be text, got {_kind(detail)}")
     return Halt(
         reason=_text(fields.get("reason"), "reason", "halt"),
-        detail=_optional_text(fields.get("detail"), "detail", "halt") or "",
+        detail=detail,
         resumable=resumable,
     )
 

@@ -12,6 +12,12 @@ between two stages restarts into the one it was owed, because nothing about
 "where we got to" was ever held in a local variable. It is also why deleting a
 document walks the run backwards rather than confusing it.
 
+**Two entry points over one loop.** `run` starts a run and `resume` continues
+one, and they differ only in what they do before `loop` — a different preflight,
+and `settle` where the record is written. Nothing below either of them is told
+which one it was, and that is the test of whether the reactor works: if a
+resumed pass needed to know it was resumed, something would be remembering.
+
 Two of the three things the runtime cannot know are here. `resolve` with
 `halt_for` is the whole halt policy: what a merge that did not land means, and
 whether a person pressing enter can help. `failed` is what an exception out of a
@@ -28,7 +34,7 @@ import time
 from functools import partial
 
 from agl.core.terminal import Option, Question
-from agl.runtime.context import RunContext, build_gate, preflight
+from agl.runtime.context import RunContext, build_gate, preflight, resume_preflight
 from agl.runtime.dag import NodeId, NodeState
 from agl.runtime.display import Board, Display, live
 from agl.runtime.merge import MergeConfig, MergeDecision, MergeOutcome, MergeQueue
@@ -38,16 +44,19 @@ from agl.runtime.worktrees import Worktrees
 from agl.workflows.tickets import agents, screens
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Status, Ticket, tickets_from_json
+from agl.workflows.tickets.resume import settle
 from agl.workflows.tickets.snapshot import RunFile
 from agl.workflows.tickets.state import Halt, dag_of, halt_for, with_halt, with_status, with_tickets
 from agl.workflows.tickets.steps import Stage, Step, look, stage_of, step_for
-from agl.workflows.tickets.ticket import Loop, base_for, one_ticket
+from agl.workflows.tickets.ticket import Loop, base_for, one_ticket, trees_for
 
 __all__ = [
     "DecomposeAbortedError",
     "HaltedError",
     "InterviewIncompleteError",
+    "NothingToResumeError",
     "loop",
+    "resume",
     "run",
 ]
 
@@ -58,6 +67,10 @@ class InterviewIncompleteError(Exception):
 
 class DecomposeAbortedError(Exception):
     """Raised when the user aborted decomposition before approving any tickets."""
+
+
+class NothingToResumeError(Exception):
+    """Raised when a run is asked to continue from a state that has no next step."""
 
 
 class HaltedError(Exception):
@@ -102,6 +115,26 @@ async def run(ctx: RunContext) -> None:
             max_concurrent=ctx.max_concurrent,
         ),
     )
+    await loop(ctx)
+
+
+async def resume(ctx: RunContext) -> None:
+    """The same run, picked back up. Edit this to change what resuming means.
+
+    The two states with nothing to continue are refused first, before the
+    repository is so much as looked at: a person who has not agreed a
+    specification yet wants to hear "start a new run", not which branch to check
+    out. Everything after that is `run`'s shape with the first two steps
+    replaced — different checks, and `settle` where `write_record` was, because
+    the record was written by the process that started this.
+    """
+    stage = stage_of(RunFile(StateFile(ctx.store)).load(), ctx.store)
+    if stage is Stage.INTERVIEW:
+        raise NothingToResumeError("nothing was agreed yet — start a new run")
+    if stage is Stage.DONE:
+        raise NothingToResumeError("this run already finished")
+    resume_preflight(ctx.vcs, ctx.base_branch)
+    settle(ctx)
     await loop(ctx)
 
 
@@ -193,7 +226,7 @@ async def implement_all(
             resolve=partial(resolve, display, state, ctx.label),
         ),
     )
-    run_loop = Loop(ctx, display, state, board, _trees(ctx), merges)
+    run_loop = Loop(ctx, display, state, board, _pool(ctx), merges)
     async with merges.running():
         # A ticket whose merge did not land is parked in `submit` until
         # `resolve` deals with it, so a halt still set when a pass returns is
@@ -294,11 +327,15 @@ def failed(state: RunFile, node_id: NodeId | None, error: BaseException) -> None
     state.update(lambda run: with_halt(run, halt))
 
 
-def _trees(ctx: RunContext) -> Worktrees:
-    """This run's worktree pool, under the project's trees root."""
-    return Worktrees(
-        ctx.vcs,
-        trees_root=ctx.project.trees_root,
-        project=ctx.project.name,
-        label=ctx.label,
-    )
+def _pool(ctx: RunContext) -> Worktrees:
+    """This run's worktree pool, owning whatever trees are already checked out.
+
+    `reopen` on every run and not only a resumed one, because the difference
+    between the two is only ever how much it finds: a fresh run has an empty
+    trees directory and takes over nothing, and a picked-up one takes over the
+    trees a dead process left rather than trying to check the same branches out
+    a second time — which git refuses, as it should.
+    """
+    trees = trees_for(ctx)
+    trees.reopen()
+    return trees
