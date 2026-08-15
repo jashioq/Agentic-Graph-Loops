@@ -8,9 +8,10 @@ tells you what is open and when it closes. A context that opened things would
 move half of that story in here, where it is nobody's local variable.
 
 `preflight` is a function rather than something imposed on a workflow. It is the
-first line of `run` because a workflow decides its own first line — one that
-resumes an interrupted run would want different checks, and it should not have
-to inherit these to get a context.
+first line of `run` because a workflow decides its own first line — and
+`resume_preflight` is what that looked like once a workflow actually had a
+second entry point: a different set of checks, chosen by the caller, rather than
+one function that has to be told which kind of start it is looking at.
 
 `build_gate` is the one place a project's build command becomes the callable the
 merge queue holds. The queue never learns what a build is: it gets something to
@@ -35,6 +36,7 @@ __all__ = [
     "RunContext",
     "build_gate",
     "preflight",
+    "resume_preflight",
 ]
 
 _TRUNK = ("main", "master")
@@ -70,8 +72,15 @@ class RunContext:
     line of a run and the last. What a run has *done* lives in the workflow's
     own state and on the display's board, both of which the workflow creates and
     owns; this is only the part that was decided before it started.
+
+    `workflow` is the one field a run cannot work out from the inside: a
+    workflow knows what it does, not what it is called. It is here because the
+    record a run writes has to name the workflow `agl resume` will hand the run
+    back to, and the context is where every other field of that record already
+    lives.
     """
 
+    workflow: str
     label: str
     request: str
     base_branch: str
@@ -94,7 +103,9 @@ def preflight(vcs: Vcs, store: Store, label: str) -> None:
     into this run's: uncommitted edits that a worktree's commits would land on
     top of, a trunk that must not be branched from and merged into, and a label
     whose branches or documents are still around from a run that did not finish.
-    The last one names `agl clean` because that is the whole remedy.
+    The last one names both remedies, because leftovers are two situations and
+    not one: a run worth picking up where it stopped, and a run worth throwing
+    away. Only the person who left it there knows which.
     """
     if vcs.is_dirty():
         raise PreflightError("the repository has uncommitted changes")
@@ -103,7 +114,29 @@ def preflight(vcs: Vcs, store: Store, label: str) -> None:
         raise PreflightError(f"cannot run on {branch!r}; check out a feature branch first")
     namespace = paths.branch_namespace(label)
     if vcs.branches(namespace) or store.list():
-        raise PreflightError(f"{label!r} is already in use; run `agl clean {label}` first")
+        raise PreflightError(
+            f"{label!r} is already in use; run `agl resume {label}` to continue it, "
+            f"or `agl clean {label}` to discard it"
+        )
+
+
+def resume_preflight(vcs: Vcs, base_branch: str) -> None:
+    """Refuse to resume unless the repository is where the run left it.
+
+    The branch has to be the one the run was started from, and the tree has to
+    be clean except for a merge this run left in progress — which is the one
+    kind of mess a resume knows how to settle. Deliberately none of
+    `preflight`'s other checks: existing branches and an occupied run directory
+    are the point of resuming, not a reason to refuse.
+    """
+    branch = vcs.current_branch()
+    if branch != base_branch:
+        raise PreflightError(
+            f"the run was started from {base_branch!r} and the repository is on "
+            f"{branch!r}; check {base_branch!r} out first"
+        )
+    if vcs.is_dirty() and not vcs.merge_in_progress(vcs.root()):
+        raise PreflightError("the repository has uncommitted changes")
 
 
 def build_gate(project: ProjectSettings) -> Build:

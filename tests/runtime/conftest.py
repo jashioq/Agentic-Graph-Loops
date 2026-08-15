@@ -99,6 +99,7 @@ def context(
     *,
     agent: AgentRunner | None = None,
     terminal: Terminal | None = None,
+    workflow: str = "tickets",
     label: str = LABEL,
     request: str = REQUEST,
     base_branch: str | None = None,
@@ -119,6 +120,7 @@ def context(
     vcs = Git(repo)
     run_home = repo.parent / "home" if home is None else home
     return RunContext(
+        workflow=workflow,
         label=label,
         request=request,
         base_branch=vcs.current_branch() if base_branch is None else base_branch,

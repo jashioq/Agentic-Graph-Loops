@@ -140,6 +140,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # run itself: a message, not a traceback.
     try:
         ctx = RunContext(
+            workflow=args.workflow,
             label=label,
             request=description,
             base_branch=vcs.current_branch(),
