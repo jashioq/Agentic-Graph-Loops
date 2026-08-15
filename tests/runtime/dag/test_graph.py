@@ -2,7 +2,7 @@
 
 import pytest
 
-from agl.runtime.dag import CycleError, Dag, UnknownNodeError
+from agl.runtime.dag import CycleError, Dag, NodeState, UnknownNodeError
 
 
 def test_nodes_preserve_insertion_order() -> None:
@@ -22,6 +22,62 @@ def test_duplicate_node_id_raises() -> None:
     with pytest.raises(ValueError):
         dag.add_node("A")
     assert dag.nodes() == ("A",)
+
+
+def test_a_node_starts_pending_by_default() -> None:
+    dag = Dag()
+    dag.add_node("A")
+    assert dag.state("A") is NodeState.PENDING
+
+
+def test_a_node_can_be_added_in_the_state_a_snapshot_says_it_is_in() -> None:
+    dag = Dag()
+    dag.add_node("A", NodeState.DONE)
+    dag.add_node("B", NodeState.CLAIMED)
+    dag.add_node("C")
+    assert (dag.state("A"), dag.state("B"), dag.state("C")) == (
+        NodeState.DONE,
+        NodeState.CLAIMED,
+        NodeState.PENDING,
+    )
+    assert dag.ready() == ("C",)
+
+
+def test_a_duplicate_id_raises_whatever_state_it_is_added_in() -> None:
+    dag = Dag()
+    dag.add_node("A", NodeState.DONE)
+    with pytest.raises(ValueError):
+        dag.add_node("A", NodeState.PENDING)
+    assert dag.state("A") is NodeState.DONE
+
+
+def test_a_graph_rebuilt_from_a_snapshot_states_edges_onto_finished_nodes() -> None:
+    # The derive path: every node arrives in the state the snapshot recorded,
+    # and the edges follow, so an edge onto an already-DONE blocker is normal.
+    dag = Dag()
+    dag.add_node("A", NodeState.DONE)
+    dag.add_node("B", NodeState.CLAIMED)
+    dag.add_node("C")
+    dag.add_edge("B", "A")
+    dag.add_edge("C", "A")
+
+    assert dag.unsatisfied_blockers("C") == ()
+    assert dag.ready() == ("C",)
+
+
+def test_a_graph_rebuilt_wholly_done_is_complete() -> None:
+    dag = Dag()
+    for node_id in ("A", "B"):
+        dag.add_node(node_id, NodeState.DONE)
+    dag.add_edge("A", "B")
+    assert dag.is_complete()
+
+
+def test_a_rebuilt_node_can_still_be_moved() -> None:
+    dag = Dag()
+    dag.add_node("A", NodeState.CLAIMED)
+    dag.complete("A")
+    assert dag.state("A") is NodeState.DONE
 
 
 def test_edge_from_unknown_node_raises() -> None:

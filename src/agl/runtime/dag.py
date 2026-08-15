@@ -17,6 +17,12 @@ Releasing first leaves it ready for a beat, and a scheduler that happens to look
 in that window claims it out from under the work meant to block it. Adding an
 edge to a still-`CLAIMED` node is legal by design, which is what makes
 edges-first safe.
+
+That same permissiveness is what lets a graph be *derived* rather than replayed.
+A live graph adds `PENDING` nodes and moves them; a graph rebuilt from a
+snapshot states each node's state as it adds it and then adds the edges, in one
+pass and in any order. Nothing is kept between rebuilds, so a derived graph
+cannot disagree with the snapshot it came from.
 """
 
 from collections.abc import Callable, Iterable
@@ -85,11 +91,20 @@ class Dag:
 
     # -- mutation ---------------------------------------------------------
 
-    def add_node(self, node_id: NodeId) -> None:
-        """Add a `PENDING` node. Raises `ValueError` if the id is already held."""
+    def add_node(self, node_id: NodeId, state: NodeState = NodeState.PENDING) -> None:
+        """Add a node, `PENDING` unless told otherwise. Raises `ValueError` on a duplicate id.
+
+        The default is the live path: work appears not yet started and the
+        transitions above are what move it. Passing a state is the derive path
+        — a graph rebuilt from a snapshot has no history to replay, so it states
+        each node as it is and reaches the same graph in one pass. That is safe
+        for exactly the reason `add_edge` gives: an edge onto a `DONE` or
+        `CLAIMED` node is already legal, so the nodes can be stated in any order
+        and the edges added afterwards.
+        """
         if node_id in self._states:
             raise ValueError(f"duplicate node id: {node_id!r}")
-        self._states[node_id] = NodeState.PENDING
+        self._states[node_id] = state
         self._blockers[node_id] = set()
         self._dependents[node_id] = set()
 
