@@ -332,7 +332,6 @@ async def _call(
         disallowed=disallowed_tools,
         permission_mode=permission_mode,
         model=model,
-        limits=ctx.limits,
         on_activity=on_activity,
         ask=ask,
     )

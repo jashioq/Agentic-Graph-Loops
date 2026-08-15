@@ -27,7 +27,6 @@ from agl.core.store import Store
 from agl.core.terminal import Terminal
 from agl.core.vcs import Vcs
 from agl.runtime import paths
-from agl.runtime.agents import Limits
 from agl.runtime.merge import Build
 
 __all__ = [
@@ -78,7 +77,6 @@ class RunContext:
     base_branch: str
     max_concurrent: int
     project: ProjectSettings
-    limits: Limits
     agent: AgentRunner
     vcs: Vcs
     store: Store

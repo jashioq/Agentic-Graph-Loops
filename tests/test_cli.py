@@ -151,7 +151,6 @@ def test_the_context_carries_the_connectors_and_the_current_branch(
     assert ctx.base_branch == "feature"
     assert ctx.vcs.root() == repo.resolve()
     assert paths.run_dir(home, "add-auth").is_dir()
-    assert ctx.limits.model is not None
 
 
 def test_fails_clearly_outside_a_repo(

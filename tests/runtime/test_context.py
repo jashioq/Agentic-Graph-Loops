@@ -21,7 +21,7 @@ from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Row, Rows, Screen, Text
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
-from agl.runtime.agents import Limits, call
+from agl.runtime.agents import call
 from agl.runtime.context import (
     PreflightError,
     ProjectSettings,
@@ -61,15 +61,14 @@ def test_project_settings_cannot_be_mutated(repo: Path) -> None:
         settings(repo).build = ()  # type: ignore[misc]
 
 
-def test_a_context_records_this_run_s_request_and_ceilings(repo: Path) -> None:
+def test_a_context_records_this_run_s_request(repo: Path) -> None:
     feature(repo, "auth")
 
-    ctx = context(repo, request="Add auth", max_concurrent=3, limits=Limits(max_turns=7))
+    ctx = context(repo, request="Add auth", max_concurrent=3)
 
     assert ctx.request == "Add auth"
     assert ctx.base_branch == "auth"
     assert ctx.max_concurrent == 3
-    assert ctx.limits == Limits(max_turns=7)
 
 
 def test_project_settings_hold_what_runtime_needs_of_a_project(repo: Path) -> None:
@@ -236,7 +235,6 @@ async def test_the_harness_s_fakes_are_reached_by_the_calls_a_workflow_makes(
             prompt="what should this do?",
             cwd=ctx.project.repo,
             model=Model.SONNET,
-            limits=ctx.limits,
             on_activity=display.activity(ctx.label),
         )
 

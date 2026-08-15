@@ -5,13 +5,11 @@ of a role: a role is a workflow's word for one of its calls, and every call
 looks the same from here — a rendered prompt, a directory, some tools, and the
 model it runs on.
 
-The model is an argument to the call and not a `Limits` field, because roles
-differ: judgement work and execution work do not want the same model, and the
-workflow is the only layer that knows which of the two a call is. `Limits` is
-what a run genuinely does set once and thread through everything — a budget is
-the run's, not the call's. `Prompts` is a directory of templates rather than a
-loader per file, so a workflow points it at its own `prompts/` once and names
-files after that.
+The model is an argument to each call rather than something a run fixes once,
+because roles differ: judgement work and execution work do not want the same
+model, and the workflow is the only layer that knows which of the two a call
+is. `Prompts` is a directory of templates rather than a loader per file, so a
+workflow points it at its own `prompts/` once and names files after that.
 
 Substitution is strict. `Template.substitute` raises on a placeholder nothing
 filled, which is what `PromptError` reports — a `$deliverables` that reached a
@@ -26,16 +24,7 @@ from string import Template
 
 from agl.core.agent import AgentQuestion, AgentResult, AgentRunner, AgentSpec, Model, Tool
 
-__all__ = ["Limits", "PromptError", "Prompts", "call"]
-
-
-@dataclass(frozen=True)
-class Limits:
-    """Ceilings threaded onto every `AgentSpec` a run builds."""
-
-    model: Model | None = None
-    max_turns: int | None = None
-    max_budget_usd: float | None = None
+__all__ = ["PromptError", "Prompts", "call"]
 
 
 class PromptError(Exception):
@@ -73,11 +62,10 @@ async def call(
     disallowed: tuple[str, ...] = (),
     permission_mode: str = "default",
     model: Model,
-    limits: Limits,
     on_activity: Callable[[str], None] | None = None,
     ask: Callable[[AgentQuestion], Awaitable[str]] | None = None,
 ) -> AgentResult:
-    """Build one spec and run it. The only place `Limits` meets `AgentSpec`.
+    """Build one spec and run it — the only place an `AgentSpec` is assembled.
 
     Keyword-only past the runner: a call has enough of them that positional
     order would be a coin toss at every site, and `tools` and `disallowed` in
@@ -94,7 +82,5 @@ async def call(
         disallowed_tools=disallowed,
         permission_mode=permission_mode,
         model=model,
-        max_turns=limits.max_turns,
-        max_budget_usd=limits.max_budget_usd,
     )
     return await runner.run(spec, on_activity, ask)

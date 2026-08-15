@@ -25,7 +25,7 @@ from agl.core.agent import (
     AgentSpec,
     Model,
 )
-from agl.runtime.agents import Limits, PromptError, Prompts
+from agl.runtime.agents import PromptError, Prompts
 from agl.runtime.context import RunContext
 from agl.workflows.tickets import agents
 from agl.workflows.tickets.agents import (
@@ -40,7 +40,6 @@ from agl.workflows.tickets.agents import (
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.reviews import CoverageError, Finding, Severity, review_key
 from tests.fakes import FakeAgentRunner, ScriptedRun
-from tests.runtime.conftest import LIMITS
 from tests.runtime.conftest import context as run_context
 
 # -- fixtures as data --------------------------------------------------------
@@ -69,9 +68,9 @@ def bug_ticket(**overrides: Any) -> Ticket:
     return Ticket(**fields)
 
 
-def context(repo: Path, runner: AgentRunner, limits: Limits = LIMITS) -> RunContext:
+def context(repo: Path, runner: AgentRunner) -> RunContext:
     """One run's context over `repo`, with `runner` standing in for the model."""
-    return run_context(repo, agent=runner, limits=limits)
+    return run_context(repo, agent=runner)
 
 
 def findings_result(*findings: dict[str, Any]) -> ScriptedRun:
@@ -585,35 +584,6 @@ async def test_each_role_runs_on_the_model_it_chose(repo: Path) -> None:
         "implement": Model.SONNET,
         "triage": Model.SONNET,
     }
-
-
-# -- limits reach every spec ---------------------------------------------------
-
-
-async def test_limits_reach_every_spec(repo: Path) -> None:
-    limits = Limits(max_turns=12, max_budget_usd=3.5)
-    runner = FakeAgentRunner(
-        {
-            "interview": "ok",
-            "decompose": "ok",
-            "implement": "ok",
-            "review-quality": findings_result(),
-            "review-spec": findings_result(),
-            "triage": groups_result(group()),
-        }
-    )
-    ctx = context(repo, runner, limits=limits)
-    tree = repo.parent / "tree"
-
-    await interview(ctx, "hello", None)
-    await decompose(ctx, None)
-    await implement(ctx, feature_ticket(), tree, None)
-    await review(ctx, feature_ticket(review_round=1), tree, "main", None)
-    await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
-
-    for spec in runner.specs:
-        assert spec.max_turns == 12
-        assert spec.max_budget_usd == 3.5
 
 
 # -- a prompt that will not render ---------------------------------------------

@@ -1,10 +1,10 @@
 """Agent API: one model call, described as data.
 
 Layer: core. This is the single path through which every model call in the
-system goes. It owns session configuration, budget limits, the retry ladder,
-custom tool registration, and the translation from a message stream into a
-result. It has never heard of a work item, a worktree, or a workflow: it takes a
-prompt, a directory, and a set of opaque tools, and hands back text.
+system goes. It owns session configuration, the retry ladder, custom tool
+registration, and the translation from a message stream into a result. It has
+never heard of a work item, a worktree, or a workflow: it takes a prompt, a
+directory, and a set of opaque tools, and hands back text.
 
 Tools are how a caller scopes what a run can reach, but the scoping happens in
 the *closure*, not here. A caller that builds a tool over one document passes a
@@ -81,7 +81,7 @@ class Model(StrEnum):
 
 @dataclass(frozen=True)
 class AgentSpec:
-    """One model call: what to ask, where, with what, and under what limits."""
+    """One model call: what to ask, where, and with what."""
 
     prompt: str
     cwd: Path
@@ -102,8 +102,6 @@ class AgentSpec:
     permission_mode: str = "default"  # "default" | "plan" | …
     # `None` leaves the choice to the CLI's own default.
     model: Model | None = None
-    max_turns: int | None = None
-    max_budget_usd: float | None = None
     output_schema: dict[str, Any] | None = None
 
 
@@ -145,11 +143,12 @@ class AgentError(Exception):
 
 
 class AgentBudgetError(AgentError):
-    """Raised when a call stopped because it ran out of budget or turns.
+    """Raised when the CLI ended a call because it ran out of budget or turns.
 
-    Distinct because it is the one failure not worth retrying: the same call
-    fails the same way and spends the budget again. Exhaustion says the task is
-    too large, not that the call went wrong.
+    A spec asks for no ceiling; this reports one the CLI applied for its own
+    reasons. Distinct because it is the one failure not worth retrying: the
+    same call fails the same way and spends the budget again. Exhaustion says
+    the task is too large, not that the call went wrong.
     """
 
 

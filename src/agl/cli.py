@@ -33,14 +33,12 @@ from agl.config import (
     load_project,
     resolve_agl_home,
 )
-from agl.core.agent import Model
 from agl.core.agent.impl.claude_runner import ClaudeRunner
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal.impl.rich_terminal import RichTerminal
 from agl.core.vcs import Vcs, VcsError
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
-from agl.runtime.agents import Limits
 from agl.runtime.context import ProjectSettings, RunContext
 from agl.runtime.paths import InvalidNameError
 
@@ -147,7 +145,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
             base_branch=vcs.current_branch(),
             max_concurrent=args.max_concurrent,
             project=_settings(config),
-            limits=Limits(model=Model.SONNET),
             agent=ClaudeRunner(settings_path=None),
             vcs=vcs,
             store=FileStore(paths.run_dir(home, label)),

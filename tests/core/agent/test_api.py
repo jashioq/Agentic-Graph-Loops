@@ -79,8 +79,6 @@ def test_a_spec_needs_a_prompt_a_cwd_and_a_role_and_nothing_else() -> None:
     assert spec.disallowed_tools == ()
     assert spec.permission_mode == "default"
     assert spec.model is None
-    assert spec.max_turns is None
-    assert spec.max_budget_usd is None
     assert spec.output_schema is None
 
 

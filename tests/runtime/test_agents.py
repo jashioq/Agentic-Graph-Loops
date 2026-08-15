@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from agl.core.agent import NO_PARAMS, AgentOption, AgentQuestion, AgentResult, Model, Tool
-from agl.runtime.agents import Limits, PromptError, Prompts, call
+from agl.runtime.agents import PromptError, Prompts, call
 from tests.fakes import FakeAgentRunner, ScriptedRun
 
 
@@ -99,7 +99,6 @@ async def test_call_runs_the_spec_it_was_asked_for(tmp_path: Path) -> None:
         cwd=tmp_path,
         tools=(tool,),
         model=Model.SONNET,
-        limits=Limits(),
     )
 
     assert isinstance(result, AgentResult)
@@ -112,7 +111,7 @@ async def test_call_runs_the_spec_it_was_asked_for(tmp_path: Path) -> None:
 
 
 async def test_the_model_the_caller_named_reaches_the_spec(tmp_path: Path) -> None:
-    """The model is the caller's per-call choice, not something `Limits` decides."""
+    """The model is the caller's per-call choice, named at the call site."""
     runner = FakeAgentRunner({"implement": "done"})
 
     await call(
@@ -121,7 +120,6 @@ async def test_the_model_the_caller_named_reaches_the_spec(tmp_path: Path) -> No
         prompt="Build it.",
         cwd=tmp_path,
         model=Model.OPUS,
-        limits=Limits(),
     )
 
     assert runner.specs[0].model is Model.OPUS
@@ -136,7 +134,6 @@ async def test_two_calls_can_name_different_models(tmp_path: Path) -> None:
         prompt="Split it.",
         cwd=tmp_path,
         model=Model.OPUS,
-        limits=Limits(),
     )
     await call(
         runner,
@@ -144,27 +141,9 @@ async def test_two_calls_can_name_different_models(tmp_path: Path) -> None:
         prompt="Build it.",
         cwd=tmp_path,
         model=Model.SONNET,
-        limits=Limits(),
     )
 
     assert [spec.model for spec in runner.specs] == [Model.OPUS, Model.SONNET]
-
-
-async def test_limits_reach_the_spec(tmp_path: Path) -> None:
-    runner = FakeAgentRunner({"implement": "done"})
-
-    await call(
-        runner,
-        role="implement",
-        prompt="Build it.",
-        cwd=tmp_path,
-        model=Model.SONNET,
-        limits=Limits(max_turns=12, max_budget_usd=3.5),
-    )
-
-    spec = runner.specs[0]
-    assert spec.max_turns == 12
-    assert spec.max_budget_usd == 3.5
 
 
 async def test_a_call_with_no_scoping_asked_for_gets_none(tmp_path: Path) -> None:
@@ -176,7 +155,6 @@ async def test_a_call_with_no_scoping_asked_for_gets_none(tmp_path: Path) -> Non
         prompt="Split it.",
         cwd=tmp_path,
         model=Model.SONNET,
-        limits=Limits(),
     )
 
     spec = runner.specs[0]
@@ -196,7 +174,6 @@ async def test_denials_and_the_permission_mode_reach_the_spec(tmp_path: Path) ->
         disallowed=("Bash(git commit:*)",),
         permission_mode="plan",
         model=Model.SONNET,
-        limits=Limits(),
     )
 
     spec = runner.specs[0]
@@ -214,7 +191,6 @@ async def test_activity_reaches_the_caller_s_callback(tmp_path: Path) -> None:
         prompt="Build it.",
         cwd=tmp_path,
         model=Model.SONNET,
-        limits=Limits(),
         on_activity=seen.append,
     )
 
@@ -240,7 +216,6 @@ async def test_a_question_reaches_the_ask_the_caller_supplied(tmp_path: Path) ->
         prompt="Build it.",
         cwd=tmp_path,
         model=Model.SONNET,
-        limits=Limits(),
         ask=ask,
     )
 

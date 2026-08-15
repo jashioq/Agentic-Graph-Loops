@@ -81,8 +81,6 @@ def build_options(
         disallowed_tools=list(spec.disallowed_tools),
         permission_mode=cast(PermissionMode, spec.permission_mode),
         model=spec.model.value if spec.model is not None else None,
-        max_turns=spec.max_turns,
-        max_budget_usd=spec.max_budget_usd,
         output_format=output_format,
         mcp_servers=cast(dict[str, McpServerConfig], mcp_servers),
         setting_sources=[],

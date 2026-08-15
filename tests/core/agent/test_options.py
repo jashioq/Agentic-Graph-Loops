@@ -26,8 +26,6 @@ FULL = AgentSpec(
     disallowed_tools=("WebFetch",),
     permission_mode="acceptEdits",
     model=Model.SONNET,
-    max_turns=12,
-    max_budget_usd=1.5,
     output_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
 )
 
@@ -52,8 +50,6 @@ def test_every_field_of_a_full_spec_reaches_the_options() -> None:
     assert options.add_dirs == [Path("/other"), Path("/third")]
     assert options.permission_mode == "acceptEdits"
     assert options.model == "sonnet"
-    assert options.max_turns == 12
-    assert options.max_budget_usd == 1.5
     assert options.disallowed_tools == ["WebFetch"]
     assert options.settings == "/etc/agl/settings.json"
     assert options.system_prompt == {
@@ -76,8 +72,6 @@ def test_a_minimal_spec_populates_nothing_spurious() -> None:
     options = build(MINIMAL)
 
     assert options.model is None
-    assert options.max_turns is None
-    assert options.max_budget_usd is None
     assert options.output_format is None
     assert options.settings is None
     assert options.disallowed_tools == []

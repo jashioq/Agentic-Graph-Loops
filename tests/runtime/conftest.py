@@ -23,19 +23,17 @@ from pathlib import Path
 
 import pytest
 
-from agl.core.agent import AgentRunner, Model
+from agl.core.agent import AgentRunner
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Terminal
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
-from agl.runtime.agents import Limits
 from agl.runtime.context import ProjectSettings, RunContext
 from tests.conftest import git
 from tests.fakes import FakeAgentRunner, HeadlessTerminal
 
 __all__ = [
     "LABEL",
-    "LIMITS",
     "NO_OP_BUILD",
     "PROJECT",
     "REQUEST",
@@ -50,11 +48,6 @@ REQUEST = "Add authentication"
 
 NO_OP_BUILD = (sys.executable, "-c", "pass")
 """A build that always passes, so the merge gate is open unless a test shuts it."""
-
-LIMITS = Limits(model=Model.SONNET)
-"""The ceilings a test run is under. A module-level singleton rather than a call
-in `context`'s signature, which `Limits` being frozen allows."""
-
 
 def feature(repo: Path, name: str = "feature") -> str:
     """Move `repo` off `main` onto a feature branch, as a real run requires."""
@@ -89,7 +82,6 @@ def context(
     max_concurrent: int = 1,
     home: Path | None = None,
     trees: Path | None = None,
-    limits: Limits = LIMITS,
     build: tuple[str, ...] = NO_OP_BUILD,
     build_timeout: float = 30.0,
 ) -> RunContext:
@@ -109,7 +101,6 @@ def context(
         base_branch=vcs.current_branch() if base_branch is None else base_branch,
         max_concurrent=max_concurrent,
         project=settings(repo, trees, build, build_timeout),
-        limits=limits,
         agent=FakeAgentRunner() if agent is None else agent,
         vcs=vcs,
         store=FileStore(paths.run_dir(run_home, label)),
