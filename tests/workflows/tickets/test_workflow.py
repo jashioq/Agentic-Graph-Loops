@@ -14,6 +14,7 @@ import asyncio
 import sys
 from collections.abc import Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -25,8 +26,8 @@ from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Answer, Question, Screen, Terminal
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
+from agl.runtime.merge import MergeOutcome, MergeQueue, MergeRequest
 from agl.workflows.tickets import workflow as workflow_module
-from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status
 from agl.workflows.tickets.state import check_consistent
 from agl.workflows.tickets.workflow import DecomposeAbortedError, Deps, PreflightError, Run
@@ -112,7 +113,7 @@ class GatedTerminal(HeadlessTerminal):
 
 
 class RecordingQueue(MergeQueue):
-    """A `MergeQueue` that remembers every request `put` to it.
+    """A `MergeQueue` that remembers every request submitted to it.
 
     Stands in for the real queue via `monkeypatch`, so a test can assert the
     workflow routed a bug ticket's merge through the queue rather than only
@@ -123,9 +124,9 @@ class RecordingQueue(MergeQueue):
         super().__init__(*args, **kwargs)
         self.seen: list[MergeRequest] = []
 
-    def put(self, request: MergeRequest) -> None:
+    async def submit(self, request: MergeRequest) -> MergeOutcome:
         self.seen.append(request)
-        super().put(request)
+        return await super().submit(request)
 
 
 type _Overrides = dict[str, tuple[str, str]]
@@ -548,6 +549,40 @@ async def test_a_merge_conflict_halts_the_run(tmp_path: Path, repo: Path) -> Non
     assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
 
 
+async def test_a_non_resumable_merge_halt_ends_the_run_rather_than_hanging(
+    tmp_path: Path, repo: Path
+) -> None:
+    """A halt nobody can press enter on still has to end the run.
+
+    The build command does not exist, so the gate raises rather than returning
+    a failed result — the one halt the queue marks non-resumable. Nothing will
+    ever resume it, so the ticket waiting on that merge has to be told the
+    answer is "never" instead of waiting for a resolution that cannot come.
+    """
+    start(repo)
+    home, trees = tmp_path / "home", tmp_path / "trees"
+    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
+    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    fake = FakeAgentRunner(
+        {
+            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
+            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
+            "implement": ScriptedRun("done"),
+            **clean_review(),
+        }
+    )
+    d = deps(repo, home, trees, WritingAgentRunner(fake), terminal)
+    d = replace(d, config=replace(d.config, build=(str(repo / "no-such-build"),)))
+    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+
+    async with asyncio.timeout(10.0):
+        await run.go()
+
+    assert run.state.halt is not None
+    assert run.state.halt.resumable is False
+    assert run.state.tickets["T-01"].status is not Status.MERGED
+
+
 # -- bug merges go through the queue too --------------------------------------
 
 
@@ -583,7 +618,7 @@ async def test_a_bug_tickets_merge_goes_through_the_queue(
     assert run.state.tickets["T-01"].status is Status.MERGED
     assert run.state.tickets["T-01-bug-1"].status is Status.MERGED
     assert isinstance(run.merge_queue, RecordingQueue)
-    ticket_ids = [r.ticket_id for r in run.merge_queue.seen]
+    ticket_ids = [r.key for r in run.merge_queue.seen]
     assert ticket_ids == ["T-01-bug-1", "T-01"]
 
     bug_request = run.merge_queue.seen[0]

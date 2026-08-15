@@ -1,13 +1,16 @@
 """The ticket workflow's graph: interview, decompose, then drive every ticket to merged.
 
 Layer: workflows. This file holds the shape of the loop and nothing else —
-every method delegates to `agents`, `state`, `merge`, `reviews`, `render`,
-`approval`, `wiring`, `tools`, or the runtime's `scheduler` and `worktrees`. A
+every method delegates to `agents`, `state`, `reviews`, `render`, `approval`,
+`wiring`, `tools`, or the runtime's `scheduler`, `worktrees` and `merge`. A
 method that grows past the shape belongs in one of those modules, not here.
 
-The two things the runtime cannot know are here: `_base_for`, which is the
-ticket rule that a bug branches off its parent, and `_is_halted`, the predicate
-that turns this run's `Halt` into the yes-or-no the scheduler asks for.
+The three things the runtime cannot know are here: `_base_for`, the ticket rule
+that a bug branches off its parent; `_is_halted`, the predicate that turns this
+run's `Halt` into the yes-or-no the scheduler asks for; and `_resolve` with
+`_halt_for`, which are the whole halt policy — what a merge that did not land
+means, and whether a person pressing enter can help. The merge queue reports
+outcomes and decides none of that.
 
 `Run` owns one run end to end: the `RunState` that is execution truth, the
 `Live` that is display-only, the merge queue, and the live terminal session.
@@ -16,7 +19,6 @@ and it has no local variables, because everything it needs flows through
 `self.state` and the store.
 """
 
-import asyncio
 import time
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -31,12 +33,19 @@ from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
 from agl.runtime import paths
 from agl.runtime.dag import Dag, NodeId
+from agl.runtime.merge import (
+    MergeConfig,
+    MergeDecision,
+    MergeOutcome,
+    MergeQueue,
+    MergeRequest,
+    MergeStatus,
+)
 from agl.runtime.scheduler import drive
 from agl.runtime.worktrees import Worktrees
 from agl.workflows.tickets import agents, state
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.approval import Approval, DecomposeAbortedError, session_screen
-from agl.workflows.tickets.merge import MergeQueue, MergeRequest
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.render import render
 from agl.workflows.tickets.reviews import next_bug_start, to_bug_tickets
@@ -114,8 +123,6 @@ class Run:
         self.wiring = Wiring(
             deps.agent, deps.store, deps.config.repo, self.state, label, lambda: self.live
         )
-        self._pending_merges: dict[str, asyncio.Event] = {}
-        self._halted = asyncio.Event()
 
     # -- the loop -----------------------------------------------------------
 
@@ -188,21 +195,15 @@ class Run:
 
     async def implement_all(self) -> None:
         self.merge_queue = self._merge_queue()
-        consumer = asyncio.create_task(self.merge_queue.run())
-        resumer = asyncio.create_task(self._resume_loop())
-        try:
+        async with self.merge_queue.running():
             await self._drive()
-        finally:
-            resumer.cancel()
-            await self.merge_queue.stop()
-            await consumer
 
     async def _drive(self) -> None:
-        # A halted ticket's own task does not return until it is resumed, so
-        # a pass cannot return on its own while one is stuck waiting —
-        # `_resume_loop`, running alongside it, is what unsticks it. A halt
-        # that is still set when a pass returns is therefore one nothing
-        # resolved, which is exactly `drive`'s stopping condition.
+        # A ticket whose merge did not land is parked inside `submit` until
+        # `_resolve` has dealt with it, so a pass cannot return on its own
+        # while one is stuck there. A halt that is still set when a pass
+        # returns is therefore one nothing resolved, which is exactly `drive`'s
+        # stopping condition.
         await drive(
             self.state.dag,
             self._run_one,
@@ -214,33 +215,34 @@ class Run:
     def _is_halted(self) -> bool:
         return self.state.halt is not None
 
-    async def _resume_loop(self) -> None:
-        while True:
-            await self._halted.wait()
-            self._halted.clear()
-            halt = self.state.halt
-            if halt is not None and halt.resumable:
-                await self._await_resume()
+    async def _resolve(self, outcome: MergeOutcome) -> MergeDecision:
+        """What a merge that did not land means to this run: the halt policy.
+
+        The queue reports; this decides. A halt a person can act on holds the
+        run at the dashboard until they press enter and then looks again; one
+        they cannot ends the queue, which answers every ticket still waiting on
+        a merge and lets the run come back with the halt still set.
+        """
+        halt = _halt_for(outcome)
+        self.state.halt = halt
+        if not halt.resumable:
+            return MergeDecision.STOP
+        await self._await_resume()
+        self.state.halt = None
+        return MergeDecision.RETRY
 
     async def _await_resume(self) -> None:
         assert self.session is not None
-        assert self.merge_queue is not None
         question = Question(
             header=self.label,
             title="press enter to continue",
             options=(Option("continue", "resume the run"),),
         )
         await self.session.ask(question)
-        self.merge_queue.resume()
-        self.state.halt = None
 
     def _merge_queue(self) -> MergeQueue:
         return MergeQueue(
-            self.deps.vcs,
-            self._build,
-            self._on_merged,
-            self._on_halt,
-            self._on_abandoned,
+            self.deps.vcs, MergeConfig(build=self._build, resolve=self._resolve)
         )
 
     async def _build(self) -> ExecResult:
@@ -297,30 +299,87 @@ class Run:
             cwd = self.deps.config.repo
         else:
             cwd = self.worktrees.tree_of(w.ticket.parent)
-        resolved = asyncio.Event()
-        self._pending_merges[w.ticket.id] = resolved
         assert self.merge_queue is not None
-        self.merge_queue.put(MergeRequest(w.ticket.id, w.branch, target, cwd))
-        await resolved.wait()
+        outcome = await self.merge_queue.submit(
+            MergeRequest(w.ticket.id, w.branch, target, cwd)
+        )
+        self._merged(outcome)
 
-    # -- merge queue callbacks ----------------------------------------------
+    def _merged(self, outcome: MergeOutcome) -> None:
+        """What this run records about a finished merge.
 
-    def _on_merged(self, ticket_id: str) -> None:
-        state.set_status(self.state, self.live, ticket_id, Status.MERGED)
-        self._pending_merges.pop(ticket_id).set()
-
-    def _on_halt(self, halt: Halt) -> None:
-        self._halt(halt)
-
-    def _on_abandoned(self, ticket_id: str) -> None:
-        if self.live is not None:
-            self.live.activity[ticket_id] = "merge abandoned"
-        self._pending_merges.pop(ticket_id).set()
+        `STOPPED` is the queue saying nobody will ever deal with this one —
+        the run is ending on a halt somebody else already set — so the ticket
+        is left where it is, `MERGING`, which is what the last frame shows.
+        """
+        if outcome.status is MergeStatus.MERGED:
+            state.set_status(self.state, self.live, outcome.key, Status.MERGED)
+        elif outcome.status is MergeStatus.ABANDONED and self.live is not None:
+            self.live.activity[outcome.key] = "merge abandoned"
 
     def _on_error(self, ticket_id: NodeId | None, error: BaseException) -> None:
         who = ticket_id if ticket_id is not None else "the run"
-        self._halt(Halt(f"{who} failed: {error}", str(error), resumable=False))
+        self.state.halt = Halt(f"{who} failed: {error}", str(error), resumable=False)
 
-    def _halt(self, halt: Halt) -> None:
-        self.state.halt = halt
-        self._halted.set()
+
+# -- what a merge outcome means to this run --------------------------------
+#
+# Pure, and message-writing: the queue reports facts about git and the build,
+# and this is where they become the halt a person reads. It sits with the
+# policy that uses it rather than in the runtime, because "resumable" is a
+# statement about what this run can do about it, which no queue can know.
+
+
+TAIL_LINES = 20
+"""How many lines of a failed build's output a halt carries.
+
+A display choice, not a fact about builds. Which slice of the output matters is
+language-specific — a Kotlin error sits early under a stack trace, a Rust one is
+structured and late, a bundler dumps module paths — which is why the outcome
+carries the result whole and the truncation lives here, next to the banner it
+is being truncated for.
+"""
+
+
+def _halt_for(outcome: MergeOutcome) -> Halt:
+    """The halt this run shows for a merge that did not land.
+
+    Resumable when a person editing the repository changes the answer — a
+    conflict to resolve, a build to fix. Not resumable when nothing they can do
+    to the repository would: git refusing a branch outright, or an exception
+    that escaped a callable which closed over its broken state before the run
+    started. Those say restart the process, because that is what would help.
+    """
+    if outcome.status is MergeStatus.CONFLICT:
+        return Halt(
+            reason=f"{outcome.key} conflicts with the base branch",
+            detail=f"resolve in the repository root: {', '.join(outcome.conflicted)}",
+        )
+    if outcome.status is MergeStatus.BUILD_FAILED:
+        assert outcome.build is not None
+        what = (
+            "timed out" if outcome.build.timed_out else f"failed with exit {outcome.build.code}"
+        )
+        return Halt(
+            reason=f"{outcome.key} merged but the build {what}",
+            detail=_tail(_output(outcome.build), TAIL_LINES),
+        )
+    if outcome.status is MergeStatus.VCS_ERROR:
+        return Halt(f"{outcome.key} cannot be merged", outcome.error, resumable=False)
+    return Halt(
+        reason=f"{outcome.key} could not be processed: {outcome.error}",
+        detail=outcome.error,
+        resumable=False,
+    )
+
+
+def _output(result: ExecResult) -> str:
+    """Both streams as one text, since which of them carries the diagnosis is
+    the build tool's choice and not something this run can know."""
+    return "\n".join(stream.strip("\n") for stream in (result.stdout, result.stderr) if stream)
+
+
+def _tail(text: str, lines: int) -> str:
+    """The last `lines` lines of `text`, and nothing about which ones matter."""
+    kept = text.strip("\n").split("\n")[-lines:]
+    return "\n".join(kept)
