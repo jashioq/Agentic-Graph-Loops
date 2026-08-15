@@ -29,6 +29,8 @@ from agl.core.terminal import Terminal
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
 from agl.runtime.context import ProjectSettings, RunContext
+from agl.runtime.dag import Dag, NodeId, NodeState
+from agl.runtime.scheduler import Claims
 from tests.conftest import git
 from tests.fakes import FakeAgentRunner, HeadlessTerminal
 
@@ -37,6 +39,7 @@ __all__ = [
     "NO_OP_BUILD",
     "PROJECT",
     "REQUEST",
+    "claims_over",
     "context",
     "feature",
     "settings",
@@ -48,6 +51,26 @@ REQUEST = "Add authentication"
 
 NO_OP_BUILD = (sys.executable, "-c", "pass")
 """A build that always passes, so the merge gate is open unless a test shuts it."""
+
+def claims_over(dag: Dag) -> Claims:
+    """A held graph as the scheduler's four questions.
+
+    The same adapter the tickets workflow keeps, so the scheduler's tests can go
+    on being graphs and gates while the scheduler itself no longer holds one.
+    """
+
+    def stalled() -> tuple[NodeId, ...] | None:
+        if not dag.is_stalled():
+            return None
+        return tuple(n for n in dag.nodes() if dag.state(n) is NodeState.PENDING)
+
+    return Claims(
+        next=dag.claim_next,
+        release=dag.release,
+        complete=dag.is_complete,
+        stalled=stalled,
+    )
+
 
 def feature(repo: Path, name: str = "feature") -> str:
     """Move `repo` off `main` onto a feature branch, as a real run requires."""

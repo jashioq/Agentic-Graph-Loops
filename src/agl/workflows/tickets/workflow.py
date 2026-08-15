@@ -25,7 +25,7 @@ from pathlib import Path
 from agl.core.agent import AgentQuestion
 from agl.core.terminal import Option, Question
 from agl.runtime.context import RunContext, build_gate, preflight
-from agl.runtime.dag import NodeId
+from agl.runtime.dag import Dag, NodeId, NodeState
 from agl.runtime.display import Board, Display, live
 from agl.runtime.merge import (
     MergeConfig,
@@ -35,7 +35,7 @@ from agl.runtime.merge import (
     MergeRequest,
     MergeStatus,
 )
-from agl.runtime.scheduler import drive
+from agl.runtime.scheduler import Claims, drive
 from agl.runtime.worktrees import Work, Worktrees
 from agl.workflows.tickets import agents, screens
 from agl.workflows.tickets import tools as ticket_tools
@@ -180,12 +180,29 @@ async def implement_all(ctx: RunContext, display: Display, state: RunState) -> N
         # `resolve` deals with it, so a halt still set when a pass returns is
         # one nothing resolved — exactly `drive`'s stopping condition.
         await drive(
-            state.dag,
+            _claims(state.dag),
             partial(one_ticket, loop),
             ctx.max_concurrent,
             partial(failed, state),
             state.is_halted,
         )
+
+
+def _claims(dag: Dag) -> Claims:
+    """The graph this run holds, as the scheduler's four questions. Temporary:
+    it goes when the workflow's state moves into a document."""
+
+    def stalled() -> tuple[NodeId, ...] | None:
+        if not dag.is_stalled():
+            return None
+        return tuple(n for n in dag.nodes() if dag.state(n) is NodeState.PENDING)
+
+    return Claims(
+        next=dag.claim_next,
+        release=dag.release,
+        complete=dag.is_complete,
+        stalled=stalled,
+    )
 
 
 # -- this run's policy ----------------------------------------------------

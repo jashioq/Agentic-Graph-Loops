@@ -1,9 +1,10 @@
-"""The concurrency loop that turns a graph into running work.
+"""The concurrency loop that turns claimable work into running work.
 
-Layer: runtime. Imports `agl.runtime.dag` and nothing else — not a workflow,
-not a core connector. `body` is what actually does anything — worktrees,
-agents, merges — and this module never learns any of that exists; it is handed
-a `NodeId` and the caller looks up whatever it keeps under that key.
+Layer: runtime. Imports `agl.runtime.dag` for its `NodeId` alias and nothing
+else — not a workflow, not a core connector. `body` is what actually does
+anything — worktrees, agents, merges — and this module never learns any of that
+exists; it is handed a `NodeId` and the caller looks up whatever it keeps under
+that key.
 
 `halted` is the one other thing a workflow supplies: a predicate the loop
 consults before admitting more work. What a halt *is* — a merge conflict, a
@@ -29,18 +30,42 @@ the same `finally` that releases a slot, so a task finishing is what wakes the
 loop back up on both waits, and neither can be left asleep by the last node
 completing underneath it.
 
-`claim_next` is used rather than `ready()` followed by `claim()`: reading the
-ready set and claiming out of it is one synchronous step, which is the only
-thing that stops two passes from claiming the same node. `Dag` guarantees
-that; this module only has to call it correctly.
+`claims.next()` is one call rather than "what is ready" followed by "claim this
+one": reading the ready set and claiming out of it has to be a single
+synchronous step, which is the only thing that stops two passes from claiming
+the same node. The caller guarantees that; this module only has to call it once
+and trust the answer.
 """
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
-from agl.runtime.dag import Dag, NodeId, NodeState
+from agl.runtime.dag import NodeId
 
-__all__ = ["StalledGraphError", "drive", "run"]
+__all__ = ["Claims", "StalledGraphError", "drive", "run"]
+
+
+@dataclass(frozen=True)
+class Claims:
+    """Where a scheduler gets its work, and where it hands it back.
+
+    Four callables rather than a graph, because the caller may derive its graph
+    fresh on every question — which is what lets a run react to a state document
+    that changed underneath it.
+    """
+
+    next: Callable[[], NodeId | None]
+    """Claim one node, atomically, or `None` when nothing is claimable."""
+
+    release: Callable[[NodeId], None]
+    """A body raised; give the node back so it is not left claimed forever."""
+
+    complete: Callable[[], bool]
+    """Whether there is nothing left to do."""
+
+    stalled: Callable[[], tuple[NodeId, ...] | None]
+    """The still-pending ids when the work cannot advance, `None` otherwise."""
 
 
 class StalledGraphError(Exception):
@@ -63,7 +88,7 @@ def _never() -> bool:
 
 
 async def run(
-    dag: Dag,
+    claims: Claims,
     body: Callable[[NodeId], Awaitable[None]],
     max_concurrent: int,
     on_error: Callable[[NodeId | None, BaseException], None],
@@ -85,8 +110,8 @@ async def run(
 
     The scheduler never writes anything a workflow keeps about a node: that is
     `body`'s job, through whatever single writer the workflow has. The one
-    graph write here is `dag.release` on a node whose `body` raised, so it is
-    not left `CLAIMED` forever; what that means for the workflow is its call.
+    write here is `claims.release` on a node whose `body` raised, so it is not
+    left claimed forever; what that means for the workflow is its call.
     """
     slots = asyncio.Semaphore(max_concurrent)
     progress = asyncio.Event()
@@ -98,7 +123,7 @@ async def run(
         try:
             await body(node_id)
         except Exception as error:  # noqa: BLE001 - reported, not re-raised
-            dag.release(node_id)
+            claims.release(node_id)
             admitting = False
             on_error(node_id, error)
         finally:
@@ -106,7 +131,7 @@ async def run(
             progress.set()
 
     def should_admit() -> bool:
-        return admitting and not halted() and not dag.is_complete()
+        return admitting and not halted() and not claims.complete()
 
     try:
         while should_admit():
@@ -117,15 +142,15 @@ async def run(
             if not should_admit():
                 slots.release()
                 break
-            node = dag.claim_next()
+            node = claims.next()
             if node is not None:
                 task = asyncio.create_task(run_one(node))
                 tasks.add(task)
                 task.add_done_callback(tasks.discard)
                 continue
             slots.release()
-            if dag.is_stalled():
-                on_error(None, StalledGraphError(_pending(dag)))
+            if (pending := claims.stalled()) is not None:
+                on_error(None, StalledGraphError(pending))
                 break
             # Nothing is claimable but a slot is free, so the graph can only
             # move once something in flight finishes. `progress` is set from
@@ -149,7 +174,7 @@ async def run(
 
 
 async def drive(
-    dag: Dag,
+    claims: Claims,
     body: Callable[[NodeId], Awaitable[None]],
     max_concurrent: int,
     on_error: Callable[[NodeId | None, BaseException], None],
@@ -168,12 +193,7 @@ async def drive(
     with the graph incomplete, and the caller reads its own halt to find out
     why.
     """
-    while not dag.is_complete():
-        await run(dag, body, max_concurrent, on_error, halted)
+    while not claims.complete():
+        await run(claims, body, max_concurrent, on_error, halted)
         if halted():
             return
-
-
-def _pending(dag: Dag) -> tuple[NodeId, ...]:
-    """Nodes still `PENDING` when the graph stalled, for the error message."""
-    return tuple(node for node in dag.nodes() if dag.state(node) is NodeState.PENDING)
