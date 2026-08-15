@@ -27,13 +27,19 @@ from pathlib import Path
 
 from agl.config import ProjectConfig
 from agl.core.agent import AgentRunner
-from agl.core.command import ExecResult, run_async
+from agl.core.command import ExecResult
 from agl.core.store import Store
 from agl.core.terminal import LiveSession, Option, Question, Screen, Terminal
 from agl.core.vcs import Vcs
-from agl.runtime import paths
+from agl.runtime.context import (
+    PreflightError,
+    ProjectSettings,
+    build_gate,
+    preflight,
+)
 from agl.runtime.dag import Dag, NodeId
 from agl.runtime.merge import (
+    Build,
     MergeConfig,
     MergeDecision,
     MergeOutcome,
@@ -85,10 +91,6 @@ class Deps:
     store: Store
     terminal: Terminal
     config: ProjectConfig
-
-
-class PreflightError(Exception):
-    """Raised when the repository or the label is not in a state to start a run."""
 
 
 class InterviewIncompleteError(Exception):
@@ -145,16 +147,7 @@ class Run:
     # -- preflight ------------------------------------------------------------
 
     def preflight(self) -> None:
-        if self.deps.vcs.is_dirty():
-            raise PreflightError("the repository has uncommitted changes")
-        branch = self.deps.vcs.current_branch()
-        if branch in ("main", "master"):
-            raise PreflightError(f"cannot run on {branch!r}; check out a feature branch first")
-        namespace = paths.branch_namespace(self.label)
-        if self.deps.vcs.branches(namespace) or self.deps.store.list():
-            raise PreflightError(
-                f"{self.label!r} is already in use; run `agl clean {self.label}` first"
-            )
+        preflight(self.deps.vcs, self.deps.store, self.label)
 
     # -- interview ------------------------------------------------------------
 
@@ -242,15 +235,25 @@ class Run:
 
     def _merge_queue(self) -> MergeQueue:
         return MergeQueue(
-            self.deps.vcs, MergeConfig(build=self._build, resolve=self._resolve)
+            self.deps.vcs, MergeConfig(build=self._build(), resolve=self._resolve)
         )
 
-    async def _build(self) -> ExecResult:
-        return await run_async(
-            list(self.deps.config.build),
-            self.deps.config.repo,
-            check=False,
-            timeout=self.deps.config.build_timeout,
+    def _build(self) -> Build:
+        """This project's build, as the gate the queue holds.
+
+        The translation from `ProjectConfig` to `ProjectSettings` is temporary:
+        once the cli hands a workflow a `RunContext`, the settings arrive
+        already made and this is `build_gate(ctx.project)` at the call site.
+        """
+        config = self.deps.config
+        return build_gate(
+            ProjectSettings(
+                name=config.name,
+                repo=config.repo,
+                trees_root=config.trees_root,
+                build=config.build,
+                build_timeout=config.build_timeout,
+            )
         )
 
     async def _run_one(self, ticket_id: NodeId) -> None:
