@@ -1,4 +1,4 @@
-"""`agl run`, `agl clean`, and `agl init` — the composition root.
+"""`agl run`, `agl resume`, `agl clean`, and `agl init` — the composition root.
 
 Layer: cli. This is the only file that constructs concrete `impl` classes;
 everything below it takes them injected. `run` resolves a project, takes a
@@ -6,9 +6,13 @@ label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and
 hands a `RunContext` to that workflow's `run`. A workflow is exactly that: a
 package under `agl.workflows` exposing `workflow.run(ctx)`. Nothing here reaches
 into a run afterwards — the exception `run` raises is the exit status.
-`clean` removes what a label left behind — worktrees, branches, and its run
-directory — tolerating anything already gone. `init` writes the `config.toml`
-and `standards.md` a project needs before `run` can find it.
+`resume` takes a label and nothing else, because everything else it needs was
+written down when the run started: it reads the run's record and rebuilds the
+context from it, so the repository a person happens to be standing in cannot
+quietly change what the run was asked for. `clean` removes what a label left
+behind — worktrees, branches, and its run directory — tolerating anything
+already gone. `init` writes the `config.toml` and `standards.md` a project needs
+before `run` can find it.
 
 `_settings` is the only place `ProjectConfig` and `ProjectSettings` meet, which
 is what keeps the config file format a cli concern: below this file a project is
@@ -21,8 +25,9 @@ import importlib
 import pkgutil
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
+from typing import Any
 
 from agl import workflows as workflows_pkg
 from agl.config import (
@@ -41,6 +46,7 @@ from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
 from agl.runtime.context import ProjectSettings, RunContext
 from agl.runtime.paths import InvalidNameError
+from agl.runtime.record import RecordError, read_record
 
 __all__ = ["main"]
 
@@ -54,6 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         return _cmd_run(args)
+    if args.command == "resume":
+        return _cmd_resume(args)
     if args.command == "clean":
         return _cmd_clean(args)
     if args.command == "init":
@@ -86,6 +94,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "what to build, as free text; may start with '--'. "
             "Reads from stdin if omitted."
         ),
+    )
+
+    resume_parser = sub.add_parser("resume", help="continue a run that was stopped")
+    resume_parser.add_argument("label", help="the run label to continue")
+    resume_parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        help="how many tickets to work on at once (default: what the run was started with)",
     )
 
     clean_parser = sub.add_parser("clean", help="remove a run's worktrees, branches, and files")
@@ -201,12 +218,113 @@ def _discover_workflows() -> tuple[str, ...]:
 
 
 def _print_interrupted(vcs: Vcs, label: str) -> None:
+    """Name the worktrees an interrupted run left, and both ways out of them.
+
+    Two remedies because leftovers are two situations: work worth picking up
+    where it stopped, and work worth throwing away. Only the person who pressed
+    ctrl-c knows which, so both are offered and neither is done.
+    """
     namespace = f"{paths.branch_namespace(label)}/"
     trees = [w.path for w in vcs.list_worktrees() if w.branch.startswith(namespace)]
     print("\ninterrupted", file=sys.stderr)
     for tree in trees:
         print(f"  {tree}", file=sys.stderr)
+    print(f"run `agl resume {label}` to continue", file=sys.stderr)
     print(f"run `agl clean {label}` to remove them", file=sys.stderr)
+
+
+# -- resume ---------------------------------------------------------------
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """Continue a run from the record it wrote when it started.
+
+    The label is the whole command line because every other field of the context
+    was settled once, at preflight, and written to `run.json` — reading the base
+    branch off the current checkout instead would let a run be resumed into a
+    branch it was never started from, and merge its tickets there.
+
+    `--max-concurrent` is the one exception, and only because it is a statement
+    about the machine rather than about the run: the same tickets, fewer at a
+    time.
+    """
+    label = args.label
+
+    try:
+        vcs: Vcs = Git(Path.cwd())
+    except VcsError as error:
+        return _fail(error)
+
+    try:
+        home = agl_home()
+        config = load_project(home, vcs.root())
+    except ConfigError as error:
+        return _fail(error)
+
+    try:
+        paths.validate_label(label)
+    except InvalidNameError as error:
+        return _fail(error)
+
+    # The directory is checked before the store is built, because building one
+    # creates its root: a mistyped label would otherwise leave an empty run
+    # behind and be a real one the next time it was typed.
+    run_directory = paths.run_dir(home, label)
+    if not run_directory.is_dir():
+        return _fail(f"unknown label {label!r}; runs found: {_existing_runs(home)}")
+
+    store = FileStore(run_directory)
+    try:
+        record = read_record(store)
+    except RecordError as error:
+        return _fail(error)
+
+    if record.project != config.name:
+        return _fail(
+            f"{label!r} is a run of project {record.project!r}, and this repository is "
+            f"project {config.name!r}"
+        )
+
+    # `getattr` is the whole registry: resuming is optional, and a workflow opts
+    # in by defining the function. A recorded workflow that no longer imports is
+    # not a case of its own — from here it is a name that does not resolve to a
+    # workflow, which is what `run` says about one too.
+    try:
+        module = importlib.import_module(f"agl.workflows.{record.workflow}.workflow")
+    except ImportError:
+        available = _discover_workflows()
+        listing = ", ".join(available) if available else "(none found)"
+        return _fail(f"unknown workflow {record.workflow!r}; available: {listing}")
+
+    resume: Callable[[RunContext], Coroutine[Any, Any, None]] | None = getattr(
+        module, "resume", None
+    )
+    if resume is None:
+        return _fail(f"the {record.workflow!r} workflow cannot be resumed")
+
+    try:
+        ctx = RunContext(
+            workflow=record.workflow,
+            label=label,
+            request=record.request,
+            base_branch=record.base_branch,
+            max_concurrent=(
+                record.max_concurrent if args.max_concurrent is None else args.max_concurrent
+            ),
+            project=_settings(config),
+            agent=ClaudeRunner(settings_path=None),
+            vcs=vcs,
+            store=store,
+            terminal=RichTerminal(),
+        )
+        asyncio.run(resume(ctx))
+    except KeyboardInterrupt:
+        _print_interrupted(vcs, label)
+        return 1
+    except Exception as error:  # noqa: BLE001 - surfaced to the user, never a traceback
+        return _fail(error)
+
+    return 0
 
 
 # -- clean ----------------------------------------------------------------

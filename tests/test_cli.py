@@ -1,11 +1,12 @@
-"""`agl run`, `agl clean`, and `agl init`: argument handling and
+"""`agl run`, `agl resume`, `agl clean`, and `agl init`: argument handling and
 composition-root wiring.
 
 A full run is already covered by `test_workflow.py`, so `run` here never
 drives a real ticket workflow to completion. Wiring tests replace the ticket
-workflow's `run` with a stub that records the `RunContext` it was handed and
-returns immediately; only the preflight-refusal test lets the real `run`
-start, because a preflight refusal happens before any agent or terminal call.
+workflow's `run` — or its `resume` — with a stub that records the `RunContext`
+it was handed and returns immediately; only the refusal tests let the real
+entry point start, because every refusal they check happens before any agent or
+terminal call.
 
 The `RunContext` those stubs capture is the whole contract between the cli and a
 workflow, so asserting over it is how this file checks the composition root: the
@@ -26,11 +27,15 @@ import pytest
 
 from agl.cli import main
 from agl.config import load_project
+from agl.core.store.impl.file_store import FileStore
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
 from agl.runtime.context import RunContext
+from agl.runtime.record import RunRecord, StateFile, write_record
 from agl.workflows.tickets import workflow as tickets_workflow
-from agl.workflows.tickets.state import Halt
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.snapshot import RunFile
+from agl.workflows.tickets.state import Halt, Run
 from agl.workflows.tickets.workflow import HaltedError
 from tests.conftest import git
 
@@ -95,6 +100,17 @@ def failing_run(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
         raise error
 
     monkeypatch.setattr(tickets_workflow, "run", raising)
+
+
+def stub_resume(monkeypatch: pytest.MonkeyPatch) -> list[RunContext]:
+    """Replace the ticket workflow's `resume` with one that only records its context."""
+    contexts: list[RunContext] = []
+
+    async def recording(ctx: RunContext) -> None:
+        contexts.append(ctx)
+
+    monkeypatch.setattr(tickets_workflow, "resume", recording)
+    return contexts
 
 
 # -- config resolution --------------------------------------------------------
@@ -515,14 +531,240 @@ def test_an_interrupted_run_names_the_worktrees_it_left(
     assert code != 0
     err = capsys.readouterr().err
     assert str(worktree) in err
+    assert f"agl resume {label}" in err
     assert f"agl clean {label}" in err
+
+
+# -- resume ------------------------------------------------------------------
+#
+# `resume` takes a label and nothing else: everything the original invocation
+# settled is read back out of the run's record, so these tests are about that
+# record reaching the workflow intact — and about the four ways a label can name
+# something that cannot be picked up.
+
+LABEL = "add-auth"
+
+
+def write_record_for(
+    home: Path,
+    label: str = LABEL,
+    *,
+    workflow: str = "tickets",
+    request: str = "Add auth",
+    base_branch: str = "feature",
+    project: str = PROJECT,
+    max_concurrent: int = 3,
+) -> RunRecord:
+    """The record a started run left behind, where `agl resume` looks for it."""
+    record = RunRecord(
+        workflow=workflow,
+        label=label,
+        request=request,
+        base_branch=base_branch,
+        project=project,
+        max_concurrent=max_concurrent,
+    )
+    write_record(FileStore(paths.run_dir(home, label)), record)
+    return record
+
+
+def write_state(home: Path, label: str = LABEL) -> None:
+    """A state document with one unfinished ticket, so the run has work left."""
+    RunFile(StateFile(FileStore(paths.run_dir(home, label)))).write(
+        Run(
+            tickets=(
+                Ticket(
+                    id="T-01",
+                    title="Add auth",
+                    status=Status.PENDING,
+                    deliverables=("auth.py",),
+                ),
+            )
+        )
+    )
+
+
+def test_resume_hands_the_workflow_the_context_the_record_describes(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    """The record is the authority, not the repository `resume` was typed in.
+
+    The checkout here is deliberately not the branch the run was started from
+    and the command line carries neither a request nor a concurrency, so every
+    field asserted below can only have come out of `run.json`.
+    """
+    git(repo, "checkout", "-b", "somewhere-else", "main")
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home, base_branch="feature", request="Add auth", max_concurrent=5)
+    contexts = stub_resume(monkeypatch)
+
+    code = main(["resume", LABEL])
+
+    assert code == 0
+    ctx = contexts[0]
+    assert ctx.workflow == "tickets"
+    assert ctx.label == LABEL
+    assert ctx.base_branch == "feature"
+    assert ctx.request == "Add auth"
+    assert ctx.max_concurrent == 5
+    assert ctx.project.name == PROJECT
+    assert ctx.vcs.root() == repo.resolve()
+    assert ctx.store.exists("run.json")
+
+
+def test_resume_max_concurrent_overrides_the_recorded_one(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home, max_concurrent=3)
+    contexts = stub_resume(monkeypatch)
+
+    code = main(["resume", LABEL, "--max-concurrent", "7"])
+
+    assert code == 0
+    assert contexts[0].max_concurrent == 7
+
+
+def test_resume_on_an_unknown_label_lists_what_exists_in_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    (home / "runs" / "existing-run").mkdir(parents=True)
+
+    code = main(["resume", "never-started"])
+
+    assert code != 0
+    assert "existing-run" in capsys.readouterr().err
+    assert not (home / "runs" / "never-started").exists()
+
+
+def test_resume_refuses_a_run_belonging_to_another_project(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Same label, different project: the branches and trees are not this repo's."""
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home, project="other-project")
+    stub_resume(monkeypatch)
+
+    code = main(["resume", LABEL])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "other-project" in err
+    assert PROJECT in err
+
+
+def test_resume_refuses_a_workflow_that_cannot_be_resumed(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`resume` is optional: a workflow that does not expose one is told apart
+    from one that does by nothing but `getattr`."""
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home)
+    monkeypatch.delattr(tickets_workflow, "resume")
+
+    code = main(["resume", LABEL])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "tickets" in err
+    assert "Traceback" not in err
+
+
+def test_resume_reports_an_unknown_recorded_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home, workflow="no-such-workflow")
+
+    code = main(["resume", LABEL])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "no-such-workflow" in err
+    assert "tickets" in err
+    assert "Traceback" not in err
+
+
+def test_resume_reports_a_state_with_nothing_to_continue(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A record but no specification: the real `resume` refuses, and its message
+    is the exit status — nothing here reaches an agent."""
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home)
+
+    code = main(["resume", LABEL])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "start a new run" in err
+    assert "Traceback" not in err
+
+
+def test_resume_from_the_wrong_branch_names_the_one_to_check_out(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    write_record_for(home, base_branch="feature")
+    write_state(home)
+
+    code = main(["resume", LABEL])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "feature" in err
+    assert "main" in err
+    assert "Traceback" not in err
+
+
+def test_resume_rejects_an_invalid_label(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+
+    code = main(["resume", "Bad-Label"])
+
+    assert code != 0
+    assert not (home / "runs").exists()
 
 
 # -- help ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "argv", [["--help"], ["run", "--help"], ["clean", "--help"], ["init", "--help"]]
+    "argv",
+    [
+        ["--help"],
+        ["run", "--help"],
+        ["resume", "--help"],
+        ["clean", "--help"],
+        ["init", "--help"],
+    ],
 )
 def test_help_exits_cleanly(argv: list[str], capsys: pytest.CaptureFixture[str]) -> None:
     code = main(argv)
