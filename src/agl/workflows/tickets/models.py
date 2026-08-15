@@ -23,7 +23,7 @@ it came from.
 """
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
@@ -50,13 +50,17 @@ class Status(Enum):
     AWAITING_INPUT = "awaiting_input"  # an agent asked, and is blocked on the user
 
 
-@dataclass
+@dataclass(frozen=True)
 class Ticket:
     """One unit of work: what to build, what it waits for, and where it is.
 
-    Mutable by design. The workflow owns every ticket in a run and moves it
-    through its statuses in place; copying one to change a field would leave two
-    tickets with the same id and no answer for which is current.
+    Frozen, because there is one authority for a ticket and it is not this
+    object: a ticket is a value read out of the run's state, and moving one
+    means writing a new value back where it came from. A mutable ticket invites
+    the opposite — a caller holding a snapshot edits it, the run's own copy
+    changes underneath everything that indexes by id, and nothing goes through
+    the operation that keeps the graph and the board in step. Frozen, a stale
+    snapshot is merely stale, which is a bug you can see.
 
     On a bug ticket — one with a `parent` — `deliverables` are the findings it
     has to fix. Same field, read differently by context, because a second field
@@ -134,11 +138,12 @@ def can_transition(frm: Status, to: Status) -> bool:
     return to in _MOVES[frm]
 
 
-def transition(ticket: Ticket, to: Status) -> None:
-    """Move `ticket` to `to`, raising `IllegalTransitionError` on an illegal move.
+def transition(ticket: Ticket, to: Status) -> Ticket:
+    """`ticket` moved to `to`, raising `IllegalTransitionError` on an illegal move.
 
-    Validates before it touches anything, so a raising call leaves the ticket
-    exactly as it was.
+    Returns a new ticket and leaves the one passed in alone, so the caller is
+    what decides where a moved ticket goes — and validates every rule before it
+    builds anything, so a raising call has produced nothing to put anywhere.
 
     Entering `AWAITING_INPUT` records the status being suspended; leaving it
     requires returning to that status and clears the record. A ticket found in
@@ -149,6 +154,7 @@ def transition(ticket: Ticket, to: Status) -> None:
     frm = ticket.status
     if not can_transition(frm, to):
         raise IllegalTransitionError(f"{ticket.id}: cannot move from {frm.value} to {to.value}")
+    resume_to: Status | None = None
     if frm is Status.AWAITING_INPUT:
         if ticket.resume_to is None:
             raise IllegalTransitionError(
@@ -159,10 +165,9 @@ def transition(ticket: Ticket, to: Status) -> None:
                 f"{ticket.id}: waiting on the user must return to "
                 f"{ticket.resume_to.value}, not {to.value}"
             )
-        ticket.resume_to = None
     elif to is Status.AWAITING_INPUT:
-        ticket.resume_to = frm
-    ticket.status = to
+        resume_to = frm
+    return replace(ticket, status=to, resume_to=resume_to)
 
 
 # -- what the decompose agent produces ------------------------------------

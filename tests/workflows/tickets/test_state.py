@@ -1,6 +1,7 @@
 """One run's state: the graph, the tickets, and keeping the two from disagreeing."""
 
 from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -163,8 +164,7 @@ def test_add_tickets_refuses_a_blocker_no_ticket_answers_to() -> None:
 
 def test_add_tickets_refuses_a_ticket_that_is_not_pending() -> None:
     state = new_state()
-    started = feature("T-01")
-    started.status = Status.IN_PROGRESS
+    started = replace(feature("T-01"), status=Status.IN_PROGRESS)
 
     with pytest.raises(InconsistentStateError, match="T-01"):
         state.add((started,))
@@ -212,7 +212,7 @@ def test_check_consistent_holds_the_table_exactly(node: NodeState, status: Statu
     if node is NodeState.DONE:
         state.dag.complete("T-01")
     # Straight past `set_status`, which is the only way to build the mismatch.
-    state.tickets["T-01"].status = status
+    state.tickets["T-01"] = replace(state.tickets["T-01"], status=status)
 
     if (node, status) in CONSISTENT:
         state.check_consistent()
@@ -360,6 +360,40 @@ def test_the_parent_becomes_ready_once_both_bugs_are_merged() -> None:
         state.check_consistent()
 
     assert state.dag.ready() == ("T-01",)
+
+
+def test_file_bugs_advances_the_parents_review_round() -> None:
+    state = two_tickets()
+    claimed_in_review(state, "T-01")
+    assert state.tickets["T-01"].review_round == 0
+
+    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
+
+    assert state.tickets["T-01"].review_round == 1
+    assert state.tickets["T-01-bug-1"].review_round == 0
+
+
+def test_a_second_round_of_bugs_advances_the_round_again() -> None:
+    state = two_tickets()
+    claimed_in_review(state, "T-01")
+    state.file_bugs("T-01", (bug("T-01-bug-1", "T-01"),))
+    for status in (Status.IN_PROGRESS, Status.MERGING, Status.MERGED):
+        state.set_status("T-01-bug-1", status)
+    claimed_in_review(state, "T-01")
+
+    state.file_bugs("T-01", (bug("T-01-bug-2", "T-01"),))
+
+    assert state.tickets["T-01"].review_round == 2
+
+
+def test_a_refused_filing_leaves_the_review_round_where_it_was() -> None:
+    state = two_tickets()
+    claimed_in_review(state, "T-01")
+
+    with pytest.raises(DuplicateTicketError, match="T-02"):
+        state.file_bugs("T-01", (bug("T-02", "T-01"),))
+
+    assert state.tickets["T-01"].review_round == 0
 
 
 def test_file_bugs_stamps_the_bugs_and_the_parent() -> None:

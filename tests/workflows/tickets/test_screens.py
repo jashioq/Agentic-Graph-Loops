@@ -10,6 +10,7 @@ disagree with the real one.
 """
 
 import time
+from dataclasses import replace
 
 import pytest
 from rich.console import Console
@@ -206,7 +207,7 @@ def status_column(screen: Screen, ticket_id: str, now: float = NOW) -> int:
 def test_a_long_title_is_cut_so_the_status_column_stays_put() -> None:
     long_title = "Migrate every last login screen in the app to Jetpack Compose"
     state = new_run(feature("T-01"), feature("T-02"))
-    state.tickets["T-02"].title = long_title
+    state.tickets["T-02"] = replace(state.tickets["T-02"], title=long_title)
     screen = dashboard(state, NOW)
     shown = words(row_of(screen, "T-02"))[1]
     assert shown != long_title
@@ -216,13 +217,16 @@ def test_a_long_title_is_cut_so_the_status_column_stays_put() -> None:
 
 def test_a_title_that_fits_is_left_alone() -> None:
     state = new_run(feature("T-01"))
-    state.tickets["T-01"].title = "Add biometric unlock"
+    state.tickets["T-01"] = replace(state.tickets["T-01"], title="Add biometric unlock")
     assert words(row_of(dashboard(state, NOW), "T-01"))[1] == "Add biometric unlock"
 
 
 def test_a_long_bug_title_is_cut_to_the_room_the_indent_leaves() -> None:
     state = run_with_bugs(1)
-    state.tickets["T-01-bug-1"].title = "The refresh call loops forever on an expired token"
+    state.tickets["T-01-bug-1"] = replace(
+        state.tickets["T-01-bug-1"],
+        title="The refresh call loops forever on an expired token",
+    )
     screen = dashboard(state, NOW)
     assert words(row_of(screen, "T-01-bug-1"))[1].endswith("…")
     assert status_column(screen, "T-01-bug-1") == status_column(screen, "T-01")

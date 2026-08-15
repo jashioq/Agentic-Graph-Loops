@@ -17,7 +17,6 @@ terminal is entered exactly once and each stage swaps the screen on it.
 """
 
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -93,6 +92,11 @@ class Job:
     callback has to be threaded through every signature. Both close over the
     ticket id: concurrent tickets sharing either would report into each other's
     rows and answer each other's questions.
+
+    `ticket` is the snapshot this pass began from — id, title, deliverables and
+    the review round the steps below are running, none of which move while it
+    runs. Where the ticket *is* moves constantly, so anything asking about its
+    status asks the state instead.
     """
 
     ticket: Ticket
@@ -256,10 +260,13 @@ async def one_ticket(loop: Loop, node_id: NodeId) -> None:
     if ticket.first_pass:
         await implement(loop, task)
     if bugs := await review(loop, task):
-        file_bugs(loop, task, bugs)
+        loop.state.file_bugs(ticket.id, bugs)
     else:
         await merge_it(loop, task)
-    if ticket.status is Status.MERGED:
+    # `ticket` is the snapshot this pass started from, and every step above has
+    # moved the run's copy since; where the ticket ended up is a question only
+    # the state can answer.
+    if loop.state.tickets[ticket.id].status is Status.MERGED:
         loop.trees.release(work)
     else:
         loop.trees.keep(work)
@@ -308,12 +315,6 @@ async def review(loop: Loop, job: Job) -> tuple[Ticket, ...]:
     groups = await agents.triage(loop.ctx, job.ticket, findings, job.on_activity, job.ask)
     start = next_bug_start(loop.state.tickets, job.ticket.id)
     return to_bug_tickets(job.ticket, groups, start)
-
-
-def file_bugs(loop: Loop, job: Job, bugs: Sequence[Ticket]) -> None:
-    """Put a review's findings into the graph as work the ticket now waits on."""
-    loop.state.file_bugs(job.ticket.id, bugs)
-    job.ticket.review_round += 1
 
 
 async def merge_it(loop: Loop, job: Job) -> None:

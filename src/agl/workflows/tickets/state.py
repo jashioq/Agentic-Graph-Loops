@@ -35,13 +35,13 @@ which no queue can know.
 
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agl.core.command import ExecResult
 from agl.runtime.dag import Dag, NodeId, NodeState
 from agl.runtime.display import Board
 from agl.runtime.merge import MergeOutcome, MergeStatus
-from agl.workflows.tickets.models import Status, Ticket, can_transition, transition
+from agl.workflows.tickets.models import Status, Ticket, transition
 
 __all__ = [
     "TAIL_LINES",
@@ -188,18 +188,13 @@ class RunState:
         Raises `UnknownTicketError` for an id the run does not hold,
         `IllegalTransitionError` for a move the life cycle forbids, and
         `ValueError` from the graph when a ticket is started while something
-        still blocks it. Nothing is written in any of those cases.
+        still blocks it. Nothing is written in any of those cases: the moved
+        ticket is built first and only stored once the graph has accepted the
+        move, which is the freedom a frozen ticket buys.
         """
-        ticket = self._ticket(ticket_id)
-        if not can_transition(ticket.status, status):
-            # `transition` owns the message. It cannot mutate on a move
-            # `can_transition` has already refused, so this only ever raises.
-            transition(ticket, status)
+        moved = transition(self._ticket(ticket_id), status)
         self._move_node(ticket_id, status)
-        # The one move left that can be refused here is a return from
-        # `AWAITING_INPUT` into a status it was not suspended from, and that
-        # pairing never moves the node, so there is nothing to undo.
-        transition(ticket, status)
+        self.tickets[ticket_id] = moved
         self.board.stamp(ticket_id, now)
 
     def file_bugs(
@@ -212,6 +207,12 @@ class RunState:
         parent ready for a beat, and a scheduler that looks in that window
         claims it out from under the very work meant to block it. `Dag`'s module
         docstring documents this; the last step here is the release.
+
+        The parent's `review_round` advances here too, because the review that
+        produced these findings is the review that just finished. Bumping it in
+        the caller would leave a window in which the parent is already back in
+        the graph carrying a round it has completed, and the next round's
+        findings would be written over the last round's documents.
 
         Every bug has to name `parent_id` as its parent, and none may be blocked
         by it — a bug waiting on the ticket that is waiting on the bug is the one
@@ -242,6 +243,8 @@ class RunState:
             self._drop([bug.id for bug in incoming])
             raise
 
+        parent = self._ticket(parent_id)
+        self.tickets[parent_id] = replace(parent, review_round=parent.review_round + 1)
         # Last, and only now that the bugs are in place to hold it back.
         self.set_status(parent_id, Status.PENDING, now=now)
 
