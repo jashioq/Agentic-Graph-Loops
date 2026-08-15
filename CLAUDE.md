@@ -47,6 +47,13 @@ particular loop. The first workflow is a ticket orchestrator.
     classification are pure functions. I/O lives at the edges.
 11. **The ABC describes what workflows need**, not everything the implementation
     can do. Implementation-only helpers stay private to `impl/`.
+12. **A workflow's state is one document in its run directory.** It is read
+    fresh at every decision and written before anything acts on it; nothing
+    derivable from it — the stage, the graph, the merge queue, which step a work
+    item is on — is stored beside it. `runtime/record.py` owns the two
+    documents; the workflow owns what goes in them. A workflow may also expose
+    `resume(ctx)`, which settles its state against the world and re-enters the
+    same loop; without one, a run of it cannot be resumed.
 
 ## Style
 
@@ -62,6 +69,14 @@ Every module is built test-first: write the failing test, then the
 implementation. Run the checks before claiming anything works.
 
 ## Commands
+
+    agl init                   # write config.toml for the repo in this directory
+    agl run <workflow> -n <label> <description>
+    agl resume <label>         # continue a run that was stopped
+    agl clean <label>          # remove a run's worktrees, branches, and files
+
+`resume` takes the label and nothing else: everything the run was started with
+is in its `run.json`, and where it got to is derived from its `state.json`.
 
     uv run pytest              # parallel by default (-n auto)
     uv run pytest -n0          # serial, for reading a failure one worker at a time
