@@ -1,10 +1,11 @@
 """Per-role prompt assembly and the calls themselves.
 
 Layer: workflows. The only file in the workflow that calls an agent at all.
-Imports `agl.runtime.agents` for the call itself and for prompt rendering,
-`agl.core.agent` and `agl.core.store` for the types it holds, and this
-workflow's `models`, `tools`, and `reviews`. What is left here is per-role
-knowledge: which prompt, which tools, what is denied, and what to read back.
+Imports `agl.runtime.agents` for the call and for prompt rendering,
+`agl.runtime.context` for what a run was given, and this workflow's `models`,
+`tools` and `reviews`. What is left here is per-role knowledge: which prompt,
+which tools, what is denied, and what to read back — the plumbing a call needs
+around that lives in the runtime.
 
 Every role reports through a tool, never through `output_schema`: a tool call
 the workflow can validate lets the agent read the error and correct itself in
@@ -42,12 +43,11 @@ so it still applies when a run is unattended.
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
 from pathlib import Path
 
-from agl.core.agent import AgentQuestion, AgentRunner, Tool
-from agl.core.store import Store
-from agl.runtime.agents import Limits, PromptError, Prompts, call
+from agl.core.agent import AgentQuestion, Tool
+from agl.runtime.agents import Prompts, call
+from agl.runtime.context import RunContext
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket
 from agl.workflows.tickets.reviews import (
@@ -62,9 +62,9 @@ from agl.workflows.tickets.reviews import (
 
 __all__ = [
     "GIT_WRITES",
-    "AgentContext",
-    "Limits",
-    "PromptError",
+    "PROMPTS",
+    "Activity",
+    "Ask",
     "RoleIncompleteError",
     "decompose",
     "implement",
@@ -72,6 +72,10 @@ __all__ = [
     "review",
     "triage",
 ]
+
+PROMPTS = Prompts(Path(__file__).parent / "prompts")
+"""This workflow's own prompt files. Module-level because which prompts a role
+reads is a fact about the workflow, not something a run is handed."""
 
 GIT_WRITES: tuple[str, ...] = (
     "Bash(git commit:*)",
@@ -94,20 +98,11 @@ _NO_FILE_ACCESS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep", "Ba
 """Denies triage the file and shell tools entirely — it works from the prompt
 and its own judgement, nothing else."""
 
-_ActivityCallback = Callable[[str], None] | None
+type Activity = Callable[[str], None]
+"""Where a long-running call reports the one line it is doing right now."""
 
-
-@dataclass(frozen=True)
-class AgentContext:
-    """What every role needs to run: where things are, and what to run them with."""
-
-    runner: AgentRunner
-    store: Store
-    repo: Path
-    prompts: Path
-    limits: Limits
-    settings: Path | None = None
-    ask: Callable[[AgentQuestion], Awaitable[str]] | None = None
+type Ask = Callable[[AgentQuestion], Awaitable[str]]
+"""How a call puts its own question to whoever is watching the run."""
 
 
 class RoleIncompleteError(Exception):
@@ -122,53 +117,65 @@ class RoleIncompleteError(Exception):
 # -- the roles ----------------------------------------------------------------
 
 
-async def interview(ctx: AgentContext, user_input: str, on_activity: _ActivityCallback) -> None:
+async def interview(
+    ctx: RunContext, user_input: str, on_activity: Activity | None = None, ask: Ask | None = None
+) -> None:
     """Interrogate the user about what to build. Writes the spec through its tools."""
     await _call(
         ctx,
         role="interview",
-        prompt=_prompt(ctx, "interview", user_input=user_input),
-        cwd=ctx.repo,
+        prompt=PROMPTS.render("interview", user_input=user_input),
+        cwd=ctx.project.repo,
         agent_tools=ticket_tools.interview_tools(ctx.store),
         permission_mode="plan",
         on_activity=on_activity,
+        ask=ask,
     )
 
 
-async def decompose(ctx: AgentContext, on_activity: _ActivityCallback) -> None:
+async def decompose(
+    ctx: RunContext, on_activity: Activity | None = None, ask: Ask | None = None
+) -> None:
     """Break the spec into tickets. Writes them through its tools."""
     await _call(
         ctx,
         role="decompose",
-        prompt=_prompt(ctx, "decompose"),
-        cwd=ctx.repo,
+        prompt=PROMPTS.render("decompose"),
+        cwd=ctx.project.repo,
         agent_tools=ticket_tools.decompose_tools(ctx.store),
         on_activity=on_activity,
+        ask=ask,
     )
 
 
 async def implement(
-    ctx: AgentContext, ticket: Ticket, tree: Path, on_activity: _ActivityCallback
+    ctx: RunContext,
+    ticket: Ticket,
+    tree: Path,
+    on_activity: Activity | None = None,
+    ask: Ask | None = None,
 ) -> None:
     """Do one ticket's work in its worktree. What it produces is a commit, not a document."""
     prompt_name = "implement_bug" if ticket.is_bug else "implement"
     await _call(
         ctx,
         role="implement",
-        prompt=_prompt(ctx, prompt_name),
+        prompt=PROMPTS.render(prompt_name),
         cwd=tree,
         agent_tools=ticket_tools.implement_tools(ctx.store, ticket.id),
         disallowed_tools=GIT_WRITES,
         on_activity=on_activity,
+        ask=ask,
     )
 
 
 async def review(
-    ctx: AgentContext,
+    ctx: RunContext,
     ticket: Ticket,
     tree: Path,
     base_branch: str,
-    on_activity: _ActivityCallback,
+    on_activity: Activity | None = None,
+    ask: Ask | None = None,
 ) -> tuple[Finding, ...]:
     """Both reviewers, run concurrently, persisted and returned together.
 
@@ -182,12 +189,12 @@ async def review(
     """
     # Both prompts are rendered before either call starts, so a template bug
     # fails the review without having run half of it.
-    quality_prompt = _prompt(ctx, "review_quality", base_branch=base_branch)
-    spec_prompt = _prompt(ctx, "review_spec", base_branch=base_branch)
+    quality_prompt = PROMPTS.render("review_quality", base_branch=base_branch)
+    spec_prompt = PROMPTS.render("review_spec", base_branch=base_branch)
 
     await asyncio.gather(
-        _review(ctx, "review-quality", quality_prompt, ticket, tree, on_activity, "quality"),
-        _review(ctx, "review-spec", spec_prompt, ticket, tree, on_activity, "spec"),
+        _review(ctx, "review-quality", quality_prompt, ticket, tree, on_activity, ask, "quality"),
+        _review(ctx, "review-spec", spec_prompt, ticket, tree, on_activity, ask, "spec"),
     )
 
     quality_findings = _read_findings(ctx, "review-quality", ticket, "quality")
@@ -197,10 +204,11 @@ async def review(
 
 
 async def triage(
-    ctx: AgentContext,
+    ctx: RunContext,
     ticket: Ticket,
     findings: Sequence[Finding],
-    on_activity: _ActivityCallback,
+    on_activity: Activity | None = None,
+    ask: Ask | None = None,
 ) -> tuple[BugGroup, ...]:
     """Group the `HIGH` findings into bug tickets one agent can fix in a pass.
 
@@ -218,16 +226,16 @@ async def triage(
     await _call(
         ctx,
         role="triage",
-        prompt=_prompt(
-            ctx,
+        prompt=PROMPTS.render(
             "triage",
             findings=_render_findings(highs),
             deliverables=_render_list(ticket.deliverables),
         ),
-        cwd=ctx.repo,
+        cwd=ctx.project.repo,
         agent_tools=ticket_tools.triage_tools(ctx.store, ticket.id, ticket.review_round, highs),
         disallowed_tools=_NO_FILE_ACCESS,
         on_activity=_prefixed(on_activity, "triage"),
+        ask=ask,
     )
 
     key = review_key(ticket.id, ticket.review_round, "triage")
@@ -245,12 +253,13 @@ async def triage(
 
 
 async def _review(
-    ctx: AgentContext,
+    ctx: RunContext,
     role: str,
     prompt: str,
     ticket: Ticket,
     tree: Path,
-    on_activity: _ActivityCallback,
+    on_activity: Activity | None,
+    ask: Ask | None,
     label: str,
 ) -> None:
     factory = (
@@ -266,11 +275,12 @@ async def _review(
         agent_tools=factory(ctx.store, ticket.id, ticket.review_round),
         disallowed_tools=GIT_WRITES,
         on_activity=_prefixed(on_activity, label),
+        ask=ask,
     )
 
 
 def _read_findings(
-    ctx: AgentContext, role: str, ticket: Ticket, source: str
+    ctx: RunContext, role: str, ticket: Ticket, source: str
 ) -> tuple[Finding, ...]:
     """One reviewer's findings, read back from where its `save_findings` wrote them."""
     key = review_key(ticket.id, ticket.review_round, source)
@@ -280,7 +290,7 @@ def _read_findings(
 
 
 async def _call(
-    ctx: AgentContext,
+    ctx: RunContext,
     *,
     role: str,
     prompt: str,
@@ -288,7 +298,8 @@ async def _call(
     agent_tools: tuple[Tool, ...],
     disallowed_tools: tuple[str, ...] = (),
     permission_mode: str = "default",
-    on_activity: _ActivityCallback = None,
+    on_activity: Activity | None = None,
+    ask: Ask | None = None,
 ) -> None:
     """One role's call, with everything the context carries threaded onto it.
 
@@ -296,7 +307,7 @@ async def _call(
     wrote is read back from the store rather than from a result.
     """
     await call(
-        ctx.runner,
+        ctx.agent,
         role=role,
         prompt=prompt,
         cwd=cwd,
@@ -305,11 +316,11 @@ async def _call(
         permission_mode=permission_mode,
         limits=ctx.limits,
         on_activity=on_activity,
-        ask=ctx.ask,
+        ask=ask,
     )
 
 
-def _prefixed(on_activity: _ActivityCallback, label: str) -> _ActivityCallback:
+def _prefixed(on_activity: Activity | None, label: str) -> Activity | None:
     """`label · activity`, or `None` when nobody is watching.
 
     All three review roles write to the same ticket's row and last writer
@@ -322,14 +333,6 @@ def _prefixed(on_activity: _ActivityCallback, label: str) -> _ActivityCallback:
         on_activity(f"{label} · {activity}")
 
     return wrapped
-
-
-# -- prompts ----------------------------------------------------------------
-
-
-def _prompt(ctx: AgentContext, name: str, **substitutions: str) -> str:
-    """Load `prompts/<name>.md` and substitute it, raising on anything left unfilled."""
-    return Prompts(ctx.prompts).render(name, **substitutions)
 
 
 def _render_findings(findings: Sequence[Finding]) -> str:

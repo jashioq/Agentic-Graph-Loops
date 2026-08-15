@@ -3,6 +3,12 @@
 `FakeAgentRunner` throughout — no test here calls a real model. What is under
 test is the `AgentSpec` each function builds and the parsing of what comes
 back, so most assertions read `runner.specs` rather than a return value.
+
+Each role takes a `RunContext`, so every test here is one call to the harness
+in `tests/runtime/conftest.py` with its own runner. Nothing here is about what
+a prompt *says* — `PROMPTS` points at the package's real `prompts/` and
+`test_prompts.py` is what reads them — nor about how one is rendered, which is
+`Prompts` and lives in `tests/runtime/test_agents.py`.
 """
 
 from collections.abc import Awaitable, Callable
@@ -12,11 +18,11 @@ from typing import Any
 import pytest
 
 from agl.core.agent import AgentError, AgentQuestion, AgentResult, AgentRunner, AgentSpec
+from agl.runtime.agents import Limits, PromptError, Prompts
+from agl.runtime.context import RunContext
+from agl.workflows.tickets import agents
 from agl.workflows.tickets.agents import (
     GIT_WRITES,
-    AgentContext,
-    Limits,
-    PromptError,
     RoleIncompleteError,
     decompose,
     implement,
@@ -26,30 +32,9 @@ from agl.workflows.tickets.agents import (
 )
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.reviews import CoverageError, Finding, Severity, review_key
-from tests.fakes import FakeAgentRunner, MemoryStore, ScriptedRun
-
-# -- prompts fixture ---------------------------------------------------------
-
-_PROMPTS: dict[str, str] = {
-    "interview": "Talk to the user about: $user_input",
-    "decompose": "Break the spec into tickets.",
-    "implement": "Build exactly the ticket's deliverables.",
-    "implement_bug": "Fix exactly the findings on this bug ticket.",
-    "review_quality": "Review against the standards document only.",
-    "review_spec": "Review against the ticket's deliverables only.",
-    "triage": "Findings:\n$findings\n\nDeliverables:\n$deliverables",
-}
-
-
-def write_prompts(tmp_path: Path, **overrides: str) -> Path:
-    """A `prompts/` directory with one markdown file per role."""
-    prompts = tmp_path / "prompts"
-    prompts.mkdir()
-    texts = {**_PROMPTS, **overrides}
-    for name, text in texts.items():
-        (prompts / f"{name}.md").write_text(text)
-    return prompts
-
+from tests.fakes import FakeAgentRunner, ScriptedRun
+from tests.runtime.conftest import LIMITS
+from tests.runtime.conftest import context as run_context
 
 # -- fixtures as data --------------------------------------------------------
 
@@ -77,22 +62,9 @@ def bug_ticket(**overrides: Any) -> Ticket:
     return Ticket(**fields)
 
 
-def context(
-    tmp_path: Path,
-    runner: AgentRunner,
-    *,
-    prompts: Path | None = None,
-    limits: Limits | None = None,
-    ask: Callable[[AgentQuestion], Awaitable[str]] | None = None,
-) -> AgentContext:
-    return AgentContext(
-        runner=runner,
-        store=MemoryStore(),
-        repo=tmp_path / "repo",
-        prompts=prompts if prompts is not None else write_prompts(tmp_path),
-        limits=limits if limits is not None else Limits(),
-        ask=ask,
-    )
+def context(repo: Path, runner: AgentRunner, limits: Limits = LIMITS) -> RunContext:
+    """One run's context over `repo`, with `runner` standing in for the model."""
+    return run_context(repo, agent=runner, limits=limits)
 
 
 def findings_result(*findings: dict[str, Any]) -> ScriptedRun:
@@ -166,36 +138,36 @@ class _FailingRunner(AgentRunner):
 # -- each role's spec --------------------------------------------------------
 
 
-async def test_interview_spec(tmp_path: Path) -> None:
+async def test_interview_spec(repo: Path) -> None:
     runner = FakeAgentRunner({"interview": "ok"})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
 
     await interview(ctx, "Add password login", None)
 
     spec = runner.specs[0]
     assert spec.role == "interview"
-    assert spec.cwd == ctx.repo
+    assert spec.cwd == ctx.project.repo
     assert [tool.name for tool in spec.tools] == ["save_spec"]
     assert spec.permission_mode == "plan"
     assert "Add password login" in spec.prompt
 
 
-async def test_decompose_spec(tmp_path: Path) -> None:
+async def test_decompose_spec(repo: Path) -> None:
     runner = FakeAgentRunner({"decompose": "ok"})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
 
     await decompose(ctx, None)
 
     spec = runner.specs[0]
     assert spec.role == "decompose"
-    assert spec.cwd == ctx.repo
+    assert spec.cwd == ctx.project.repo
     assert [tool.name for tool in spec.tools] == ["read_spec", "save_tickets"]
 
 
-async def test_implement_spec(tmp_path: Path) -> None:
+async def test_implement_spec(repo: Path) -> None:
     runner = FakeAgentRunner({"implement": "ok"})
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await implement(ctx, feature_ticket(), tree, None)
 
@@ -206,12 +178,12 @@ async def test_implement_spec(tmp_path: Path) -> None:
     assert spec.disallowed_tools == GIT_WRITES
 
 
-async def test_review_specs(tmp_path: Path) -> None:
+async def test_review_specs(repo: Path) -> None:
     runner = FakeAgentRunner(
         {"review-quality": findings_result(), "review-spec": findings_result()}
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
@@ -235,9 +207,9 @@ async def test_review_specs(tmp_path: Path) -> None:
     assert by_role["review-spec"].output_schema is None
 
 
-async def test_triage_spec(tmp_path: Path) -> None:
+async def test_triage_spec(repo: Path) -> None:
     runner = FakeAgentRunner({"triage": groups_result(group())})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
     await triage(ctx, feature_ticket(), findings, None)
@@ -251,7 +223,7 @@ async def test_triage_spec(tmp_path: Path) -> None:
 # -- GIT_WRITES ---------------------------------------------------------------
 
 
-async def test_git_writes_denied_on_every_worktree_role(tmp_path: Path) -> None:
+async def test_git_writes_denied_on_every_worktree_role(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "implement": "ok",
@@ -259,8 +231,8 @@ async def test_git_writes_denied_on_every_worktree_role(tmp_path: Path) -> None:
             "review-spec": findings_result(),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await implement(ctx, feature_ticket(), tree, None)
     await review(ctx, feature_ticket(review_round=1), tree, "main", None)
@@ -283,7 +255,7 @@ def test_git_writes_are_scoped_bash_deny_rules() -> None:
 # -- AskUserQuestion is never pre-allowed -------------------------------------
 
 
-async def test_ask_user_question_never_appears_as_a_tool(tmp_path: Path) -> None:
+async def test_ask_user_question_never_appears_as_a_tool(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "interview": "ok",
@@ -294,8 +266,8 @@ async def test_ask_user_question_never_appears_as_a_tool(tmp_path: Path) -> None
             "triage": groups_result(group()),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await interview(ctx, "hello", None)
     await decompose(ctx, None)
@@ -310,25 +282,25 @@ async def test_ask_user_question_never_appears_as_a_tool(tmp_path: Path) -> None
 # -- implement: bug vs feature prompt -----------------------------------------
 
 
-async def test_implement_uses_a_different_prompt_for_a_bug_ticket(tmp_path: Path) -> None:
+async def test_implement_uses_a_different_prompt_for_a_bug_ticket(repo: Path) -> None:
     runner = FakeAgentRunner(["ok", "ok"])
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await implement(ctx, feature_ticket(), tree, None)
     await implement(ctx, bug_ticket(), tree, None)
 
     feature_prompt, bug_prompt = runner.specs[0].prompt, runner.specs[1].prompt
     assert feature_prompt != bug_prompt
-    assert feature_prompt == _PROMPTS["implement"]
-    assert bug_prompt == _PROMPTS["implement_bug"]
+    assert feature_prompt == agents.PROMPTS.render("implement")
+    assert bug_prompt == agents.PROMPTS.render("implement_bug")
 
 
 # -- review: two calls, concatenated, persisted -------------------------------
 
 
 async def test_review_issues_two_calls_and_returns_both_lists_concatenated(
-    tmp_path: Path,
+    repo: Path,
 ) -> None:
     runner = FakeAgentRunner(
         {
@@ -336,23 +308,23 @@ async def test_review_issues_two_calls_and_returns_both_lists_concatenated(
             "review-spec": findings_result(finding(id="S-1", severity="medium")),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     findings = await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
     assert {f.id for f in findings} == {"Q-1", "S-1"}
 
 
-async def test_review_persists_both_under_the_right_review_key(tmp_path: Path) -> None:
+async def test_review_persists_both_under_the_right_review_key(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "review-quality": findings_result(finding(id="Q-1")),
             "review-spec": findings_result(finding(id="S-1")),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     await review(ctx, feature_ticket(review_round=2), tree, "main", None)
 
@@ -363,7 +335,7 @@ async def test_review_persists_both_under_the_right_review_key(tmp_path: Path) -
 
 
 async def test_a_reviewer_that_never_calls_save_findings_raises_naming_role_and_ticket(
-    tmp_path: Path,
+    repo: Path,
 ) -> None:
     # Prose instead of the tool call — the exact failure that crashed a real
     # run on a clean review: the model summarized instead of reporting.
@@ -373,20 +345,20 @@ async def test_a_reviewer_that_never_calls_save_findings_raises_naming_role_and_
             "review-spec": findings_result(),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     with pytest.raises(RoleIncompleteError, match="review-quality"):
         await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
 
-async def test_a_clean_review_that_saves_empty_lists_returns_no_findings(tmp_path: Path) -> None:
+async def test_a_clean_review_that_saves_empty_lists_returns_no_findings(repo: Path) -> None:
     # The case that crashed the real run: nothing to report is not an error.
     runner = FakeAgentRunner(
         {"review-quality": findings_result(), "review-spec": findings_result()}
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     findings = await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
@@ -394,7 +366,7 @@ async def test_a_clean_review_that_saves_empty_lists_returns_no_findings(tmp_pat
 
 
 async def test_review_propagates_a_failure_rather_than_returning_half_a_review(
-    tmp_path: Path,
+    repo: Path,
 ) -> None:
     # `review-spec` still saves its own findings through its own tool call —
     # that write is real and stands. What `review` guarantees is that a
@@ -403,8 +375,8 @@ async def test_review_propagates_a_failure_rather_than_returning_half_a_review(
     # review.
     ok = FakeAgentRunner({"review-spec": findings_result(finding(id="S-1"))})
     runner = _FailingRunner(ok, fails_role="review-quality")
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
 
     with pytest.raises(AgentError):
         await review(ctx, feature_ticket(review_round=1), tree, "main", None)
@@ -416,7 +388,7 @@ async def test_review_propagates_a_failure_rather_than_returning_half_a_review(
 # -- activity prefixes ---------------------------------------------------------
 
 
-async def test_review_activity_is_prefixed_and_implement_is_not(tmp_path: Path) -> None:
+async def test_review_activity_is_prefixed_and_implement_is_not(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "implement": ScriptedRun("done", activity=("wrote a.py",)),
@@ -428,8 +400,8 @@ async def test_review_activity_is_prefixed_and_implement_is_not(tmp_path: Path) 
             ),
         }
     )
-    ctx = context(tmp_path, runner)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner)
+    tree = repo.parent / "tree"
     seen: list[str] = []
 
     await implement(ctx, feature_ticket(), tree, seen.append)
@@ -440,7 +412,7 @@ async def test_review_activity_is_prefixed_and_implement_is_not(tmp_path: Path) 
     assert "spec · read spec" in seen
 
 
-async def test_triage_activity_is_prefixed(tmp_path: Path) -> None:
+async def test_triage_activity_is_prefixed(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "triage": ScriptedRun(
@@ -448,7 +420,7 @@ async def test_triage_activity_is_prefixed(tmp_path: Path) -> None:
             )
         }
     )
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     seen: list[str] = []
 
     await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), seen.append)
@@ -456,9 +428,9 @@ async def test_triage_activity_is_prefixed(tmp_path: Path) -> None:
     assert seen == ["triage · thinking"]
 
 
-async def test_interview_reports_activity_unprefixed(tmp_path: Path) -> None:
+async def test_interview_reports_activity_unprefixed(repo: Path) -> None:
     runner = FakeAgentRunner({"interview": ScriptedRun("noted", activity=("read spec.md",))})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     seen: list[str] = []
 
     await interview(ctx, "Add password login", seen.append)
@@ -466,9 +438,9 @@ async def test_interview_reports_activity_unprefixed(tmp_path: Path) -> None:
     assert seen == ["read spec.md"]
 
 
-async def test_decompose_reports_activity_unprefixed(tmp_path: Path) -> None:
+async def test_decompose_reports_activity_unprefixed(repo: Path) -> None:
     runner = FakeAgentRunner({"decompose": ScriptedRun("planned", activity=("read spec.md",))})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     seen: list[str] = []
 
     await decompose(ctx, seen.append)
@@ -479,9 +451,9 @@ async def test_decompose_reports_activity_unprefixed(tmp_path: Path) -> None:
 # -- triage: skip when there is nothing to decide -----------------------------
 
 
-async def test_triage_skips_the_call_for_zero_high_findings(tmp_path: Path) -> None:
+async def test_triage_skips_the_call_for_zero_high_findings(repo: Path) -> None:
     runner = FakeAgentRunner([])  # no script needed: nothing should be called
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     findings = (
         a_finding(id="Q-1", severity=Severity.MEDIUM),
         a_finding(id="Q-2", severity=Severity.LOW),
@@ -493,9 +465,9 @@ async def test_triage_skips_the_call_for_zero_high_findings(tmp_path: Path) -> N
     assert runner.specs == []
 
 
-async def test_triage_skips_the_call_for_exactly_one_high_finding(tmp_path: Path) -> None:
+async def test_triage_skips_the_call_for_exactly_one_high_finding(repo: Path) -> None:
     runner = FakeAgentRunner([])
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     only = a_finding(id="Q-1", title="Missing null check", detail="auth() can NPE")
     findings = (only, a_finding(id="Q-2", severity=Severity.LOW))
 
@@ -506,9 +478,9 @@ async def test_triage_skips_the_call_for_exactly_one_high_finding(tmp_path: Path
     assert groups[0].findings == ("Q-1",)
 
 
-async def test_triage_calls_the_agent_for_two_or_more_high_findings(tmp_path: Path) -> None:
+async def test_triage_calls_the_agent_for_two_or_more_high_findings(repo: Path) -> None:
     runner = FakeAgentRunner({"triage": groups_result(group(findings=["Q-1", "Q-2"]))})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
     groups = await triage(ctx, feature_ticket(), findings, None)
@@ -520,9 +492,9 @@ async def test_triage_calls_the_agent_for_two_or_more_high_findings(tmp_path: Pa
 # -- triage: no file or shell tools -------------------------------------------
 
 
-async def test_triage_has_no_file_or_shell_tools(tmp_path: Path) -> None:
+async def test_triage_has_no_file_or_shell_tools(repo: Path) -> None:
     runner = FakeAgentRunner({"triage": groups_result(group())})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
     await triage(ctx, feature_ticket(), findings, None)
@@ -539,13 +511,13 @@ async def test_triage_has_no_file_or_shell_tools(tmp_path: Path) -> None:
 
 
 async def test_triage_that_never_calls_save_triage_raises_naming_role_and_ticket(
-    tmp_path: Path,
+    repo: Path,
 ) -> None:
     # The scripted run ends without calling its tool at all — prose instead of
     # the call, the exact failure this workflow moved off `output_schema` to
     # make loud instead of silently mistaken for "no groups".
     runner = FakeAgentRunner({"triage": ScriptedRun("Here is my analysis...")})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
     with pytest.raises(RoleIncompleteError, match="triage"):
@@ -556,13 +528,13 @@ async def test_triage_that_never_calls_save_triage_raises_naming_role_and_ticket
 
 
 async def test_triage_backstop_raises_if_the_store_holds_uncovered_groups(
-    tmp_path: Path,
+    repo: Path,
 ) -> None:
     # `save_triage` already refuses groups that fail coverage, so the only way
     # this branch is reached is data landing at the key some other way — which
     # is exactly why `agents.triage` does not just trust that the tool ran.
     runner = FakeAgentRunner({"triage": ScriptedRun()})
-    ctx = context(tmp_path, runner)
+    ctx = context(repo, runner)
     ctx.store.write_json(review_key("T-03", 0, "triage"), {"groups": [group(findings=["Q-1"])]})
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))
 
@@ -573,7 +545,7 @@ async def test_triage_backstop_raises_if_the_store_holds_uncovered_groups(
 # -- limits reach every spec ---------------------------------------------------
 
 
-async def test_limits_reach_every_spec(tmp_path: Path) -> None:
+async def test_limits_reach_every_spec(repo: Path) -> None:
     limits = Limits(model="claude-opus-5", max_turns=12, max_budget_usd=3.5)
     runner = FakeAgentRunner(
         {
@@ -585,8 +557,8 @@ async def test_limits_reach_every_spec(tmp_path: Path) -> None:
             "triage": groups_result(group()),
         }
     )
-    ctx = context(tmp_path, runner, limits=limits)
-    tree = tmp_path / "tree"
+    ctx = context(repo, runner, limits=limits)
+    tree = repo.parent / "tree"
 
     await interview(ctx, "hello", None)
     await decompose(ctx, None)
@@ -600,22 +572,26 @@ async def test_limits_reach_every_spec(tmp_path: Path) -> None:
         assert spec.max_budget_usd == 3.5
 
 
-# -- prompt substitution -------------------------------------------------------
+# -- a prompt that will not render ---------------------------------------------
 
 
-async def test_a_prompt_with_an_unsubstituted_placeholder_raises(tmp_path: Path) -> None:
-    prompts = write_prompts(tmp_path, decompose="Break the spec into $unfilled tickets.")
+async def test_a_prompt_with_an_unsubstituted_placeholder_fails_the_role(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`PromptError` reaches the caller instead of a `$placeholder` reaching a model.
+
+    The only test here that swaps `PROMPTS`: the real files render, which is
+    the point of `test_prompts.py`, so the failure has to be built. What is
+    under test is that the role does not catch it — the agent is never called.
+    """
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    (broken / "decompose.md").write_text("Break the spec into $unfilled tickets.")
+    monkeypatch.setattr(agents, "PROMPTS", Prompts(broken))
     runner = FakeAgentRunner({"decompose": "ok"})
-    ctx = context(tmp_path, runner, prompts=prompts)
+    ctx = context(repo, runner)
 
     with pytest.raises(PromptError):
         await decompose(ctx, None)
 
-
-async def test_interview_substitutes_user_input(tmp_path: Path) -> None:
-    runner = FakeAgentRunner({"interview": "ok"})
-    ctx = context(tmp_path, runner)
-
-    await interview(ctx, "Add password login", None)
-
-    assert runner.specs[0].prompt == "Talk to the user about: Add password login"
+    assert runner.specs == []

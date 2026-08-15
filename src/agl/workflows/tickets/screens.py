@@ -1,10 +1,14 @@
-"""One frame of the ticket dashboard: run state and a clock reading in, a `Screen` out.
+"""Every screen this workflow draws: run state and a clock reading in, a `Screen` out.
 
 Layer: workflows. Pure — no I/O, no async, and no clock read anywhere. `now` is
 a parameter, which is what makes every frame assertable: a test can demand a
 timer reading exactly `0:38` because nothing here can disagree about when now
-is. The live loop calls this several times a second beside a scheduler mutating
-the same objects, so it reads them and writes nothing.
+is. The live loop calls these several times a second beside a scheduler mutating
+the same objects, so they read them and write nothing.
+
+Three screens, one per stage, swapped on the one session the run opens.
+`session` is the bare header the interview shows, `decompose` is that header
+over the tickets an agent has proposed, and `dashboard` is the run itself.
 
 The status a row shows is not always `Ticket.status`. A ticket whose review
 filed bugs sits at `PENDING` with edges to them — there is no `fixing` status,
@@ -18,11 +22,25 @@ between whichever wrote last. Each row reports its own work, so all three are
 legible at a glance.
 """
 
-from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
-from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.state import Halt, Live, RunState, display_order
+from collections.abc import Sequence
 
-__all__ = ["render", "session_header"]
+from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
+from agl.runtime.dag import Dag
+from agl.runtime.display import Board
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.state import Halt, RunState
+
+__all__ = [
+    "APPROVED",
+    "SESSION_ACTIVITY_WIDTH",
+    "dashboard",
+    "decompose",
+    "session",
+    "session_header",
+]
+
+APPROVED = "approved"
+"""The board mark the dashboard's footer counts from: when tickets were approved."""
 
 # The columns. `LABEL_WIDTH` covers the id and the title together, indent
 # included, so an id sits right against its title and a bug row's title may
@@ -65,11 +83,45 @@ _STATUS_COLOR: dict[Status, Color] = {
 }
 
 
-def render(state: RunState, live: Live, now: float) -> Screen:
+# -- the three screens ----------------------------------------------------
+
+
+def session(label: str, board: Board) -> Screen:
+    """The interview's screen: the session header and nothing under it."""
+    return Screen(header=session_header(label, board), content=Rows())
+
+
+def decompose(label: str, board: Board, tickets: Sequence[Ticket]) -> Screen:
+    """The proposed tickets, in dependency order, under the session header.
+
+    Falls back to the bare header while there are none yet, which is what the
+    first proposal is drawn against. The graph is built here rather than kept:
+    these tickets are not in the run until they are approved, so there is
+    nothing to read a level ordering off but themselves.
+    """
+    if not tickets:
+        return session(label, board)
+    dag = Dag()
+    for ticket in tickets:
+        dag.add_node(ticket.id)
+    for ticket in tickets:
+        for blocker in ticket.blocked_by:
+            dag.add_edge(ticket.id, blocker)
+    by_id = {ticket.id: ticket for ticket in tickets}
+    rows = []
+    for level in dag.levels():
+        for ticket_id in level:
+            ticket = by_id[ticket_id]
+            blocked = ", ".join(ticket.blocked_by) if ticket.blocked_by else "—"
+            rows.append(Row(Text(f"{ticket.id}: {ticket.title} (blocked by: {blocked})")))
+    return Screen(header=session_header(label, board), content=Rows(*rows))
+
+
+def dashboard(state: RunState, now: float) -> Screen:
     """The whole dashboard as of `now`: label and markers, one row per ticket, elapsed.
 
-    Reads `live` for what it holds and tolerates what it does not. `Live` is
-    ephemeral and may be empty — a fresh one, or one that lost a ticket to an
+    Reads the board for what it holds and tolerates what it does not. The board
+    is ephemeral and may be empty — a fresh one, or one that lost a ticket to an
     unwound mutation — and a missing stamp costs that row its timer rather than
     the frame.
 
@@ -78,26 +130,27 @@ def render(state: RunState, live: Live, now: float) -> Screen:
     What `now` is for is the guarantee that a frame is a function of its
     arguments, so a test can demand a row reading exactly `0:38`.
     """
+    board = state.board
     return Screen(
         header=_header(state),
-        content=Rows(*(_row(state, live, state.tickets[t]) for t in display_order(state))),
-        footer=_footer(live),
+        content=Rows(*(_row(state, state.tickets[t]) for t in state.display_order())),
+        footer=_footer(board),
     )
 
 
-def session_header(label: str, live: Live) -> Row:
+def session_header(label: str, board: Board) -> Row:
     """The header for the interview and decompose screens: label, timer, activity.
 
-    These sessions have no ticket, so `live.activity` is keyed by `label`
-    itself — the same fallback `Wiring.ask` uses for its question header, for
-    the same reason. Unpadded, unlike the dashboard header: there is no
-    status column or waiting marker to hold a place for here, only a label
-    that is whatever length it is. Renders before any activity has arrived:
-    with nothing recorded for `label`, the row is the label and the timer
-    alone, with no gap held open for a string that has not shown up yet.
+    These sessions have no ticket, so the board's activity is keyed by `label`
+    itself — the same fallback the run uses for a question's header, for the
+    same reason. Unpadded, unlike the dashboard header: there is no status
+    column or waiting marker to hold a place for here, only a label that is
+    whatever length it is. Renders before any activity has arrived: with nothing
+    recorded for `label`, the row is the label and the timer alone, with no gap
+    held open for a string that has not shown up yet.
     """
-    cells: list[Component] = [Text(label, Color.CYAN), Spacer(GAP), Timer(live.started_at)]
-    activity = live.activity.get(label)
+    cells: list[Component] = [Text(label, Color.CYAN), Spacer(GAP), Timer(board.started_at)]
+    activity = board.activity.get(label)
     if activity is not None:
         cells.extend((Spacer(GAP), Text(_fit(activity, SESSION_ACTIVITY_WIDTH), Color.DIM_GREY)))
     return Row(*cells)
@@ -123,8 +176,8 @@ def _waiting_marker(state: RunState) -> Text | None:
     again up here, where it is visible without reading the list.
 
     You will hardly ever see it, and that is expected rather than a bug. Asking
-    stops `Live` and takes the whole screen, and a second question queues on a
-    lock and takes the screen the moment the first is answered — so the
+    stops the live loop and takes the whole screen, and a second question queues
+    on a lock and takes the screen the moment the first is answered — so the
     dashboard is visible exactly when no question is pending, which is exactly
     when there is no marker to draw. It is kept because it is correct in the
     moment it does show, it costs nothing, and it becomes load-bearing the day a
@@ -163,16 +216,17 @@ def _halt_banner(halt: Halt) -> tuple[Row, Row]:
 # -- one ticket -----------------------------------------------------------
 
 
-def _row(state: RunState, live: Live, ticket: Ticket) -> Row:
+def _row(state: RunState, ticket: Ticket) -> Row:
     """A ticket's line: id, title, status, and what is happening to it right now.
 
     Takes no `now`, and wants none: a `Timer` works out its own elapsed at draw
     time, so a row hands over the stamp and stays a description of what to draw
     rather than a reading of how long it has been.
     """
+    board = state.board
     cells: list[Component] = [*_label(ticket), _status_cell(state, ticket)]
-    stamp = live.status_since.get(ticket.id) if ticket.status in _TICKING else None
-    activity = live.activity.get(ticket.id)
+    stamp = board.status_since.get(ticket.id) if ticket.status in _TICKING else None
+    activity = board.activity.get(ticket.id)
     if stamp is not None:
         cells.append(Timer(stamp))
     elif activity is not None:
@@ -250,13 +304,16 @@ def _open_bugs(state: RunState, parent_id: str) -> int:
 # -- the footer -----------------------------------------------------------
 
 
-def _footer(live: Live) -> Rows:
+def _footer(board: Board) -> Rows:
     """How long the implementation loop has been going, set off by a blank line.
 
-    Reads `approved_at`, not `started_at`: the footer answers "how long has
-    this run taken", and a person answering interview questions is not the run
-    taking that long. By the time the dashboard exists, tickets are approved
-    and the stamp is set — see `Live`.
+    Counts from the `approved` mark, not from `started_at`: the footer answers
+    "how long has this run taken", and a person answering interview questions is
+    not the run taking that long. The dashboard is only ever shown after tickets
+    are approved; a board with no mark yet keeps the blank line and shows no
+    clock, rather than showing one that would be counting the wrong thing.
     """
-    assert live.approved_at is not None
-    return Rows(Row(), Row(Timer(live.approved_at)))
+    approved = board.since(APPROVED)
+    if approved is None:
+        return Rows(Row(), Row())
+    return Rows(Row(), Row(Timer(approved)))

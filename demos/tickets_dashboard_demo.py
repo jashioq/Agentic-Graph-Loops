@@ -7,8 +7,8 @@ filed underneath them. Everything goes through the real `set_status` and
 the graph refuses an illegal move here exactly as it would in a live run.
 
 Nothing pushes updates. The live loop rebuilds the frame several times a second
-by calling `render`, which is why the timers tick and why each row's activity
-line can change on its own schedule.
+by calling `screens.dashboard`, which is why the timers tick and why each row's
+activity line can change on its own schedule.
 
     uv run python demos/tickets_dashboard_demo.py
 
@@ -21,10 +21,10 @@ from dataclasses import dataclass, field
 
 from agl.core.terminal import Screen
 from agl.core.terminal.impl.rich_terminal import RichTerminal
-from agl.runtime.dag import Dag
+from agl.runtime.display import Board
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.render import render
-from agl.workflows.tickets.state import Live, RunState, add_tickets, file_bugs, set_status
+from agl.workflows.tickets.screens import dashboard
+from agl.workflows.tickets.state import RunState
 
 LABEL = "add-auth-ticket-18732"
 
@@ -161,7 +161,6 @@ class Demo:
 
     started: float = field(default_factory=time.monotonic)
     state: RunState = field(init=False)
-    live: Live = field(init=False)
     _cycle: int = -1
     _next_event: int = 0
 
@@ -173,7 +172,7 @@ class Demo:
         now = time.monotonic()
         self._advance(now)
         self._report_activity(now)
-        return render(self.state, self.live, now)
+        return dashboard(self.state, now)
 
     # -- driving the run --------------------------------------------------
 
@@ -201,7 +200,7 @@ class Demo:
         if ticket_id not in self.state.tickets:
             self._file(ticket_id, at)
             return
-        set_status(self.state, self.live, ticket_id, status, now=at)
+        self.state.set_status(ticket_id, status, now=at)
 
     def _file(self, bug_id: str, at: float) -> None:
         """File one finding against the ticket its id names.
@@ -218,15 +217,12 @@ class Demo:
             deliverables=(BUGS[bug_id],),
             parent=parent,
         )
-        file_bugs(self.state, self.live, parent, (bug,), now=at)
+        self.state.file_bugs(parent, (bug,), now=at)
 
     def _reset(self, at: float) -> None:
         """Start the run over: a fresh graph, fresh tickets, fresh stamps."""
-        self.state = RunState(label=LABEL, base_branch="main", dag=Dag(), tickets={})
-        self.live = Live(started_at=at)
-        add_tickets(
-            self.state,
-            self.live,
+        self.state = RunState(LABEL, "main", Board(started_at=at))
+        self.state.add(
             tuple(
                 Ticket(
                     id=ticket_id,
@@ -251,15 +247,16 @@ class Demo:
         own starting point, which is the thing worth looking at here: three rows
         changing independently rather than in lockstep.
         """
+        board = self.state.board
         for index, ticket_id in enumerate(self.state.tickets):
             ticket = self.state.tickets[ticket_id]
             pool = _POOLS.get(ticket.status)
             if pool is None:
-                self.live.activity.pop(ticket_id, None)
+                board.activity.pop(ticket_id, None)
                 continue
-            since = self.live.status_since.get(ticket_id, self.live.started_at)
+            since = board.status_since.get(ticket_id, board.started_at)
             step = int(max(0.0, now - since) / (BASE_PERIOD + PERIOD_STEP * index))
-            self.live.activity[ticket_id] = pool[(index * 3 + step) % len(pool)]
+            board.activity[ticket_id] = pool[(index * 3 + step) % len(pool)]
 
 
 _POOLS: dict[Status, tuple[str, ...]] = {
