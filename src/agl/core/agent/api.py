@@ -24,6 +24,7 @@ the layer that knows why the question was asked.
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,7 @@ __all__ = [
     "AgentResult",
     "AgentRunner",
     "AgentSpec",
+    "Model",
     "Tool",
 ]
 
@@ -63,6 +65,20 @@ class Tool:
     handler: Callable[[dict[str, Any]], Awaitable[str]]
 
 
+class Model(StrEnum):
+    """Which model a call runs on, as the CLI's own aliases.
+
+    Aliases rather than pinned ids (`claude-opus-5`): an alias follows the
+    latest release of its tier, and pinning is a decision to revisit on a
+    schedule rather than one to bake into the type.
+    """
+
+    HAIKU = "haiku"
+    SONNET = "sonnet"
+    OPUS = "opus"
+    FABLE = "fable"
+
+
 @dataclass(frozen=True)
 class AgentSpec:
     """One model call: what to ask, where, with what, and under what limits."""
@@ -84,7 +100,8 @@ class AgentSpec:
     # pattern language (`Bash(git commit:*)`).
     disallowed_tools: tuple[str, ...] = ()
     permission_mode: str = "default"  # "default" | "plan" | …
-    model: str | None = None
+    # `None` leaves the choice to the CLI's own default.
+    model: Model | None = None
     max_turns: int | None = None
     max_budget_usd: float | None = None
     output_schema: dict[str, Any] | None = None

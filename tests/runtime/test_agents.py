@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from agl.core.agent import NO_PARAMS, AgentOption, AgentQuestion, AgentResult, Tool
+from agl.core.agent import NO_PARAMS, AgentOption, AgentQuestion, AgentResult, Model, Tool
 from agl.runtime.agents import Limits, PromptError, Prompts, call
 from tests.fakes import FakeAgentRunner, ScriptedRun
 
@@ -118,11 +118,11 @@ async def test_limits_reach_the_spec(tmp_path: Path) -> None:
         role="implement",
         prompt="Build it.",
         cwd=tmp_path,
-        limits=Limits(model="claude-opus-5", max_turns=12, max_budget_usd=3.5),
+        limits=Limits(model=Model.OPUS, max_turns=12, max_budget_usd=3.5),
     )
 
     spec = runner.specs[0]
-    assert spec.model == "claude-opus-5"
+    assert spec.model is Model.OPUS
     assert spec.max_turns == 12
     assert spec.max_budget_usd == 3.5
 

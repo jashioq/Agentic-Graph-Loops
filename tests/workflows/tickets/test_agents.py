@@ -17,7 +17,14 @@ from typing import Any
 
 import pytest
 
-from agl.core.agent import AgentError, AgentQuestion, AgentResult, AgentRunner, AgentSpec
+from agl.core.agent import (
+    AgentError,
+    AgentQuestion,
+    AgentResult,
+    AgentRunner,
+    AgentSpec,
+    Model,
+)
 from agl.runtime.agents import Limits, PromptError, Prompts
 from agl.runtime.context import RunContext
 from agl.workflows.tickets import agents
@@ -546,7 +553,7 @@ async def test_triage_backstop_raises_if_the_store_holds_uncovered_groups(
 
 
 async def test_limits_reach_every_spec(repo: Path) -> None:
-    limits = Limits(model="claude-opus-5", max_turns=12, max_budget_usd=3.5)
+    limits = Limits(model=Model.OPUS, max_turns=12, max_budget_usd=3.5)
     runner = FakeAgentRunner(
         {
             "interview": "ok",
@@ -567,7 +574,7 @@ async def test_limits_reach_every_spec(repo: Path) -> None:
     await triage(ctx, feature_ticket(), (a_finding(id="Q-1"), a_finding(id="Q-2")), None)
 
     for spec in runner.specs:
-        assert spec.model == "claude-opus-5"
+        assert spec.model is Model.OPUS
         assert spec.max_turns == 12
         assert spec.max_budget_usd == 3.5
 

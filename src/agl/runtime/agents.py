@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 
-from agl.core.agent import AgentQuestion, AgentResult, AgentRunner, AgentSpec, Tool
+from agl.core.agent import AgentQuestion, AgentResult, AgentRunner, AgentSpec, Model, Tool
 
 __all__ = ["Limits", "PromptError", "Prompts", "call"]
 
@@ -31,7 +31,7 @@ __all__ = ["Limits", "PromptError", "Prompts", "call"]
 class Limits:
     """Ceilings threaded onto every `AgentSpec` a run builds."""
 
-    model: str | None = None
+    model: Model | None = None
     max_turns: int | None = None
     max_budget_usd: float | None = None
 

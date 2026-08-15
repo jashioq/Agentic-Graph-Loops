@@ -80,7 +80,7 @@ def build_options(
         system_prompt=system_prompt,
         disallowed_tools=list(spec.disallowed_tools),
         permission_mode=cast(PermissionMode, spec.permission_mode),
-        model=spec.model,
+        model=spec.model.value if spec.model is not None else None,
         max_turns=spec.max_turns,
         max_budget_usd=spec.max_budget_usd,
         output_format=output_format,

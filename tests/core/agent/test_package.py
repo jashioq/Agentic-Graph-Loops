@@ -17,6 +17,7 @@ def test_root_exports_exactly_the_api() -> None:
         "AgentResult",
         "AgentRunner",
         "AgentSpec",
+        "Model",
         "Tool",
     }
 

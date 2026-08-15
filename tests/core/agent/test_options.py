@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import ClaudeAgentOptions
 
-from agl.core.agent import AgentSpec
+from agl.core.agent import AgentSpec, Model
 from agl.core.agent.impl.options import build_options
 
 MINIMAL = AgentSpec(prompt="do the thing", cwd=Path("/repo"), role="implement")
@@ -25,7 +25,7 @@ FULL = AgentSpec(
     add_dirs=(Path("/other"), Path("/third")),
     disallowed_tools=("WebFetch",),
     permission_mode="acceptEdits",
-    model="claude-sonnet-4-5",
+    model=Model.SONNET,
     max_turns=12,
     max_budget_usd=1.5,
     output_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
@@ -51,7 +51,7 @@ def test_every_field_of_a_full_spec_reaches_the_options() -> None:
     assert options.cwd == Path("/repo")
     assert options.add_dirs == [Path("/other"), Path("/third")]
     assert options.permission_mode == "acceptEdits"
-    assert options.model == "claude-sonnet-4-5"
+    assert options.model == "sonnet"
     assert options.max_turns == 12
     assert options.max_budget_usd == 1.5
     assert options.disallowed_tools == ["WebFetch"]
@@ -62,6 +62,14 @@ def test_every_field_of_a_full_spec_reaches_the_options() -> None:
         "append": "House rules go here.",
     }
     assert options.output_format == {"type": "json_schema", "schema": FULL.output_schema}
+
+
+def test_the_model_reaches_the_options_as_a_plain_string() -> None:
+    # The SDK is handed the alias itself, not an enum member that happens to be
+    # a string: nothing of ours should travel out through the options object.
+    model = build(FULL).model
+    assert model == "sonnet"
+    assert type(model) is str
 
 
 def test_a_minimal_spec_populates_nothing_spurious() -> None:

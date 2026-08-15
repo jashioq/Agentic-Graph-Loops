@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from agl.core.agent import AgentRunner
+from agl.core.agent import AgentRunner, Model
 from agl.core.store.impl.file_store import FileStore
 from agl.core.terminal import Terminal
 from agl.core.vcs.impl.git import Git
@@ -51,7 +51,7 @@ REQUEST = "Add authentication"
 NO_OP_BUILD = (sys.executable, "-c", "pass")
 """A build that always passes, so the merge gate is open unless a test shuts it."""
 
-LIMITS = Limits(model="sonnet")
+LIMITS = Limits(model=Model.SONNET)
 """The ceilings a test run is under. A module-level singleton rather than a call
 in `context`'s signature, which `Limits` being frozen allows."""
 
