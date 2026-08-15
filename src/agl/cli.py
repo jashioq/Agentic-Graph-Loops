@@ -84,7 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     clean_parser = sub.add_parser("clean", help="remove a run's worktrees, branches, and files")
-    clean_parser.add_argument("-l", "--label", help="the run label to remove")
+    clean_parser.add_argument("label", help="the run label to remove")
 
     init_parser = sub.add_parser(
         "init", help="create the project configuration for the repo in the current directory"
