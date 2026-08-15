@@ -1,8 +1,10 @@
 """Per-role prompt assembly and the calls themselves.
 
-Layer: workflows. The only file in the workflow that constructs an
-`AgentSpec`. Imports `agl.core.agent`, `agl.core.store`, and this workflow's
-`models`, `tools`, and `reviews`.
+Layer: workflows. The only file in the workflow that calls an agent at all.
+Imports `agl.runtime.agents` for the call itself and for prompt rendering,
+`agl.core.agent` and `agl.core.store` for the types it holds, and this
+workflow's `models`, `tools`, and `reviews`. What is left here is per-role
+knowledge: which prompt, which tools, what is denied, and what to read back.
 
 Every role reports through a tool, never through `output_schema`: a tool call
 the workflow can validate lets the agent read the error and correct itself in
@@ -42,10 +44,10 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from string import Template
 
-from agl.core.agent import AgentQuestion, AgentRunner, AgentSpec, Tool
+from agl.core.agent import AgentQuestion, AgentRunner, Tool
 from agl.core.store import Store
+from agl.runtime.agents import Limits, PromptError, Prompts, call
 from agl.workflows.tickets import tools as ticket_tools
 from agl.workflows.tickets.models import Ticket
 from agl.workflows.tickets.reviews import (
@@ -96,15 +98,6 @@ _ActivityCallback = Callable[[str], None] | None
 
 
 @dataclass(frozen=True)
-class Limits:
-    """Ceilings threaded onto every `AgentSpec` this file builds."""
-
-    model: str | None = None
-    max_turns: int | None = None
-    max_budget_usd: float | None = None
-
-
-@dataclass(frozen=True)
 class AgentContext:
     """What every role needs to run: where things are, and what to run them with."""
 
@@ -115,10 +108,6 @@ class AgentContext:
     limits: Limits
     settings: Path | None = None
     ask: Callable[[AgentQuestion], Awaitable[str]] | None = None
-
-
-class PromptError(Exception):
-    """Raised when a prompt could not be assembled — usually a missing substitution."""
 
 
 class RoleIncompleteError(Exception):
@@ -135,27 +124,27 @@ class RoleIncompleteError(Exception):
 
 async def interview(ctx: AgentContext, user_input: str, on_activity: _ActivityCallback) -> None:
     """Interrogate the user about what to build. Writes the spec through its tools."""
-    spec = _spec(
+    await _call(
         ctx,
         role="interview",
         prompt=_prompt(ctx, "interview", user_input=user_input),
         cwd=ctx.repo,
         agent_tools=ticket_tools.interview_tools(ctx.store),
         permission_mode="plan",
+        on_activity=on_activity,
     )
-    await ctx.runner.run(spec, on_activity, ctx.ask)
 
 
 async def decompose(ctx: AgentContext, on_activity: _ActivityCallback) -> None:
     """Break the spec into tickets. Writes them through its tools."""
-    spec = _spec(
+    await _call(
         ctx,
         role="decompose",
         prompt=_prompt(ctx, "decompose"),
         cwd=ctx.repo,
         agent_tools=ticket_tools.decompose_tools(ctx.store),
+        on_activity=on_activity,
     )
-    await ctx.runner.run(spec, on_activity, ctx.ask)
 
 
 async def implement(
@@ -163,15 +152,15 @@ async def implement(
 ) -> None:
     """Do one ticket's work in its worktree. What it produces is a commit, not a document."""
     prompt_name = "implement_bug" if ticket.is_bug else "implement"
-    spec = _spec(
+    await _call(
         ctx,
         role="implement",
         prompt=_prompt(ctx, prompt_name),
         cwd=tree,
         agent_tools=ticket_tools.implement_tools(ctx.store, ticket.id),
         disallowed_tools=GIT_WRITES,
+        on_activity=on_activity,
     )
-    await ctx.runner.run(spec, on_activity, ctx.ask)
 
 
 async def review(
@@ -191,12 +180,14 @@ async def review(
     without `return_exceptions` propagates the first failure immediately, and
     nothing below it runs.
     """
-    quality_spec = _review_spec(ctx, "review-quality", "review_quality", ticket, tree, base_branch)
-    spec_spec = _review_spec(ctx, "review-spec", "review_spec", ticket, tree, base_branch)
+    # Both prompts are rendered before either call starts, so a template bug
+    # fails the review without having run half of it.
+    quality_prompt = _prompt(ctx, "review_quality", base_branch=base_branch)
+    spec_prompt = _prompt(ctx, "review_spec", base_branch=base_branch)
 
     await asyncio.gather(
-        ctx.runner.run(quality_spec, _prefixed(on_activity, "quality"), ctx.ask),
-        ctx.runner.run(spec_spec, _prefixed(on_activity, "spec"), ctx.ask),
+        _review(ctx, "review-quality", quality_prompt, ticket, tree, on_activity, "quality"),
+        _review(ctx, "review-spec", spec_prompt, ticket, tree, on_activity, "spec"),
     )
 
     quality_findings = _read_findings(ctx, "review-quality", ticket, "quality")
@@ -224,7 +215,7 @@ async def triage(
         only = highs[0]
         return (BugGroup(title=only.title, deliverables=(only.detail,), findings=(only.id,)),)
 
-    spec = _spec(
+    await _call(
         ctx,
         role="triage",
         prompt=_prompt(
@@ -236,8 +227,8 @@ async def triage(
         cwd=ctx.repo,
         agent_tools=ticket_tools.triage_tools(ctx.store, ticket.id, ticket.review_round, highs),
         disallowed_tools=_NO_FILE_ACCESS,
+        on_activity=_prefixed(on_activity, "triage"),
     )
-    await ctx.runner.run(spec, _prefixed(on_activity, "triage"), ctx.ask)
 
     key = review_key(ticket.id, ticket.review_round, "triage")
     if not ctx.store.exists(key):
@@ -253,21 +244,28 @@ async def triage(
 # -- spec assembly --------------------------------------------------------
 
 
-def _review_spec(
-    ctx: AgentContext, role: str, prompt_name: str, ticket: Ticket, tree: Path, base_branch: str
-) -> AgentSpec:
+async def _review(
+    ctx: AgentContext,
+    role: str,
+    prompt: str,
+    ticket: Ticket,
+    tree: Path,
+    on_activity: _ActivityCallback,
+    label: str,
+) -> None:
     factory = (
         ticket_tools.review_quality_tools
         if role == "review-quality"
         else ticket_tools.review_spec_tools
     )
-    return _spec(
+    await _call(
         ctx,
         role=role,
-        prompt=_prompt(ctx, prompt_name, base_branch=base_branch),
+        prompt=prompt,
         cwd=tree,
         agent_tools=factory(ctx.store, ticket.id, ticket.review_round),
         disallowed_tools=GIT_WRITES,
+        on_activity=_prefixed(on_activity, label),
     )
 
 
@@ -281,7 +279,7 @@ def _read_findings(
     return findings_from_json(ctx.store.read_json(key))
 
 
-def _spec(
+async def _call(
     ctx: AgentContext,
     *,
     role: str,
@@ -290,18 +288,24 @@ def _spec(
     agent_tools: tuple[Tool, ...],
     disallowed_tools: tuple[str, ...] = (),
     permission_mode: str = "default",
-) -> AgentSpec:
-    """Every field `Limits` owns, threaded onto one spec, once."""
-    return AgentSpec(
+    on_activity: _ActivityCallback = None,
+) -> None:
+    """One role's call, with everything the context carries threaded onto it.
+
+    Nothing is returned: every role here reports through a tool, and what it
+    wrote is read back from the store rather than from a result.
+    """
+    await call(
+        ctx.runner,
+        role=role,
         prompt=prompt,
         cwd=cwd,
-        role=role,
         tools=agent_tools,
-        disallowed_tools=disallowed_tools,
+        disallowed=disallowed_tools,
         permission_mode=permission_mode,
-        model=ctx.limits.model,
-        max_turns=ctx.limits.max_turns,
-        max_budget_usd=ctx.limits.max_budget_usd,
+        limits=ctx.limits,
+        on_activity=on_activity,
+        ask=ctx.ask,
     )
 
 
@@ -325,12 +329,7 @@ def _prefixed(on_activity: _ActivityCallback, label: str) -> _ActivityCallback:
 
 def _prompt(ctx: AgentContext, name: str, **substitutions: str) -> str:
     """Load `prompts/<name>.md` and substitute it, raising on anything left unfilled."""
-    path = ctx.prompts / f"{name}.md"
-    template = Template(path.read_text())
-    try:
-        return template.substitute(**substitutions)
-    except KeyError as error:
-        raise PromptError(f"{path}: missing a substitution for {error}") from error
+    return Prompts(ctx.prompts).render(name, **substitutions)
 
 
 def _render_findings(findings: Sequence[Finding]) -> str:
