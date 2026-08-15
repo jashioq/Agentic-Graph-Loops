@@ -413,6 +413,128 @@ async def test_a_non_positive_fps_is_refused_rather_than_dividing_by_zero(
         terminal.live(build_screen, fps=fps)
 
 
+async def test_show_swaps_the_screen_mid_flight() -> None:
+    # The whole point of `show`: one session opened once, with the screen
+    # replaced per stage instead of a new `live()` per stage.
+    terminal, buffer = make_terminal()
+
+    async with terminal.live(build_screen) as session:
+        session.show(lambda: Screen(Rows(Row(Text("approval")))))
+
+    output = buffer.getvalue()
+    assert "dashboard" in output
+    assert "approval" in output
+    assert output.index("dashboard") < output.index("approval")
+
+
+async def test_show_paints_the_new_screen_immediately() -> None:
+    painted = False
+
+    def build() -> Screen:
+        nonlocal painted
+        painted = True
+        return Screen(Rows(Row(Text("approval"))))
+
+    terminal, buffer = make_terminal()
+    async with terminal.live(build_screen) as session:
+        session.show(build)
+        assert painted
+        assert "approval" in buffer.getvalue()
+
+
+async def test_repainting_follows_the_screen_show_installed() -> None:
+    repainted = asyncio.Event()
+    calls = 0
+    stale = 0
+
+    def stale_build() -> Screen:
+        nonlocal stale
+        stale += 1
+        return build_screen()
+
+    def build() -> Screen:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            repainted.set()
+        return Screen(Rows(Row(Text("approval"))))
+
+    terminal, _ = make_terminal()
+    async with terminal.live(stale_build, fps=100) as session:
+        session.show(build)
+        settled = stale
+        await asyncio.wait_for(repainted.wait(), _TIMEOUT)
+
+    assert calls > 1
+    assert stale == settled  # the replaced builder is never called again
+
+
+async def test_live_without_a_builder_shows_a_blank_screen_until_the_first_show() -> None:
+    terminal, buffer = make_terminal()
+
+    async with terminal.live() as session:
+        assert "dashboard" not in buffer.getvalue()
+        session.show(build_screen)
+
+    assert "dashboard" in buffer.getvalue()
+
+
+async def test_live_without_a_builder_keeps_repainting() -> None:
+    # A blank start must not leave the session without a repaint task, or the
+    # screen `show` installs would never tick.
+    repainted = asyncio.Event()
+    calls = 0
+
+    def build() -> Screen:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            repainted.set()
+        return build_screen()
+
+    terminal, _ = make_terminal()
+    async with terminal.live(fps=100) as session:
+        session.show(build)
+        await asyncio.wait_for(repainted.wait(), _TIMEOUT)
+    assert calls > 1
+
+
+async def test_a_screen_shown_before_a_question_is_the_one_that_comes_back() -> None:
+    # A question wipes the screen; what returns is whatever `show` last
+    # installed, not the screen `live()` was opened with.
+    resumed = asyncio.Event()
+    answered = False
+
+    def build() -> Screen:
+        if answered:
+            resumed.set()
+        return Screen(Rows(Row(Text("approval"))))
+
+    terminal, buffer = make_terminal("1")
+    async with terminal.live(build_screen, fps=100) as session:
+        session.show(build)
+        await session.ask(QUESTION)
+        answered = True
+        await asyncio.wait_for(resumed.wait(), _TIMEOUT)
+
+    output = buffer.getvalue()
+    assert output.rindex("approval") > output.index("Which storage layer")
+    assert output.count("dashboard") == 1
+
+
+async def test_a_failing_build_installed_by_show_becomes_an_error_frame() -> None:
+    terminal, buffer = make_terminal()
+
+    async with terminal.live(build_screen) as session:
+        session.show(_blows_up)
+
+    assert "show blew up" in buffer.getvalue()
+
+
+def _blows_up() -> Screen:
+    raise RuntimeError("show blew up")
+
+
 async def test_a_screen_with_only_content_paints() -> None:
     terminal, buffer = make_terminal()
 

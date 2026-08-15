@@ -4,6 +4,10 @@ Layer: core (impl). This is where the I/O lives. Nothing pushes updates — a
 repaint task calls `build()` at `1/fps` and renders whatever it returns, so a
 `Timer` ticks because the frame is rebuilt, not because anything told it to.
 
+The builder lives on the session, so `show` can replace it mid-flight and the
+repaint task keeps ticking against whatever is current. A session opened with no
+builder paints a blank screen until the first `show`.
+
 A question takes the whole screen: the live display stops, the question is
 printed, stdin is read on a worker thread so the event loop keeps running, and
 the display is restored. A lock serializes concurrent askers into a FIFO queue.
@@ -50,6 +54,8 @@ __all__ = ["RichTerminal"]
 
 _OTHER_LABEL = "Other… (type your answer)"
 
+_BLANK = Screen(Rows())
+
 
 def _error_screen(error: Exception) -> Screen:
     """The frame shown in place of one `build()` failed to produce."""
@@ -66,9 +72,13 @@ class RichTerminal(Terminal):
         self._stdin = stdin
 
     def live(
-        self, build: Callable[[], Screen], fps: int = 4
+        self, build: Callable[[], Screen] | None = None, fps: int = 4
     ) -> AbstractAsyncContextManager[LiveSession]:
         """Repaint `build()` at `fps` for as long as the context is open.
+
+        With no `build`, the screen starts blank and stays that way until the
+        first `show`; the repaint task runs either way, so the screen a later
+        `show` installs ticks like any other.
 
         Checked here rather than inside the context manager's body, so a caller
         that passes nonsense hears about it at the call and not on entry.
@@ -79,14 +89,14 @@ class RichTerminal(Terminal):
 
     @asynccontextmanager
     async def _live(
-        self, build: Callable[[], Screen], fps: int
+        self, build: Callable[[], Screen] | None, fps: int
     ) -> AsyncIterator[LiveSession]:
         # Not transient: the last frame of a run is worth keeping on screen.
         display = Live(console=self._console, auto_refresh=False, transient=False)
-        session = _RichLiveSession(display, self._console, self._read_line)
+        session = _RichLiveSession(display, self._console, self._read_line, build)
         display.start(refresh=False)
-        session.paint(build)
-        repaint = asyncio.create_task(self._repaint(session, build, fps))
+        session.paint()
+        repaint = asyncio.create_task(self._repaint(session, fps))
         try:
             yield session
         finally:
@@ -97,10 +107,11 @@ class RichTerminal(Terminal):
                 pass
             display.stop()
 
-    async def _repaint(
-        self, session: "_RichLiveSession", build: Callable[[], Screen], fps: int
-    ) -> None:
+    async def _repaint(self, session: "_RichLiveSession", fps: int) -> None:
         """Tick until cancelled.
+
+        The builder lives on the session, so a `show` mid-flight changes what
+        this paints without the task knowing anything happened.
 
         `paint` handles a failing frame, so this task ends only by cancellation
         and the `await repaint` on exit cannot mask an error from the body.
@@ -108,7 +119,7 @@ class RichTerminal(Terminal):
         interval = 1 / fps
         while True:
             await asyncio.sleep(interval)
-            session.paint(build)
+            session.paint()
 
     def _read_line(self) -> str:
         """Blocking read. Always called on a worker thread."""
@@ -123,15 +134,32 @@ class RichTerminal(Terminal):
 class _RichLiveSession(LiveSession):
     """A running live display, and the questions that interrupt it."""
 
-    def __init__(self, display: Live, console: Console, read_line: Callable[[], str]) -> None:
+    def __init__(
+        self,
+        display: Live,
+        console: Console,
+        read_line: Callable[[], str],
+        build: Callable[[], Screen] | None = None,
+    ) -> None:
         self._display = display
         self._console = console
         self._read_line = read_line
+        self._build = build
         self._lock = asyncio.Lock()
         self._suspended = False
         self._last_frame = ""
 
-    def paint(self, build: Callable[[], Screen]) -> None:
+    def show(self, build: Callable[[], Screen]) -> None:
+        """Replace the frame source and paint it once.
+
+        Painting here rather than waiting for the next tick is what makes a
+        stage change immediate. While a question owns the screen the paint is a
+        no-op, and the new screen is what comes back when the question ends.
+        """
+        self._build = build
+        self.paint()
+
+    def paint(self) -> None:
         """Render one frame, unless a question currently owns the screen.
 
         A `build()` that raises is caught here, not left to kill the repaint
@@ -139,15 +167,21 @@ class _RichLiveSession(LiveSession):
         """
         if self._suspended:
             return
-        try:
-            screen = build()
-        except Exception as error:
-            screen = _error_screen(error)
+        screen = self._frame()
         now = time.monotonic()
         if self._can_animate():
             self._display.update(to_layout(screen, now), refresh=True)
         else:
             self._print_frame(screen, now)
+
+    def _frame(self) -> Screen:
+        """The screen to paint: blank before the first `show`, else `build()`."""
+        if self._build is None:
+            return _BLANK
+        try:
+            return self._build()
+        except Exception as error:  # noqa: BLE001 - a bad frame is not a dead display
+            return _error_screen(error)
 
     def _can_animate(self) -> bool:
         """Whether Rich will actually redraw in place. Matches `Live`'s own test."""

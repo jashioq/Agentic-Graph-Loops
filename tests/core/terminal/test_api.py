@@ -1,6 +1,7 @@
 """The API surface is immutable data plus two abstract classes."""
 
 import dataclasses
+import inspect
 
 import pytest
 
@@ -123,3 +124,16 @@ def test_terminal_and_live_session_are_abstract() -> None:
         Terminal()  # type: ignore[abstract]
     with pytest.raises(TypeError):
         LiveSession()  # type: ignore[abstract]
+
+
+def test_a_session_must_implement_show() -> None:
+    # Swapping the screen is part of the contract, not a Rich-only extra: a
+    # stand-in that cannot do it has to fail at instantiation.
+    assert "show" in LiveSession.__abstractmethods__
+
+
+def test_live_may_be_opened_without_a_builder() -> None:
+    from agl.core.terminal import Terminal
+
+    signature = inspect.signature(Terminal.live)
+    assert signature.parameters["build"].default is None
