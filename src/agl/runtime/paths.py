@@ -1,6 +1,6 @@
 """Where things live: run directories, worktree paths, and branch names.
 
-Layer: core. Pure functions over `Path` and `str` — nothing here creates,
+Layer: runtime. Pure functions over `Path` and `str` — nothing here creates,
 checks, or touches anything on disk, and the paths it returns need not exist.
 The modules that do the I/O receive concrete paths in their constructors, which
 is what keeps `store` and `vcs` free of any config knowledge.

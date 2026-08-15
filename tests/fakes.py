@@ -21,7 +21,7 @@ from agl.core.agent import (
     Tool,
 )
 from agl.core.store import MissingKeyError, Store
-from agl.core.terminal import Answer, LiveSession, Question, Screen, Terminal
+from agl.core.terminal import Answer, LiveSession, Question, Rows, Screen, Terminal
 from agl.core.terminal.impl.render import to_renderable
 
 __all__ = [
@@ -53,7 +53,7 @@ class HeadlessTerminal(Terminal):
 
     @asynccontextmanager
     async def live(
-        self, build: Callable[[], Screen], fps: int = 4
+        self, build: Callable[[], Screen] | None = None, fps: int = 4
     ) -> AsyncIterator[LiveSession]:
         """Capture a frame on entry and on exit. No repaint task, no timing."""
         session = _HeadlessSession(self, build)
@@ -84,13 +84,24 @@ class HeadlessTerminal(Terminal):
 class _HeadlessSession(LiveSession):
     """Frames are captured on demand — a test decides when time moves."""
 
-    def __init__(self, terminal: HeadlessTerminal, build: Callable[[], Screen]) -> None:
+    def __init__(
+        self, terminal: HeadlessTerminal, build: Callable[[], Screen] | None = None
+    ) -> None:
         self._terminal = terminal
         self._build = build
 
+    def show(self, build: Callable[[], Screen]) -> None:
+        """Swap the screen and record the frame, as the real session paints one."""
+        self._build = build
+        self.frame()
+
     def frame(self) -> str:
         """Rebuild the screen, record it, and hand the text back."""
-        return self._terminal.capture(self._build())
+        return self._terminal.capture(self._screen())
+
+    def _screen(self) -> Screen:
+        """Blank until the first `show`, matching what a real session paints."""
+        return Screen(Rows()) if self._build is None else self._build()
 
     async def ask(self, question: Question) -> Answer:
         """Record the frame the question interrupted, then answer from the script."""

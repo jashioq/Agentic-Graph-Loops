@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agl.core.paths import (
+from agl.runtime.paths import (
     BRANCH_PREFIX,
     InvalidNameError,
     branch,
@@ -263,7 +263,7 @@ def test_path_functions_are_repeatable_and_create_nothing(tmp_path: Path) -> Non
 
 
 def test_the_module_does_no_io() -> None:
-    import agl.core.paths as paths
+    import agl.runtime.paths as paths
 
     source = Path(str(paths.__file__)).read_text(encoding="utf-8")
     for forbidden in ("open(", "mkdir", "exists(", "os.", "shutil"):
@@ -271,7 +271,7 @@ def test_the_module_does_no_io() -> None:
 
 
 def test_the_module_speaks_no_workflow_vocabulary() -> None:
-    import agl.core.paths as paths
+    import agl.runtime.paths as paths
 
     source = Path(str(paths.__file__)).read_text(encoding="utf-8").lower()
     for word in ("ticket", "bug", "spec", "standards"):

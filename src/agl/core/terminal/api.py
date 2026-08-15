@@ -154,9 +154,13 @@ class Terminal(ABC):
 
     @abstractmethod
     def live(
-        self, build: Callable[[], Screen], fps: int = 4
+        self, build: Callable[[], Screen] | None = None, fps: int = 4
     ) -> AbstractAsyncContextManager["LiveSession"]:
         """Repaint `build()` at `fps` until the context exits.
+
+        `build` is optional: with none, the screen is blank until the first
+        `LiveSession.show`, which is what lets a run open one session up front
+        and decide what to draw as it goes.
 
         `fps` is frames per second and must be positive; a non-positive value
         raises `ValueError` here rather than becoming a division inside the
@@ -166,6 +170,16 @@ class Terminal(ABC):
 
 class LiveSession(ABC):
     """A running live display. Questions interrupt it and then hand it back."""
+
+    @abstractmethod
+    def show(self, build: Callable[[], Screen]) -> None:
+        """Replace the frame source and paint it once.
+
+        A run has stages, and each stage has its own screen; swapping the
+        builder is how it moves between them without stopping and restarting
+        the display. The new screen is painted straight away rather than at the
+        next tick, so a stage change is visible even if nothing else happens.
+        """
 
     @abstractmethod
     async def ask(self, question: Question) -> Answer:

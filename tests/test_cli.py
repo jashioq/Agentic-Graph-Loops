@@ -3,9 +3,14 @@ composition-root wiring.
 
 A full run is already covered by `test_workflow.py`, so `run` here never
 drives a real ticket workflow to completion. Wiring tests replace the ticket
-workflow's `Run` with a stub that records what it was constructed with and
-returns immediately; only the preflight-refusal test lets the real `Run`
+workflow's `run` with a stub that records the `RunContext` it was handed and
+returns immediately; only the preflight-refusal test lets the real `run`
 start, because a preflight refusal happens before any agent or terminal call.
+
+The `RunContext` those stubs capture is the whole contract between the cli and a
+workflow, so asserting over it is how this file checks the composition root: the
+label, the description, `--max-concurrent`, and the `ProjectSettings` that
+`config.toml` was translated into.
 
 Real git throughout — `repo` and `git` come from `tests/conftest.py` — and a
 real `config.toml`. Nothing here ever constructs `FakeAgentRunner` or
@@ -16,16 +21,17 @@ either fails before one (preflight) or is stubbed out before one (wiring).
 import shutil
 import sys
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
 from agl.cli import main
 from agl.config import load_project
-from agl.core import paths
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
+from agl.runtime.context import RunContext
 from agl.workflows.tickets import workflow as tickets_workflow
+from agl.workflows.tickets.state import Halt
+from agl.workflows.tickets.workflow import HaltedError
 from tests.conftest import git
 
 PROJECT = "demo"
@@ -67,37 +73,28 @@ def setup(
     monkeypatch.chdir(repo)
 
 
-class StubRun:
-    """Stands in for the ticket workflow's `Run`: records its args, does nothing.
+def stub_run(monkeypatch: pytest.MonkeyPatch) -> list[RunContext]:
+    """Replace the ticket workflow's `run` with one that only records its context.
 
-    `go()` returns immediately without touching `deps.agent` or `deps.terminal`,
-    which is what keeps these tests from ever reaching a real model call.
+    It returns before touching `ctx.agent` or `ctx.terminal`, which is what
+    keeps these tests from ever reaching a real model call.
     """
+    contexts: list[RunContext] = []
 
-    def __init__(
-        self, deps: Any, label: str, description: str, max_concurrent: int
-    ) -> None:
-        self.deps = deps
-        self.label = label
-        self.description = description
-        self.max_concurrent = max_concurrent
-        self.state = SimpleNamespace(halt=None)
+    async def recording(ctx: RunContext) -> None:
+        contexts.append(ctx)
+
+    monkeypatch.setattr(tickets_workflow, "run", recording)
+    return contexts
 
 
-def stub_run(monkeypatch: pytest.MonkeyPatch) -> list[StubRun]:
-    """Patch the real `Run` with `StubRun`; returns the list it appends to."""
-    created: list[StubRun] = []
+def failing_run(monkeypatch: pytest.MonkeyPatch, error: BaseException) -> None:
+    """Replace the ticket workflow's `run` with one that raises `error`."""
 
-    class _Recording(StubRun):
-        def __init__(self, *args: Any, **kwargs: Any) -> None:
-            super().__init__(*args, **kwargs)
-            created.append(self)
+    async def raising(ctx: RunContext) -> None:
+        raise error
 
-        async def go(self) -> None:
-            return None
-
-    monkeypatch.setattr(tickets_workflow, "Run", _Recording)
-    return created
+    monkeypatch.setattr(tickets_workflow, "run", raising)
 
 
 # -- config resolution --------------------------------------------------------
@@ -107,13 +104,53 @@ def test_resolves_the_config_from_a_repo_inside_a_known_project(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
-    assert created[0].deps.config.name == PROJECT
-    assert created[0].deps.config.repo == repo.resolve()
+    assert contexts[0].project.name == PROJECT
+    assert contexts[0].project.repo == repo.resolve()
+
+
+def test_the_config_file_arrives_as_project_settings(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    """Every field of `config.toml` a run may use, and nothing of the file format.
+
+    This is the one translation in the codebase, so it is the one place the two
+    shapes can drift apart without anything else noticing.
+    """
+    setup(monkeypatch, repo, home, trees)
+    contexts = stub_run(monkeypatch)
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code == 0
+    settings = contexts[0].project
+    config = load_project(home, repo)
+    assert settings.name == config.name
+    assert settings.repo == config.repo
+    assert settings.trees_root == config.trees_root
+    assert settings.build == config.build
+    assert settings.build_timeout == config.build_timeout
+
+
+def test_the_context_carries_the_connectors_and_the_current_branch(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    """What the composition root is for: real connectors, and the base to merge into."""
+    git(repo, "checkout", "-b", "feature", "main")
+    setup(monkeypatch, repo, home, trees)
+    contexts = stub_run(monkeypatch)
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code == 0
+    ctx = contexts[0]
+    assert ctx.base_branch == "feature"
+    assert ctx.vcs.root() == repo.resolve()
+    assert paths.run_dir(home, "add-auth").is_dir()
 
 
 def test_fails_clearly_outside_a_repo(
@@ -163,24 +200,24 @@ def test_name_sets_the_label(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
-    assert created[0].label == "add-auth"
+    assert contexts[0].label == "add-auth"
 
 
 def test_the_short_name_flag_sets_the_label(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "-n", "add-auth", "Add auth"])
 
     assert code == 0
-    assert created[0].label == "add-auth"
+    assert contexts[0].label == "add-auth"
 
 
 def test_an_invalid_label_is_rejected_before_anything_is_created(
@@ -215,6 +252,26 @@ def test_an_unknown_workflow_lists_the_available_ones(
     assert "tickets" in capsys.readouterr().err
 
 
+def test_a_workflow_is_a_package_exposing_only_run(
+    monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
+) -> None:
+    """`run(ctx)` is the whole entry point a workflow has to provide.
+
+    Stripping every other name off the module and still getting a run is what
+    says so — the cli constructs nothing of the workflow's and reaches into
+    nothing of it afterwards.
+    """
+    setup(monkeypatch, repo, home, trees)
+    contexts = stub_run(monkeypatch)
+    for name in ("Deps", "Run", "Loop", "Job"):
+        monkeypatch.delattr(tickets_workflow, name, raising=False)
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code == 0
+    assert len(contexts) == 1
+
+
 # -- description and max-concurrent ---------------------------------------
 
 
@@ -222,48 +279,48 @@ def test_a_multi_word_description_arrives_intact(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "Add", "a", "login", "page"])
 
     assert code == 0
-    assert created[0].description == "Add a login page"
+    assert contexts[0].request == "Add a login page"
 
 
 def test_a_double_dash_lets_the_description_start_with_a_dash(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "--", "--fix", "things"])
 
     assert code == 0
-    assert created[0].description == "--fix things"
+    assert contexts[0].request == "--fix things"
 
 
 def test_max_concurrent_defaults_to_three(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
-    assert created[0].max_concurrent == 3
+    assert contexts[0].max_concurrent == 3
 
 
 def test_max_concurrent_reaches_run(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
 
     code = main(["run", "tickets", "--name", "add-auth", "--max-concurrent", "7", "Add auth"])
 
     assert code == 0
-    assert created[0].max_concurrent == 7
+    assert contexts[0].max_concurrent == 7
 
 
 # -- description from stdin ------------------------------------------------
@@ -290,28 +347,28 @@ def test_piped_stdin_description_arrives_intact_including_newlines(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
     stdin = _FakeStdin("Add auth\nwith OAuth\n", isatty=False)
     monkeypatch.setattr(sys, "stdin", stdin)
 
     code = main(["run", "tickets", "--name", "add-auth"])
 
     assert code == 0
-    assert created[0].description == "Add auth\nwith OAuth\n"
+    assert contexts[0].request == "Add auth\nwith OAuth\n"
 
 
 def test_a_positional_description_wins_and_stdin_is_untouched(
     monkeypatch: pytest.MonkeyPatch, repo: Path, home: Path, trees: Path
 ) -> None:
     setup(monkeypatch, repo, home, trees)
-    created = stub_run(monkeypatch)
+    contexts = stub_run(monkeypatch)
     stdin = _FakeStdin("should not be read", isatty=False)
     monkeypatch.setattr(sys, "stdin", stdin)
 
     code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
 
     assert code == 0
-    assert created[0].description == "Add auth"
+    assert contexts[0].request == "Add auth"
     assert stdin.read_called is False
 
 
@@ -378,6 +435,87 @@ def test_a_preflight_refusal_exits_nonzero_with_the_reason_printed(
     err = capsys.readouterr().err
     assert "uncommitted" in err
     assert "Traceback" not in err
+
+
+# -- exit status -----------------------------------------------------------
+#
+# The exception `run` raises *is* the exit status. Nothing here reaches into a
+# workflow to ask how it went, so a workflow that returns is a run that
+# succeeded and any exception out of it is a run that failed, with its message
+# on stderr and no traceback.
+
+
+def test_a_workflow_that_returns_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    stub_run(monkeypatch)
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_run_that_ends_halted_exits_nonzero_with_the_halts_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    halt = Halt("T-01 hit a conflict", "auth.py", resumable=False)
+    failing_run(monkeypatch, HaltedError(halt))
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert halt.reason in err
+    assert "Traceback" not in err
+
+
+def test_any_other_failure_out_of_a_workflow_exits_nonzero_with_its_message(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    failing_run(monkeypatch, RuntimeError("the agent went missing"))
+
+    code = main(["run", "tickets", "--name", "add-auth", "Add auth"])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert "the agent went missing" in err
+    assert "Traceback" not in err
+
+
+def test_an_interrupted_run_names_the_worktrees_it_left(
+    monkeypatch: pytest.MonkeyPatch,
+    repo: Path,
+    home: Path,
+    trees: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup(monkeypatch, repo, home, trees)
+    label = "add-auth"
+    _, worktree = _ticket_branch_and_worktree(repo, home, trees, label)
+    failing_run(monkeypatch, KeyboardInterrupt())
+
+    code = main(["run", "tickets", "--name", label, "Add auth"])
+
+    assert code != 0
+    err = capsys.readouterr().err
+    assert str(worktree) in err
+    assert f"agl clean {label}" in err
 
 
 # -- help ------------------------------------------------------------------

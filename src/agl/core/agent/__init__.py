@@ -13,6 +13,7 @@ from agl.core.agent.api import (
     AgentResult,
     AgentRunner,
     AgentSpec,
+    Model,
     Tool,
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     "AgentResult",
     "AgentRunner",
     "AgentSpec",
+    "Model",
     "Tool",
 ]

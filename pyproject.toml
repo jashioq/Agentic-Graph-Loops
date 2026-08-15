@@ -68,22 +68,32 @@ modules = [
   "agl.core.agent",
   "agl.core.store",
   "agl.core.vcs",
-  "agl.core.dag",
-  "agl.core.paths",
 ]
 
 [[tool.importlinter.contracts]]
 name = "Layers"
 type = "layers"
-layers = ["agl.cli", "agl.workflows", "agl.core"]
+layers = ["agl.cli", "agl.workflows", "agl.runtime", "agl.core"]
+
+[[tool.importlinter.contracts]]
+name = "dag and paths are pure leaves"
+type = "forbidden"
+source_modules = ["agl.runtime.dag", "agl.runtime.paths"]
+forbidden_modules = ["agl.core", "agl.workflows", "agl.cli", "agl.config"]
 
 [[tool.importlinter.contracts]]
 name = "Workflows use APIs, never implementations"
 type = "forbidden"
-source_modules = ["agl.workflows"]
+source_modules = ["agl.workflows", "agl.runtime"]
 forbidden_modules = [
   "agl.core.terminal.impl",
   "agl.core.agent.impl",
   "agl.core.store.impl",
   "agl.core.vcs.impl",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Only the cli knows the config file format"
+type = "forbidden"
+source_modules = ["agl.workflows", "agl.runtime"]
+forbidden_modules = ["agl.config"]

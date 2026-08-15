@@ -17,6 +17,7 @@ from agl.core.agent import (
     AgentResult,
     AgentRunner,
     AgentSpec,
+    Model,
     Tool,
 )
 
@@ -78,9 +79,15 @@ def test_a_spec_needs_a_prompt_a_cwd_and_a_role_and_nothing_else() -> None:
     assert spec.disallowed_tools == ()
     assert spec.permission_mode == "default"
     assert spec.model is None
-    assert spec.max_turns is None
-    assert spec.max_budget_usd is None
     assert spec.output_schema is None
+
+
+def test_a_spec_takes_a_model_as_the_enum() -> None:
+    spec = AgentSpec(
+        prompt="hello", cwd=Path("/repo"), role="implement", model=Model.OPUS
+    )
+
+    assert spec.model is Model.OPUS
 
 
 def test_a_result_carries_the_text_and_what_the_run_cost() -> None:
@@ -133,6 +140,26 @@ def test_the_question_type_is_this_modules_own() -> None:
     # other, and translating one into the other is the workflow's job.
     assert AgentQuestion.__module__ == "agl.core.agent.api"
     assert not [name for name in dir(AgentQuestion) if name == "header"]
+
+
+# -- the model ------------------------------------------------------------
+
+
+def test_the_model_enum_holds_the_four_tiers() -> None:
+    assert [member.name for member in Model] == ["HAIKU", "SONNET", "OPUS", "FABLE"]
+
+
+def test_the_members_are_the_cli_aliases_not_pinned_ids() -> None:
+    # An alias follows the latest release of its tier; pinning `claude-opus-5`
+    # is a decision to revisit on a schedule, not one to bake into the type.
+    assert [member.value for member in Model] == ["haiku", "sonnet", "opus", "fable"]
+
+
+def test_a_model_is_a_string() -> None:
+    # `StrEnum`, so a member compares equal to its alias and needs no unwrapping
+    # to be read by a person.
+    assert isinstance(Model.SONNET, str)
+    assert Model.SONNET == "sonnet"
 
 
 # -- errors ---------------------------------------------------------------

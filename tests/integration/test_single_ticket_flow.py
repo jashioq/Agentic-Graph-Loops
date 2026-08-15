@@ -22,13 +22,13 @@ from typing import Any
 
 import pytest
 
-from agl.core import paths
 from agl.core.agent import NO_PARAMS, AgentResult, AgentSpec, Tool
-from agl.core.dag import Dag, NodeState
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
 from agl.core.vcs import MergeResult, Worktree
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
+from agl.runtime.dag import Dag, NodeState
 from tests.fakes import FakeAgentRunner, ScriptedRun, ToolResult
 from tests.integration.conftest import PROJECT, copy_repo
 

@@ -2,7 +2,7 @@
 
 import pytest
 
-from agl.core.dag import CycleError, Dag, UnknownNodeError
+from agl.runtime.dag import CycleError, Dag, UnknownNodeError
 
 
 def test_nodes_preserve_insertion_order() -> None:

@@ -13,8 +13,6 @@ import pytest
 
 import agl.workflows.tickets as tickets_pkg
 from agl.workflows.tickets.agents import (
-    AgentContext,
-    Limits,
     decompose,
     implement,
     interview,
@@ -23,7 +21,8 @@ from agl.workflows.tickets.agents import (
 )
 from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.reviews import Finding, Severity
-from tests.fakes import FakeAgentRunner, MemoryStore, ScriptedRun
+from tests.fakes import FakeAgentRunner, ScriptedRun
+from tests.runtime.conftest import context
 
 PROMPTS_DIR = Path(tickets_pkg.__file__).parent / "prompts"
 
@@ -36,16 +35,6 @@ _ROLE_FILES = (
     "review_spec",
     "triage",
 )
-
-
-def context(runner: FakeAgentRunner, tmp_path: Path) -> AgentContext:
-    return AgentContext(
-        runner=runner,
-        store=MemoryStore(),
-        repo=tmp_path / "repo",
-        prompts=PROMPTS_DIR,
-        limits=Limits(),
-    )
 
 
 def feature_ticket(**overrides: object) -> Ticket:
@@ -109,9 +98,9 @@ def test_prompts_with_no_placeholders_render_as_is(name: str) -> None:
     assert "$" not in rendered
 
 
-async def test_decompose_prompt_has_no_placeholders(tmp_path: Path) -> None:
+async def test_decompose_prompt_has_no_placeholders(repo: Path) -> None:
     runner = FakeAgentRunner({"decompose": "ok"})
-    ctx = context(runner, tmp_path)
+    ctx = context(repo, agent=runner)
 
     await decompose(ctx, None)
 
@@ -121,9 +110,9 @@ async def test_decompose_prompt_has_no_placeholders(tmp_path: Path) -> None:
 # -- interview: $user_input --------------------------------------------------
 
 
-async def test_interview_prompt_substitutes_user_input(tmp_path: Path) -> None:
+async def test_interview_prompt_substitutes_user_input(repo: Path) -> None:
     runner = FakeAgentRunner({"interview": "ok"})
-    ctx = context(runner, tmp_path)
+    ctx = context(repo, agent=runner)
 
     await interview(ctx, "Add password login", None)
 
@@ -156,12 +145,12 @@ def test_interview_prompt_has_the_fixed_sections_in_order() -> None:
 # -- review: $base_branch, three-dot diff ------------------------------------
 
 
-async def test_review_prompts_substitute_base_branch(tmp_path: Path) -> None:
+async def test_review_prompts_substitute_base_branch(repo: Path) -> None:
     runner = FakeAgentRunner(
         {"review-quality": findings_result(), "review-spec": findings_result()}
     )
-    ctx = context(runner, tmp_path)
-    tree = tmp_path / "tree"
+    ctx = context(repo, agent=runner)
+    tree = repo.parent / "tree"
 
     await review(ctx, feature_ticket(review_round=1), tree, "main", None)
 
@@ -172,12 +161,12 @@ async def test_review_prompts_substitute_base_branch(tmp_path: Path) -> None:
     assert "$" not in by_role["review-spec"].prompt
 
 
-async def test_review_prompts_use_the_three_dot_diff_form(tmp_path: Path) -> None:
+async def test_review_prompts_use_the_three_dot_diff_form(repo: Path) -> None:
     runner = FakeAgentRunner(
         {"review-quality": findings_result(), "review-spec": findings_result()}
     )
-    ctx = context(runner, tmp_path)
-    tree = tmp_path / "tree"
+    ctx = context(repo, agent=runner)
+    tree = repo.parent / "tree"
 
     await review(ctx, feature_ticket(review_round=1), tree, "release/9", None)
 
@@ -248,10 +237,10 @@ def test_triage_prompt_names_save_triage() -> None:
 # -- implement: bug vs feature use different files ---------------------------
 
 
-async def test_implement_uses_a_different_prompt_for_a_bug_ticket(tmp_path: Path) -> None:
+async def test_implement_uses_a_different_prompt_for_a_bug_ticket(repo: Path) -> None:
     runner = FakeAgentRunner(["ok", "ok"])
-    ctx = context(runner, tmp_path)
-    tree = tmp_path / "tree"
+    ctx = context(repo, agent=runner)
+    tree = repo.parent / "tree"
 
     await implement(ctx, feature_ticket(), tree, None)
     await implement(ctx, bug_ticket(), tree, None)
@@ -265,7 +254,7 @@ async def test_implement_uses_a_different_prompt_for_a_bug_ticket(tmp_path: Path
 # -- triage: $findings, $deliverables ----------------------------------------
 
 
-async def test_triage_prompt_substitutes_findings_and_deliverables(tmp_path: Path) -> None:
+async def test_triage_prompt_substitutes_findings_and_deliverables(repo: Path) -> None:
     runner = FakeAgentRunner(
         {
             "triage": groups_result(
@@ -273,7 +262,7 @@ async def test_triage_prompt_substitutes_findings_and_deliverables(tmp_path: Pat
             )
         }
     )
-    ctx = context(runner, tmp_path)
+    ctx = context(repo, agent=runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2", title="Leaks a Retrofit type"))
 
     await triage(ctx, feature_ticket(), findings, None)

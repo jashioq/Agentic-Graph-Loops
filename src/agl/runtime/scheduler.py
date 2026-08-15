@@ -1,14 +1,21 @@
-"""The concurrency loop that turns a ticket graph into running work.
+"""The concurrency loop that turns a graph into running work.
 
-Layer: workflows. Imports `agl.core.dag` and this workflow's `state` and
-`models`; nothing else from `agl.core`. `body` is what actually does anything —
-worktrees, agents, merges — and this module never learns any of that exists.
+Layer: runtime. Imports `agl.runtime.dag` and nothing else — not a workflow,
+not a core connector. `body` is what actually does anything — worktrees,
+agents, merges — and this module never learns any of that exists; it is handed
+a `NodeId` and the caller looks up whatever it keeps under that key.
+
+`halted` is the one other thing a workflow supplies: a predicate the loop
+consults before admitting more work. What a halt *is* — a merge conflict, a
+failed build, a person to ask — is the workflow's knowledge, and none of it
+reaches here. The default never halts, so a caller with no notion of halting
+gets a loop that stops only on completion, a failing body, or a stall.
 
 Two hazards, both easy to reintroduce.
 
 **A slot is acquired before the graph is asked what is ready, never after.**
 Claiming a node and only then waiting for a slot would leave it `CLAIMED` while
-nothing runs — a lie to the dashboard, and a deadlock the moment the graph is
+nothing runs — a lie to any dashboard, and a deadlock the moment the graph is
 deeper than the cap, because the held slot would belong to a node that cannot
 start. A slot acquired with nothing to claim is handed straight back before the
 loop waits again.
@@ -31,11 +38,9 @@ that; this module only has to call it correctly.
 import asyncio
 from collections.abc import Awaitable, Callable
 
-from agl.core.dag import Dag, NodeId, NodeState
-from agl.workflows.tickets.models import Ticket
-from agl.workflows.tickets.state import RunState
+from agl.runtime.dag import Dag, NodeId, NodeState
 
-__all__ = ["StalledGraphError", "bugs_first", "run"]
+__all__ = ["StalledGraphError", "drive", "run"]
 
 
 class StalledGraphError(Exception):
@@ -52,18 +57,24 @@ class StalledGraphError(Exception):
         self.pending = pending
 
 
-async def run(
-    state: RunState,
-    body: Callable[[Ticket], Awaitable[None]],
-    max_concurrent: int,
-    on_error: Callable[[Ticket | None, BaseException], None],
-) -> None:
-    """Run every ticket's `body` once, at most `max_concurrent` at a time.
+def _never() -> bool:
+    """The default halt predicate: a caller who never halts."""
+    return False
 
-    Stops admitting new work the moment `body` raises or `state.halt` is set,
-    and waits for whatever is already running before returning. A stalled
+
+async def run(
+    dag: Dag,
+    body: Callable[[NodeId], Awaitable[None]],
+    max_concurrent: int,
+    on_error: Callable[[NodeId | None, BaseException], None],
+    halted: Callable[[], bool] = _never,
+) -> None:
+    """Run every node's `body` once, at most `max_concurrent` at a time.
+
+    Stops admitting new work the moment `body` raises or `halted()` becomes
+    true, and waits for whatever is already running before returning. A stalled
     graph — nothing ready, nothing claimed, not complete — is reported through
-    `on_error` with `None` in place of a ticket, rather than spinning forever.
+    `on_error` with `None` in place of a node, rather than spinning forever.
 
     Cancelling the run cancels every in-flight `body` and propagates, the way
     Ctrl-C now reaches a running build. A raising `on_error` is treated the
@@ -72,32 +83,30 @@ async def run(
     still cancelled and awaited before that exception leaves `run` — a
     caller sees a clean stop, never a set of orphaned tasks.
 
-    The scheduler never mutates a ticket's status: `body` does that through
-    `state.set_status`, the single writer. The one graph write here is
-    `dag.release` on a ticket whose `body` raised, so it is not left `CLAIMED`
-    forever; what that means for the ticket's status is the workflow's call.
+    The scheduler never writes anything a workflow keeps about a node: that is
+    `body`'s job, through whatever single writer the workflow has. The one
+    graph write here is `dag.release` on a node whose `body` raised, so it is
+    not left `CLAIMED` forever; what that means for the workflow is its call.
     """
-    dag = state.dag
     slots = asyncio.Semaphore(max_concurrent)
     progress = asyncio.Event()
     tasks: set[asyncio.Task[None]] = set()
     admitting = True
 
-    async def run_one(ticket_id: NodeId) -> None:
+    async def run_one(node_id: NodeId) -> None:
         nonlocal admitting
-        ticket = state.tickets[ticket_id]
         try:
-            await body(ticket)
+            await body(node_id)
         except Exception as error:  # noqa: BLE001 - reported, not re-raised
-            dag.release(ticket_id)
+            dag.release(node_id)
             admitting = False
-            on_error(ticket, error)
+            on_error(node_id, error)
         finally:
             slots.release()
             progress.set()
 
     def should_admit() -> bool:
-        return admitting and state.halt is None and not dag.is_complete()
+        return admitting and not halted() and not dag.is_complete()
 
     try:
         while should_admit():
@@ -139,24 +148,32 @@ async def run(
         raise
 
 
+async def drive(
+    dag: Dag,
+    body: Callable[[NodeId], Awaitable[None]],
+    max_concurrent: int,
+    on_error: Callable[[NodeId | None, BaseException], None],
+    halted: Callable[[], bool] = _never,
+) -> None:
+    """Re-enter `run` until the graph is complete or a halt outlives a pass.
+
+    A node whose `body` is parked waiting on a person does not return until
+    somebody deals with it, so `run` cannot return on its own while one is
+    stuck there — whatever the workflow arranged to unstick it is what lets
+    the pass finish. This loop only has to notice work a pass returned early
+    from: a resolved halt that left something newly ready to claim.
+
+    A halt still set when a pass returns is one nothing resolved, so going
+    round again would admit nothing and spin. That is where `drive` returns
+    with the graph incomplete, and the caller reads its own halt to find out
+    why.
+    """
+    while not dag.is_complete():
+        await run(dag, body, max_concurrent, on_error, halted)
+        if halted():
+            return
+
+
 def _pending(dag: Dag) -> tuple[NodeId, ...]:
     """Nodes still `PENDING` when the graph stalled, for the error message."""
     return tuple(node for node in dag.nodes() if dag.state(node) is NodeState.PENDING)
-
-
-def bugs_first(state: RunState) -> Callable[[NodeId], bool]:
-    """A `Dag` priority key that puts every ready bug ahead of every ready feature.
-
-    `Dag.ready()` sorts with this key using a stable sort, so ties — bug vs
-    bug, feature vs feature — keep insertion order for free; the key only has
-    to say which of the two groups a node belongs to.
-
-    A run that keeps generating bugs can leave feature tickets waiting a long
-    time even though they became ready first. That is intended: finishing
-    what is already open takes priority over opening more.
-    """
-
-    def priority(node_id: NodeId) -> bool:
-        return not state.tickets[node_id].is_bug
-
-    return priority

@@ -1,109 +1,130 @@
-"""End-to-end tests for the ticket workflow's graph.
+"""The ticket workflow end to end: the loop, the policy, and the screens it swaps.
 
 `FakeAgentRunner` and `HeadlessTerminal` throughout — no test here calls a real
 model or paints a real screen. `WritingAgentRunner` wraps the fake to give an
 "implement" call the one thing the fake cannot do on its own: put a file in the
 worktree, the way a real agent's file tools would. Everything else — git,
-worktrees, the store — is real, in `tmp_path`.
+worktrees, the store — is real, in `tmp_path`, and assembled by the harness in
+`tests/runtime/conftest.py`.
 
-These are the last safety net before a real run, so they drive `Run.go()`
-whole, the way `agl.cli` will.
+`run(ctx)` keeps its state in a local, so nothing here reaches into it. What a
+run did is read off what it left behind: the files that landed on the base
+branch, the worktrees it released, the frames it painted — the dashboard is the
+window onto every ticket's status — and the exception it raised. That is also
+what the cli sees, so these tests exercise the same surface it does.
+
+The policy the loop is built from is plain functions, tested as such at the foot
+of the file: `resolve` (what a merge that did not land means), `failed` (what an
+exception out of a ticket means), `base_for` (a bug branches off its parent) and
+`asker` (a question suspends its own ticket and no other).
 """
 
 import asyncio
-import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agl.config import ProjectConfig
-from agl.core import paths
 from agl.core.agent import AgentOption, AgentQuestion, AgentResult, AgentRunner, AgentSpec
-from agl.core.store.impl.file_store import FileStore
-from agl.core.terminal import Answer, Question, Screen, Terminal
-from agl.core.vcs.impl.git import Git
+from agl.core.terminal import Answer, LiveSession, Question, Screen
+from agl.runtime import paths
+from agl.runtime.context import PreflightError, RunContext
+from agl.runtime.display import Board, Display, live
+from agl.runtime.merge import (
+    MergeConfig,
+    MergeDecision,
+    MergeOutcome,
+    MergeQueue,
+    MergeRequest,
+    MergeStatus,
+)
+from agl.runtime.worktrees import Worktrees
 from agl.workflows.tickets import workflow as workflow_module
-from agl.workflows.tickets.merge import MergeQueue, MergeRequest
-from agl.workflows.tickets.models import Status
-from agl.workflows.tickets.state import check_consistent
-from agl.workflows.tickets.workflow import DecomposeAbortedError, Deps, PreflightError, Run
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.state import RunState
+from agl.workflows.tickets.workflow import (
+    DecomposeAbortedError,
+    HaltedError,
+    InterviewIncompleteError,
+    Loop,
+    asker,
+    base_for,
+    failed,
+    resolve,
+    run,
+)
 from tests.conftest import git
-from tests.fakes import FakeAgentRunner, HeadlessTerminal, ScriptedRun, _HeadlessSession
-from tests.integration.conftest import PROJECT
+from tests.fakes import (
+    FakeAgentRunner,
+    HeadlessTerminal,
+    ScriptedRun,
+    _HeadlessSession,
+)
+from tests.runtime.conftest import LABEL, context, feature
 
-LABEL = "add-auth"
+NOW = 1_000.0
+GATE = "press enter to continue"
+"""The title `resolve` puts up while a person deals with a halt."""
 
-
-# -- wiring -----------------------------------------------------------------
-
-
-def start(repo: Path, name: str = "feature") -> None:
-    """Move `repo` off `main` onto a feature branch, as a real run requires."""
-    git(repo, "checkout", "-b", name, "main")
-
-
-def config(repo: Path, trees: Path) -> ProjectConfig:
-    config_dir = repo.parent / "agl-config"
-    return ProjectConfig(
-        name=PROJECT,
-        repo=repo,
-        trees_root=trees,
-        build=(sys.executable, "-c", "pass"),
-        build_timeout=30.0,
-        standards=config_dir / "standards.md",
-        config_dir=config_dir,
-    )
+APPROVE = Answer("approve", was_free_text=False)
 
 
-def deps(
-    repo: Path, home: Path, trees: Path, agent: AgentRunner, terminal: Terminal
-) -> Deps:
-    return Deps(
-        agent=agent,
-        vcs=Git(repo),
-        store=FileStore(paths.run_dir(home, LABEL)),
-        terminal=terminal,
-        config=config(repo, trees),
-    )
+# -- holding the run at a halt -------------------------------------------------
+
+
+@dataclass
+class Gate:
+    """Two events around the resume prompt, so a test can stand where a person does.
+
+    `asked` fires when the run puts the prompt up, which is the observable
+    "this run has halted" — the state that carries the halt is a local of
+    `run`. `ready` is the test saying the repository has been fixed, so the
+    scripted answer means "somebody looked" rather than "an answer happened to
+    be queued".
+    """
+
+    asked: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 class _GatedSession(_HeadlessSession):
-    """Holds "press enter to continue" until the test says the fix is in.
-
-    Every other question answers the instant it is asked, same as
-    `HeadlessTerminal` — only this one title waits, which is what makes the
-    scripted answer mean "a person looked and pressed enter" rather than
-    "whatever answer happened to be queued".
-    """
+    """Holds the resume prompt until the test says the fix is in."""
 
     def __init__(
-        self, terminal: "GatedTerminal", build: Callable[[], Screen], ready: asyncio.Event
+        self, terminal: "GatedTerminal", build: Callable[[], Screen] | None, gate: Gate
     ) -> None:
         super().__init__(terminal, build)
-        self._ready = ready
+        self._gate = gate
 
     async def ask(self, question: Question) -> Answer:
-        if question.title == "press enter to continue":
-            await self._ready.wait()
+        if question.title == GATE:
+            # The frame the halt is on, captured before the wait: a real
+            # session is repainting throughout, so the banner is on screen for
+            # as long as a person is being waited on.
+            self.frame()
+            self._gate.asked.set()
+            await self._gate.ready.wait()
         return await super().ask(question)
 
 
 class GatedTerminal(HeadlessTerminal):
     """A `HeadlessTerminal` whose resume prompt is held by `_GatedSession`."""
 
-    def __init__(self, ready: asyncio.Event, **kwargs: Any) -> None:
+    def __init__(self, gate: Gate, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self._ready = ready
+        self.gate = gate
 
     def queue(self, answer: Answer) -> None:
         self._answers.append(answer)
 
     @asynccontextmanager
-    async def live(self, build: Callable[[], Screen], fps: int = 4) -> Any:
-        session = _GatedSession(self, build, self._ready)
+    async def live(
+        self, build: Callable[[], Screen] | None = None, fps: int = 4
+    ) -> AsyncIterator[LiveSession]:
+        session = _GatedSession(self, build, self.gate)
         session.frame()
         try:
             yield session
@@ -111,21 +132,7 @@ class GatedTerminal(HeadlessTerminal):
             session.frame()
 
 
-class RecordingQueue(MergeQueue):
-    """A `MergeQueue` that remembers every request `put` to it.
-
-    Stands in for the real queue via `monkeypatch`, so a test can assert the
-    workflow routed a bug ticket's merge through the queue rather than only
-    checking the end state, which a bypass could also reach.
-    """
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.seen: list[MergeRequest] = []
-
-    def put(self, request: MergeRequest) -> None:
-        self.seen.append(request)
-        super().put(request)
+# -- standing in for the agent's own file tools --------------------------------
 
 
 type _Overrides = dict[str, tuple[str, str]]
@@ -189,6 +196,35 @@ class ScriptedByTicket(AgentRunner):
         return await self._inner.run(spec, on_activity, on_question)
 
 
+class _RecordingQueue(MergeQueue):
+    """A `MergeQueue` that appends every request to a list the test holds."""
+
+    def __init__(self, seen: list[MergeRequest], *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._seen = seen
+
+    async def submit(self, request: MergeRequest) -> MergeOutcome:
+        self._seen.append(request)
+        return await super().submit(request)
+
+
+def recording_queue(seen: list[MergeRequest]) -> Callable[..., MergeQueue]:
+    """A `MergeQueue` factory to monkeypatch in, so a test can see what was submitted.
+
+    Asserting on the end state alone would pass for a workflow that bypassed
+    the queue entirely; this is how a bug ticket's merge is shown to go through
+    the same queue every other merge does.
+    """
+
+    def make(*args: Any, **kwargs: Any) -> MergeQueue:
+        return _RecordingQueue(seen, *args, **kwargs)
+
+    return make
+
+
+# -- scripting a run -----------------------------------------------------------
+
+
 def ticket_json(
     id_: str, title: str, deliverables: tuple[str, ...], blocked_by: tuple[str, ...] = ()
 ) -> dict[str, Any]:
@@ -232,182 +268,191 @@ def group(**overrides: Any) -> dict[str, Any]:
 
 def clean_review() -> dict[str, ScriptedRun]:
     """Both reviewers scripted to find nothing."""
+    return {"review-quality": findings_result(), "review-spec": findings_result()}
+
+
+def opening(*tickets: dict[str, Any], **roles: ScriptedRun) -> dict[str, ScriptedRun]:
+    """The interview and decompose calls every run below starts with."""
     return {
-        "review-quality": findings_result(),
-        "review-spec": findings_result(),
+        "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
+        "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": list(tickets)}),)),
+        **roles,
     }
 
 
-# -- one ticket, start to finish ---------------------------------------------
+def worktrees_of(ctx: RunContext) -> list[Path]:
+    return [w.path for w in ctx.vcs.list_worktrees()]
 
 
-async def test_one_ticket_end_to_end(tmp_path: Path, repo: Path) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
-    fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# Add auth\n"}),)),
-            "decompose": ScriptedRun(
-                "planned", calls=(("save_tickets", {"tickets": tickets}),)
-            ),
-            "implement": ScriptedRun("done", calls=(("get_ticket", {}), ("read_spec", {}))),
-            **clean_review(),
-        }
+def landed(repo: Path, *ticket_ids: str) -> bool:
+    """Every named ticket's file is on the base branch — which is what merged means."""
+    return all(
+        (repo / f"{tid}.txt").read_text(encoding="utf-8") == f"{tid}\n" for tid in ticket_ids
     )
-    d = deps(repo, home, trees, WritingAgentRunner(fake), terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
-
-    await run.go()
-
-    assert run.state.tickets["T-01"].status is Status.MERGED
-    assert run.state.dag.is_complete()
-    check_consistent(run.state)
-    assert (repo / "T-01.txt").read_text(encoding="utf-8") == "T-01\n"
-    assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
-    assert d.vcs.current_branch() == "feature"
-    assert d.vcs.is_ancestor(d.vcs.rev_parse("feature"), "feature")
 
 
-async def test_the_interview_header_carries_the_label_and_activity_wired_through(
-    tmp_path: Path, repo: Path
-) -> None:
-    """`Run.interview` passes `Wiring.activity(label)` through to the agent, and
-    the screen it draws shows the label before any activity has a chance to
-    arrive — the state of the first seconds of every run.
+# -- one ticket, start to finish -----------------------------------------------
+
+
+async def test_one_ticket_end_to_end(repo: Path) -> None:
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    runner = WritingAgentRunner(
+        FakeAgentRunner(
+            opening(
+                ticket_json("T-01", "Add auth", ("auth.py",)),
+                implement=ScriptedRun("done", calls=(("get_ticket", {}), ("read_spec", {}))),
+                **clean_review(),
+            )
+        )
+    )
+    ctx = context(repo, agent=runner, terminal=terminal, max_concurrent=2)
+
+    await run(ctx)
+
+    assert landed(repo, "T-01")
+    assert any("merged" in frame for frame in terminal.frames)
+    assert worktrees_of(ctx) == [repo.resolve()]
+    assert ctx.vcs.current_branch() == "feature"
+    assert ctx.store.exists("spec.md")
+
+
+async def test_the_run_opens_one_session_and_swaps_the_screen_on_it(repo: Path) -> None:
+    """The interview screen, then the dashboard, on the terminal entered once.
+
+    The first frame is the blank one a session paints before any `show` — a run
+    opens the display before it knows what its first stage looks like — and the
+    label is on every frame after it.
     """
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
-    fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun(
-                "noted",
-                activity=("read app/build.gradle.kts",),
-                calls=(("save_spec", {"content": "# Add auth\n"}),),
-            ),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
-            **clean_review(),
-        }
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    runner = WritingAgentRunner(
+        FakeAgentRunner(
+            opening(
+                ticket_json("T-01", "Add auth", ("auth.py",)),
+                implement=ScriptedRun("done"),
+                **clean_review(),
+            )
+        )
     )
-    d = deps(repo, home, trees, WritingAgentRunner(fake), terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+    ctx = context(repo, agent=runner, terminal=terminal, max_concurrent=1)
 
-    await run.go()
+    await run(ctx)
 
-    assert LABEL in terminal.frames[0]
-    assert "read app/build.gradle.kts" not in terminal.frames[0]
+    assert terminal.frames[0].strip() == ""
+    assert LABEL in terminal.frames[1]
+    assert "T-01" not in terminal.frames[1]
+    assert any("T-01" in frame for frame in terminal.frames)
+
+
+async def test_interview_activity_reaches_the_session_header(repo: Path) -> None:
+    """The activity writer the interview is given lands on the header it draws."""
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    runner = WritingAgentRunner(
+        FakeAgentRunner(
+            opening(
+                ticket_json("T-01", "Add auth", ("auth.py",)),
+                implement=ScriptedRun("done"),
+                **clean_review(),
+            )
+            | {
+                "interview": ScriptedRun(
+                    "noted",
+                    activity=("read app/build.gradle.kts",),
+                    calls=(("save_spec", {"content": "# Add auth\n"}),),
+                )
+            }
+        )
+    )
+    ctx = context(repo, agent=runner, terminal=terminal, max_concurrent=1)
+
+    await run(ctx)
+
+    assert "read app/build.gradle.kts" not in terminal.frames[1]
     assert any(
         LABEL in frame and "read app/build.gradle.kts" in frame for frame in terminal.frames
     )
 
 
-def test_preflight_refuses_a_dirty_repo(tmp_path: Path, repo: Path) -> None:
-    start(repo)
-    (repo / "dirty.txt").write_text("oops\n", encoding="utf-8")
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    d = deps(repo, home, trees, FakeAgentRunner(), HeadlessTerminal())
-    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+async def test_an_interview_that_saves_no_spec_stops_the_run(repo: Path) -> None:
+    """A missing spec is a run that stopped short, not an empty one to carry on with."""
+    feature(repo)
+    terminal = HeadlessTerminal()
+    runner = FakeAgentRunner({"interview": ScriptedRun("I have some thoughts.")})
+    ctx = context(repo, agent=runner, terminal=terminal)
 
-    with pytest.raises(PreflightError):
-        run.preflight()
+    with pytest.raises(InterviewIncompleteError):
+        await run(ctx)
 
-
-def test_preflight_refuses_main(tmp_path: Path, repo: Path) -> None:
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    d = deps(repo, home, trees, FakeAgentRunner(), HeadlessTerminal())
-    run = Run(d, "main-run", "Add auth please", max_concurrent=1)
-
-    with pytest.raises(PreflightError):
-        run.preflight()
+    assert ctx.vcs.branches(paths.branch_namespace(LABEL)) == ()
 
 
-def test_preflight_refuses_a_label_already_in_use(tmp_path: Path, repo: Path) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    d = deps(repo, home, trees, FakeAgentRunner(), HeadlessTerminal())
-    d.store.write("spec.md", "already started\n")
-    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
-
-    with pytest.raises(PreflightError):
-        run.preflight()
+# -- preflight is a run's first line -------------------------------------------
 
 
-def test_preflight_allows_a_label_that_matches_the_current_branch(
-    tmp_path: Path, repo: Path
+async def test_a_run_refuses_to_start_before_it_touches_the_agent_or_the_terminal(
+    repo: Path,
 ) -> None:
-    """A person may reasonably pass `--name` matching the branch they are
-    standing on, so the label can name a real ref: their own branch. That
-    must not read as "already in use" — only leftover `agl/<label>/*` branches
-    or run state should.
-    """
-    start(repo, name=LABEL)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    d = deps(repo, home, trees, FakeAgentRunner(), HeadlessTerminal())
-    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+    """`preflight` is the first line of `run`, and its own cases live in
+    `tests/runtime/test_context.py`. What is under test here is only that a
+    workflow calls it before doing anything at all."""
+    feature(repo)
+    (repo / "dirty.txt").write_text("oops\n", encoding="utf-8")
+    terminal = HeadlessTerminal()
+    runner = FakeAgentRunner()
+    ctx = context(repo, agent=runner, terminal=terminal)
 
-    run.preflight()
+    with pytest.raises(PreflightError):
+        await run(ctx)
+
+    assert runner.specs == []
+    assert terminal.frames == []
 
 
-# -- four tickets, one dependency edge ---------------------------------------
+# -- four tickets, one dependency edge -----------------------------------------
 
 
-async def test_four_tickets_with_a_dependency_edge(tmp_path: Path, repo: Path) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
-    tickets = [
-        ticket_json("T1", "One", ("t1.py",)),
-        ticket_json("T2", "Two", ("t2.py",)),
-        ticket_json("T3", "Three", ("t3.py",)),
-        ticket_json("T4", "Four", ("t4.py",), blocked_by=("T3",)),
-    ]
-    fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
-            **clean_review(),
-        }
+async def test_four_tickets_with_a_dependency_edge(repo: Path) -> None:
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    writer = WritingAgentRunner(
+        FakeAgentRunner(
+            opening(
+                ticket_json("T1", "One", ("t1.py",)),
+                ticket_json("T2", "Two", ("t2.py",)),
+                ticket_json("T3", "Three", ("t3.py",)),
+                ticket_json("T4", "Four", ("t4.py",), blocked_by=("T3",)),
+                implement=ScriptedRun("done"),
+                **clean_review(),
+            )
+        )
     )
-    writer = WritingAgentRunner(fake)
-    d = deps(repo, home, trees, writer, terminal)
-    run = Run(d, LABEL, "do four things", max_concurrent=2)
+    ctx = context(repo, agent=writer, terminal=terminal, max_concurrent=2)
 
-    await run.go()
+    await run(ctx)
 
-    for ticket_id in ("T1", "T2", "T3", "T4"):
-        assert run.state.tickets[ticket_id].status is Status.MERGED
-        assert (repo / f"{ticket_id}.txt").read_text(encoding="utf-8") == f"{ticket_id}\n"
-    assert run.state.dag.is_complete()
-    check_consistent(run.state)
+    assert landed(repo, "T1", "T2", "T3", "T4")
+    assert worktrees_of(ctx) == [repo.resolve()]
     assert writer.implemented.index("T3") < writer.implemented.index("T4")
 
 
-# -- a review that finds bugs -------------------------------------------------
+# -- a review that finds bugs --------------------------------------------------
 
 
-async def test_review_findings_file_bugs_that_run_before_the_parent_merges(
-    tmp_path: Path, repo: Path
-) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+async def test_review_findings_file_bugs_that_run_before_the_parent_merges(repo: Path) -> None:
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
     fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
-            "review-quality": findings_result(),
-            "triage": groups_result(
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **{"review-quality": findings_result()},
+            triage=groups_result(
                 group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
                 group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
             ),
-        }
+        )
     )
     spec_queues = {
         "T-01": [
@@ -423,62 +468,50 @@ async def test_review_findings_file_bugs_that_run_before_the_parent_merges(
         "T-01-bug-3": [findings_result()],
     }
     writer = WritingAgentRunner(fake)
-    scripted = ScriptedByTicket(writer, "review-spec", spec_queues)
-    d = deps(repo, home, trees, scripted, terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
+    ctx = context(
+        repo,
+        agent=ScriptedByTicket(writer, "review-spec", spec_queues),
+        terminal=terminal,
+        max_concurrent=2,
+    )
 
-    await run.go()
+    await run(ctx)
 
-    assert run.state.tickets["T-01"].status is Status.MERGED
-    for bug_id in ("T-01-bug-1", "T-01-bug-2", "T-01-bug-3"):
-        assert run.state.tickets[bug_id].status is Status.MERGED
-    assert run.state.dag.is_complete()
-    check_consistent(run.state)
+    assert landed(repo, "T-01", "T-01-bug-1", "T-01-bug-2", "T-01-bug-3")
+    assert worktrees_of(ctx) == [repo.resolve()]
 
     # The parent's second and third passes ran no implementation agent.
     assert writer.implemented.count("T-01") == 1
 
-    # The second round of bugs did not reuse the first round's ids.
-    assert set(run.state.tickets) == {"T-01", "T-01-bug-1", "T-01-bug-2", "T-01-bug-3"}
+    # The second round of bugs did not reuse the first round's ids, and no
+    # fourth round was ever opened.
+    assert not (repo / "T-01-bug-4.txt").exists()
 
     # Triage ran once — for the two-high round. One high skips it, zero skips it.
-    triage_specs = [s for s in fake.specs if s.role == "triage"]
-    assert len(triage_specs) == 1
-
-    assert (repo / "T-01.txt").read_text(encoding="utf-8") == "T-01\n"
-    for bug_id in ("T-01-bug-1", "T-01-bug-2", "T-01-bug-3"):
-        assert (repo / f"{bug_id}.txt").read_text(encoding="utf-8") == f"{bug_id}\n"
-    assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
+    assert len([s for s in fake.specs if s.role == "triage"]) == 1
 
 
-# -- a question mid-run -------------------------------------------------------
+# -- a question mid-run --------------------------------------------------------
 
 
 async def test_a_question_mid_run_reaches_the_terminal_and_shows_awaiting_input(
-    tmp_path: Path, repo: Path
+    repo: Path,
 ) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
+    feature(repo)
     question = AgentQuestion(
         title="Which token store?", options=(AgentOption("memory", "In process"),)
     )
-    terminal = HeadlessTerminal(
-        answers=[Answer("approve", was_free_text=False), Answer("memory", was_free_text=False)]
-    )
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    terminal = HeadlessTerminal(answers=[APPROVE, Answer("memory", was_free_text=False)])
     fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done", question=question),
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done", question=question),
             **clean_review(),
-        }
+        )
     )
-    writer = WritingAgentRunner(fake)
-    d = deps(repo, home, trees, writer, terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=1)
+    ctx = context(repo, agent=WritingAgentRunner(fake), terminal=terminal, max_concurrent=1)
 
-    await run.go()
+    await run(ctx)
 
     assert fake.answers == ["memory"]
     assert [q.title for q in terminal.questions] == [
@@ -486,137 +519,189 @@ async def test_a_question_mid_run_reaches_the_terminal_and_shows_awaiting_input(
         "Which token store?",
     ]
     assert any("waiting for you" in frame for frame in terminal.frames)
-    assert run.state.tickets["T-01"].status is Status.MERGED
-    check_consistent(run.state)
+    assert landed(repo, "T-01")
 
 
-# -- a merge conflict halts the run -------------------------------------------
+# -- a merge conflict halts the run --------------------------------------------
 
 
-async def test_a_merge_conflict_halts_the_run(tmp_path: Path, repo: Path) -> None:
-    start(repo)
+async def test_a_merge_conflict_halts_the_run_and_resuming_finishes_it(repo: Path) -> None:
+    feature(repo)
     (repo / "shared.py").write_text("MODE = 'off'\n", encoding="utf-8")
     git(repo, "add", "shared.py")
     git(repo, "commit", "-m", "add shared.py")
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    ready = asyncio.Event()
-    terminal = GatedTerminal(ready, answers=[Answer("approve", was_free_text=False)])
-    tickets = [
-        ticket_json("T1", "One", ("shared.py",)),
-        ticket_json("T2", "Two", ("shared.py",)),
-        ticket_json("T3", "Three", ("t3.py",), blocked_by=("T2",)),
-    ]
+    gate = Gate()
+    terminal = GatedTerminal(gate, answers=[APPROVE])
     fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
+        opening(
+            ticket_json("T1", "One", ("shared.py",)),
+            ticket_json("T2", "Two", ("shared.py",)),
+            ticket_json("T3", "Three", ("t3.py",), blocked_by=("T2",)),
+            implement=ScriptedRun("done"),
             **clean_review(),
-        }
+        )
     )
     overrides = {"T1": ("shared.py", "MODE = 'ours'\n"), "T2": ("shared.py", "MODE = 'theirs'\n")}
-    writer = WritingAgentRunner(fake, overrides)
-    d = deps(repo, home, trees, writer, terminal)
-    run = Run(d, LABEL, "conflict please", max_concurrent=2)
+    ctx = context(
+        repo,
+        agent=WritingAgentRunner(fake, overrides),
+        terminal=terminal,
+        max_concurrent=2,
+    )
 
-    task = asyncio.create_task(run.go())
+    task = asyncio.create_task(run(ctx))
     async with asyncio.timeout(10.0):
-        while run.state.halt is None:
-            await asyncio.sleep(0.01)
+        await gate.asked.wait()
 
     # Nothing new started: T3 waits on T2, which is stuck mid-merge.
-    assert run.state.tickets["T3"].status is Status.PENDING
-    merged = {tid for tid in ("T1", "T2") if run.state.tickets[tid].status is Status.MERGED}
-    assert len(merged) == 1
-    conflicted = "T2" if "T1" in merged else "T1"
+    assert not (repo / "t3.txt").exists()
+    assert not (repo / "T3.txt").exists()
+    assert any("conflicts with the base branch" in frame for frame in terminal.frames)
 
     # A person resolves it in the repository root, the way the halt says to,
     # then presses enter — modelled as answering only once that has happened.
     (repo / "shared.py").write_text("MODE = 'resolved'\n", encoding="utf-8")
-    d.vcs.commit_merge(repo, f"merge {conflicted}")
+    ctx.vcs.commit_merge(repo, "merge the conflicted ticket")
     terminal.queue(Answer("continue", was_free_text=False))
-    ready.set()
+    gate.ready.set()
 
     async with asyncio.timeout(10.0):
         await task
 
-    assert run.state.tickets["T1"].status is Status.MERGED
-    assert run.state.tickets["T2"].status is Status.MERGED
-    assert run.state.tickets["T3"].status is Status.MERGED
-    assert run.state.dag.is_complete()
-    check_consistent(run.state)
-    assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
+    assert landed(repo, "T3")
+    assert (repo / "shared.py").read_text(encoding="utf-8") == "MODE = 'resolved'\n"
+    assert worktrees_of(ctx) == [repo.resolve()]
 
 
-# -- bug merges go through the queue too --------------------------------------
+async def test_a_non_resumable_merge_halt_ends_the_run_rather_than_hanging(repo: Path) -> None:
+    """A halt nobody can press enter on still has to end the run.
+
+    The build command does not exist, so the gate raises rather than returning
+    a failed result — a halt this run marks non-resumable. Nothing will ever
+    resume it, so the ticket waiting on that merge has to be told the answer is
+    "never" instead of waiting for a resolution that cannot come. `run` reports
+    it by raising, which is the whole of a run's exit status.
+    """
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    fake = FakeAgentRunner(
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **clean_review(),
+        )
+    )
+    ctx = context(
+        repo,
+        agent=WritingAgentRunner(fake),
+        terminal=terminal,
+        max_concurrent=1,
+        build=(str(repo / "no-such-build"),),
+    )
+
+    async with asyncio.timeout(10.0):
+        with pytest.raises(HaltedError) as raised:
+            await run(ctx)
+
+    assert raised.value.halt.resumable is False
+    assert "T-01" in raised.value.halt.reason
+    # The git merge itself landed; the gate behind it did not, so the ticket
+    # never became `MERGED` and the last frame still shows it merging.
+    assert not any("merged" in frame for frame in terminal.frames)
+    assert "merging" in terminal.frames[-1]
+
+
+async def test_a_halted_run_leaves_the_worktree_where_it_is(repo: Path) -> None:
+    """Anything but a merged ticket keeps its tree, so a person can look at it."""
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    fake = FakeAgentRunner(
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **clean_review(),
+        )
+    )
+    ctx = context(
+        repo,
+        agent=WritingAgentRunner(fake),
+        terminal=terminal,
+        max_concurrent=1,
+        build=(str(repo / "no-such-build"),),
+    )
+
+    with pytest.raises(HaltedError):
+        await run(ctx)
+
+    kept = [w.path for w in ctx.vcs.list_worktrees() if w.path != repo.resolve()]
+    assert len(kept) == 1
+    assert (kept[0] / "T-01.txt").exists()
+
+
+# -- bug merges go through the queue too ---------------------------------------
 
 
 async def test_a_bug_tickets_merge_goes_through_the_queue(
-    tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
+    repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(workflow_module, "MergeQueue", RecordingQueue)
+    seen: list[MergeRequest] = []
+    monkeypatch.setattr(workflow_module, "MergeQueue", recording_queue(seen))
 
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    terminal = HeadlessTerminal(answers=[Answer("approve", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[APPROVE])
     fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
-            "review-quality": findings_result(),
-            "triage": groups_result(group()),
-        }
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **{"review-quality": findings_result()},
+            triage=groups_result(group()),
+        )
     )
     spec_queues = {
         "T-01": [findings_result(finding()), findings_result()],
         "T-01-bug-1": [findings_result()],
     }
     writer = WritingAgentRunner(fake)
-    scripted = ScriptedByTicket(writer, "review-spec", spec_queues)
-    d = deps(repo, home, trees, scripted, terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
+    ctx = context(
+        repo,
+        agent=ScriptedByTicket(writer, "review-spec", spec_queues),
+        terminal=terminal,
+        max_concurrent=2,
+    )
 
-    await run.go()
+    await run(ctx)
 
-    assert run.state.tickets["T-01"].status is Status.MERGED
-    assert run.state.tickets["T-01-bug-1"].status is Status.MERGED
-    assert isinstance(run.merge_queue, RecordingQueue)
-    ticket_ids = [r.ticket_id for r in run.merge_queue.seen]
-    assert ticket_ids == ["T-01-bug-1", "T-01"]
+    assert landed(repo, "T-01", "T-01-bug-1")
+    assert [request.key for request in seen] == ["T-01-bug-1", "T-01"]
 
-    bug_request = run.merge_queue.seen[0]
+    bug_request = seen[0]
     assert bug_request.target == paths.branch(LABEL, "T-01")
-    assert bug_request.cwd != d.config.repo.resolve()
+    assert bug_request.cwd != ctx.project.repo.resolve()
 
-    feature_request = run.merge_queue.seen[1]
+    feature_request = seen[1]
     assert feature_request.target == "feature"
-    assert feature_request.cwd == d.config.repo
+    assert feature_request.cwd == ctx.project.repo
 
 
 async def test_a_bug_merge_conflict_halts_resumably_and_resuming_lets_the_parent_merge(
-    tmp_path: Path, repo: Path
+    repo: Path,
 ) -> None:
-    start(repo)
+    feature(repo)
     (repo / "shared.py").write_text("MODE = 'off'\n", encoding="utf-8")
     git(repo, "add", "shared.py")
     git(repo, "commit", "-m", "add shared.py")
-    home, trees = tmp_path / "home", tmp_path / "trees"
-    ready = asyncio.Event()
-    terminal = GatedTerminal(ready, answers=[Answer("approve", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
+    gate = Gate()
+    terminal = GatedTerminal(gate, answers=[APPROVE])
     fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-            "implement": ScriptedRun("done"),
-            "review-quality": findings_result(),
-            "triage": groups_result(
+        opening(
+            ticket_json("T-01", "Add auth", ("auth.py",)),
+            implement=ScriptedRun("done"),
+            **{"review-quality": findings_result()},
+            triage=groups_result(
                 group(title="Fix S-1", deliverables=["Fix it."], findings=["S-1"]),
                 group(title="Fix S-2", deliverables=["Fix it too."], findings=["S-2"]),
             ),
-        }
+        )
     )
     spec_queues = {
         "T-01": [
@@ -634,107 +719,340 @@ async def test_a_bug_merge_conflict_halts_resumably_and_resuming_lets_the_parent
         "T-01-bug-2": ("shared.py", "MODE = 'theirs'\n"),
     }
     writer = WritingAgentRunner(fake, overrides)
-    scripted = ScriptedByTicket(writer, "review-spec", spec_queues)
-    d = deps(repo, home, trees, scripted, terminal)
-    run = Run(d, LABEL, "conflict please", max_concurrent=2)
+    ctx = context(
+        repo,
+        agent=ScriptedByTicket(writer, "review-spec", spec_queues),
+        terminal=terminal,
+        max_concurrent=2,
+    )
 
-    task = asyncio.create_task(run.go())
+    task = asyncio.create_task(run(ctx))
     async with asyncio.timeout(10.0):
-        while run.state.halt is None:
-            await asyncio.sleep(0.01)
+        await gate.asked.wait()
 
-    bug_ids = ("T-01-bug-1", "T-01-bug-2")
-    merged = {tid for tid in bug_ids if run.state.tickets[tid].status is Status.MERGED}
-    assert len(merged) == 1
-    conflicted = "T-01-bug-2" if "T-01-bug-1" in merged else "T-01-bug-1"
-    assert run.state.halt is not None
-    assert run.state.halt.resumable is True
-
+    # The conflict is in the parent's worktree — the repository root was never
+    # touched by this merge — which is where the halt sends a person.
     parent_branch = paths.branch(LABEL, "T-01")
-    parent_tree = next(w.path for w in d.vcs.list_worktrees() if w.branch == parent_branch)
+    parent_tree = next(w.path for w in ctx.vcs.list_worktrees() if w.branch == parent_branch)
+    assert (repo / "shared.py").read_text(encoding="utf-8") == "MODE = 'off'\n"
 
-    # A person resolves it in the parent's worktree — not the repository root,
-    # which was never touched by this merge — then presses enter.
     (parent_tree / "shared.py").write_text("MODE = 'resolved'\n", encoding="utf-8")
-    d.vcs.commit_merge(parent_tree, f"merge {conflicted}")
+    ctx.vcs.commit_merge(parent_tree, "merge the conflicted bug")
     terminal.queue(Answer("continue", was_free_text=False))
-    ready.set()
+    gate.ready.set()
 
     async with asyncio.timeout(10.0):
         await task
 
-    assert run.state.tickets["T-01-bug-1"].status is Status.MERGED
-    assert run.state.tickets["T-01-bug-2"].status is Status.MERGED
-    assert run.state.tickets["T-01"].status is Status.MERGED
-    assert run.state.dag.is_complete()
-    check_consistent(run.state)
-    assert [w.path for w in d.vcs.list_worktrees()] == [repo.resolve()]
+    assert landed(repo, "T-01")
+    assert (repo / "shared.py").read_text(encoding="utf-8") == "MODE = 'resolved'\n"
+    assert worktrees_of(ctx) == [repo.resolve()]
 
 
-# -- decompose: revise and abort ----------------------------------------------
+# -- decompose: propose, approve, revise, abort --------------------------------
+#
+# The loop's own shape, driven directly rather than through a whole run. What is
+# under test is the loop, not the agent or the terminal.
 
 
-async def test_decompose_revision_sends_the_free_text_back_and_calls_the_agent_again(
-    tmp_path: Path, repo: Path
-) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
+async def decompose_with(ctx: RunContext, terminal: HeadlessTerminal) -> tuple[Ticket, ...]:
+    """`decompose`, over a display opened the way `run` opens one."""
+    board = Board(started_at=NOW)
+    async with live(terminal, board) as display:
+        return await workflow_module.decompose(ctx, display, board)
+
+
+def a_decompose_run(*tickets: dict[str, Any], **extra: Any) -> ScriptedRun:
+    return ScriptedRun("planned", calls=(("save_tickets", {"tickets": list(tickets)}),), **extra)
+
+
+def spec_in(ctx: RunContext) -> RunContext:
+    ctx.store.write("spec.md", "# spec\n")
+    return ctx
+
+
+async def test_approving_the_first_proposal_returns_it(repo: Path) -> None:
+    terminal = HeadlessTerminal(answers=[APPROVE])
+    ctx = spec_in(
+        context(
+            repo,
+            agent=FakeAgentRunner(
+                {"decompose": a_decompose_run(ticket_json("T-01", "Add auth", ("auth.py",)))}
+            ),
+            terminal=terminal,
+        )
+    )
+
+    result = await decompose_with(ctx, terminal)
+
+    assert [t.id for t in result] == ["T-01"]
+    assert terminal.questions[0].title == "Approve these 1 tickets?"
+
+
+async def test_a_revision_is_appended_to_the_spec_and_decompose_runs_again(repo: Path) -> None:
     terminal = HeadlessTerminal(
         answers=[
             Answer("split them into two tickets", was_free_text=True),
-            Answer("approve", was_free_text=False),
+            APPROVE,
         ]
     )
-    first = [ticket_json("T-01", "Add auth", ("auth.py",))]
-    second = [
-        ticket_json("T-01", "Add token issuing", ("auth.py",)),
-        ticket_json("T-02", "Add token checking", ("check.py",)),
-    ]
-    fake = FakeAgentRunner(
+    agent = FakeAgentRunner(
         [
-            ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            ScriptedRun("planned", calls=(("save_tickets", {"tickets": first}),)),
+            a_decompose_run(ticket_json("T-01", "Add auth", ("auth.py",))),
             ScriptedRun(
                 "replanned",
-                calls=(("read_spec", {}), ("save_tickets", {"tickets": second})),
+                calls=(
+                    ("read_spec", {}),
+                    (
+                        "save_tickets",
+                        {
+                            "tickets": [
+                                ticket_json("T-01", "Add token issuing", ("auth.py",)),
+                                ticket_json("T-02", "Add token checking", ("check.py",)),
+                            ]
+                        },
+                    ),
+                ),
             ),
-            ScriptedRun("done"),
-            ScriptedRun("done"),
-            findings_result(),
-            findings_result(),
-            findings_result(),
-            findings_result(),
         ]
     )
-    writer = WritingAgentRunner(fake)
-    d = deps(repo, home, trees, writer, terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
+    ctx = spec_in(context(repo, agent=agent, terminal=terminal))
 
-    await run.go()
+    result = await decompose_with(ctx, terminal)
 
-    assert set(run.state.tickets) == {"T-01", "T-02"}
-    assert any("split them into two tickets" in result.text for result in fake.tool_results)
-    check_consistent(run.state)
+    assert {t.id for t in result} == {"T-01", "T-02"}
+    # The feedback went into the spec, and the second call read it back from
+    # there rather than being handed it directly.
+    assert "## Decomposition feedback" in ctx.store.read("spec.md")
+    assert any("split them into two tickets" in result.text for result in agent.tool_results)
 
 
-def test_decompose_abort_exits_without_creating_worktrees_or_branches(
-    tmp_path: Path, repo: Path
-) -> None:
-    start(repo)
-    home, trees = tmp_path / "home", tmp_path / "trees"
+async def test_aborting_raises_without_returning_any_tickets(repo: Path) -> None:
     terminal = HeadlessTerminal(answers=[Answer("abort", was_free_text=False)])
-    tickets = [ticket_json("T-01", "Add auth", ("auth.py",))]
-    fake = FakeAgentRunner(
-        {
-            "interview": ScriptedRun("noted", calls=(("save_spec", {"content": "# spec\n"}),)),
-            "decompose": ScriptedRun("planned", calls=(("save_tickets", {"tickets": tickets}),)),
-        }
+    ctx = spec_in(
+        context(
+            repo,
+            agent=FakeAgentRunner(
+                {"decompose": a_decompose_run(ticket_json("T-01", "Add auth", ("auth.py",)))}
+            ),
+            terminal=terminal,
+        )
     )
-    d = deps(repo, home, trees, WritingAgentRunner(fake), terminal)
-    run = Run(d, LABEL, "Add auth please", max_concurrent=2)
 
     with pytest.raises(DecomposeAbortedError):
-        asyncio.run(run.go())
+        await decompose_with(ctx, terminal)
 
-    assert d.vcs.list_worktrees() == (d.vcs.list_worktrees()[0],)
-    assert d.vcs.branches(paths.branch_namespace(LABEL)) == ()
+
+async def test_the_first_decompose_frame_has_no_tickets_and_no_activity_yet(repo: Path) -> None:
+    """The state during the first seconds of the stage: a header, nothing else."""
+    terminal = HeadlessTerminal(answers=[APPROVE], clock=lambda: NOW)
+    ctx = spec_in(
+        context(
+            repo,
+            agent=FakeAgentRunner(
+                {"decompose": a_decompose_run(ticket_json("T-01", "Add auth", ("auth.py",)))}
+            ),
+            terminal=terminal,
+        )
+    )
+
+    await decompose_with(ctx, terminal)
+
+    first = next(frame for frame in terminal.frames if frame.strip())
+    assert LABEL in first
+    assert "T-01" not in first
+
+
+async def test_decompose_activity_reaches_the_header_above_the_ticket_list(repo: Path) -> None:
+    terminal = HeadlessTerminal(answers=[APPROVE], clock=lambda: NOW)
+    ctx = spec_in(
+        context(
+            repo,
+            agent=FakeAgentRunner(
+                {
+                    "decompose": a_decompose_run(
+                        ticket_json("T-01", "Add auth", ("auth.py",)),
+                        activity=("reading spec.md",),
+                    )
+                }
+            ),
+            terminal=terminal,
+        )
+    )
+
+    await decompose_with(ctx, terminal)
+
+    frame = next(f for f in terminal.frames if "T-01" in f)
+    assert LABEL in frame
+    assert "reading spec.md" in frame
+    assert "T-01: Add auth" in frame
+
+
+async def test_a_run_aborted_at_decompose_creates_no_worktrees_or_branches(repo: Path) -> None:
+    feature(repo)
+    terminal = HeadlessTerminal(answers=[Answer("abort", was_free_text=False)])
+    ctx = context(
+        repo,
+        agent=FakeAgentRunner(opening(ticket_json("T-01", "Add auth", ("auth.py",)))),
+        terminal=terminal,
+        max_concurrent=2,
+    )
+
+    with pytest.raises(DecomposeAbortedError):
+        await run(ctx)
+
+    assert worktrees_of(ctx) == [repo.resolve()]
+    assert ctx.vcs.branches(paths.branch_namespace(LABEL)) == ()
+
+
+# -- this run's policy, as functions -------------------------------------------
+
+
+def a_state(*tickets: Ticket) -> RunState:
+    state = RunState(LABEL, "feature", Board(started_at=NOW))
+    if tickets:
+        state.add(tickets, now=NOW)
+    return state
+
+
+def a_ticket(ticket_id: str, parent: str | None = None) -> Ticket:
+    return Ticket(
+        id=ticket_id,
+        title=f"Do {ticket_id}",
+        status=Status.PENDING,
+        deliverables=(f"{ticket_id}.py",),
+        parent=parent,
+    )
+
+
+def a_loop(ctx: RunContext, display: Display, state: RunState) -> Loop:
+    trees = Worktrees(
+        ctx.vcs, trees_root=ctx.project.trees_root, project=ctx.project.name, label=ctx.label
+    )
+    return Loop(ctx, display, state, trees, MergeQueue(ctx.vcs, MergeConfig()))
+
+
+async def test_resolve_holds_the_run_at_a_resumable_halt_and_then_retries(repo: Path) -> None:
+    """A conflict is shown, a person is asked, and the halt is cleared to retry."""
+    terminal = HeadlessTerminal(answers=[Answer("continue", was_free_text=False)])
+    state = a_state(a_ticket("T-01"))
+    outcome = MergeOutcome("T-01", MergeStatus.CONFLICT, conflicted=("shared.py",))
+
+    async with live(terminal, state.board) as display:
+        decision = await resolve(display, state, LABEL, outcome)
+
+    assert decision is MergeDecision.RETRY
+    assert state.halt is None
+    assert state.is_halted() is False
+    assert [q.title for q in terminal.questions] == [GATE]
+
+
+async def test_resolve_stops_the_queue_on_a_halt_nobody_can_act_on(repo: Path) -> None:
+    """Nothing to press enter on, so the halt stays set and the queue ends."""
+    terminal = HeadlessTerminal()
+    state = a_state(a_ticket("T-01"))
+    outcome = MergeOutcome("T-01", MergeStatus.VCS_ERROR, error="refusing to merge")
+
+    async with live(terminal, state.board) as display:
+        decision = await resolve(display, state, LABEL, outcome)
+
+    assert decision is MergeDecision.STOP
+    assert state.halt is not None
+    assert state.halt.resumable is False
+    assert state.is_halted() is True
+    assert terminal.questions == []
+
+
+def test_failed_names_the_node_and_is_not_resumable() -> None:
+    state = a_state(a_ticket("T-01"))
+
+    failed(state, "T-01", RuntimeError("the agent blew up"))
+
+    assert state.halt is not None
+    assert "T-01" in state.halt.reason
+    assert "the agent blew up" in state.halt.reason
+    assert state.halt.resumable is False
+
+
+def test_failed_without_a_node_blames_the_run_itself() -> None:
+    state = a_state()
+
+    failed(state, None, RuntimeError("the loop blew up"))
+
+    assert state.halt is not None
+    assert "the run" in state.halt.reason
+    assert state.halt.resumable is False
+
+
+async def test_a_feature_branches_off_the_runs_base_and_a_bug_off_its_parent(
+    repo: Path,
+) -> None:
+    """The one piece of ticket knowledge the worktree pool was not given."""
+    feature(repo)
+    terminal = HeadlessTerminal()
+    ctx = context(repo, terminal=terminal)
+    state = a_state(a_ticket("T-01"))
+    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
+    state.set_status("T-01", Status.IN_REVIEW, now=NOW)
+    state.file_bugs("T-01", [a_ticket("T-01-bug-1", parent="T-01")], now=NOW)
+
+    async with live(terminal, state.board) as display:
+        loop = a_loop(ctx, display, state)
+        assert base_for(loop, state.tickets["T-01"]) == "feature"
+        assert base_for(loop, state.tickets["T-01-bug-1"]) == paths.branch(LABEL, "T-01")
+
+
+class WatchingTerminal(HeadlessTerminal):
+    """Reads the run's state at the moment a question is put to a person.
+
+    What `asker` guarantees holds only while the question is open, which is
+    gone by the time the call returns — so it is looked at from here.
+    """
+
+    def __init__(self, watch: Callable[[], None], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._watch = watch
+
+    def answer(self, question: Question) -> Answer:
+        self._watch()
+        return super().answer(question)
+
+
+async def test_asker_suspends_only_its_own_ticket_and_puts_it_back() -> None:
+    """Two tickets in flight; a question moves the one it belongs to and no other."""
+    seen: list[tuple[Status, Status]] = []
+    state = a_state(a_ticket("T-01"), a_ticket("T-02"))
+    terminal = WatchingTerminal(
+        lambda: seen.append((state.tickets["T-01"].status, state.tickets["T-02"].status)),
+        answers=[Answer("memory", was_free_text=False)],
+    )
+    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
+    state.set_status("T-02", Status.IN_PROGRESS, now=NOW)
+
+    async with live(terminal, state.board) as display:
+        answer = await asker(state, display, "T-01")(
+            AgentQuestion(title="Which store?", options=(AgentOption("memory", "In process"),))
+        )
+
+    assert answer == "memory"
+    assert seen == [(Status.AWAITING_INPUT, Status.IN_PROGRESS)]
+    assert state.tickets["T-01"].status is Status.IN_PROGRESS
+    assert terminal.questions[0].header == "T-01"
+    state.check_consistent()
+
+
+async def test_a_question_that_fails_still_gives_the_ticket_back() -> None:
+    """The resume is in a `finally`: a ticket is no longer waiting on anybody."""
+    terminal = HeadlessTerminal()
+    state = a_state(a_ticket("T-01"))
+    state.set_status("T-01", Status.IN_PROGRESS, now=NOW)
+    state.set_status("T-01", Status.IN_REVIEW, now=NOW)
+
+    async with live(terminal, state.board) as display:
+        ask = asker(state, display, "T-01")
+        with pytest.raises(AssertionError):
+            # `HeadlessTerminal` fails loudly with no scripted answer left.
+            await ask(AgentQuestion(title="Which store?", options=()))
+
+    assert state.tickets["T-01"].status is Status.IN_REVIEW
+    state.check_consistent()

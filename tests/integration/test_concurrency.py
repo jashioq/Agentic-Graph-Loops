@@ -28,10 +28,10 @@ from typing import Any
 
 import pytest
 
-from agl.core import paths
 from agl.core.agent import NO_PARAMS, AgentSpec, Tool
-from agl.core.dag import Dag, NodeId
 from agl.core.vcs.impl.git import Git
+from agl.runtime import paths
+from agl.runtime.dag import Dag, NodeId
 from tests.fakes import FakeAgentRunner, ScriptedRun
 from tests.integration.conftest import PROJECT, copy_repo
 

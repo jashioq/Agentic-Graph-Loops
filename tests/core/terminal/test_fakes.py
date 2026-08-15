@@ -99,6 +99,33 @@ async def test_it_records_every_frame_plus_one_on_entry_and_exit() -> None:
     assert len(terminal.frames) == 4
 
 
+async def test_show_swaps_the_screen_and_records_the_new_frame() -> None:
+    terminal = HeadlessTerminal(clock=lambda: 0.0)
+    async with terminal.live(build_screen) as session:
+        session.show(lambda: Screen(Rows(Row(Text("approval")))))
+
+    assert "T-01  merged" in terminal.frames[0]
+    assert terminal.frames[1].strip() == "approval"
+
+
+async def test_frames_after_show_come_from_the_screen_it_installed() -> None:
+    terminal = HeadlessTerminal(clock=lambda: 0.0)
+    async with terminal.live(build_screen) as session:
+        session.show(lambda: Screen(Rows(Row(Text("approval")))))
+        assert session.frame().strip() == "approval"
+
+    assert terminal.frames[-1].strip() == "approval"
+
+
+async def test_a_session_can_start_blank_and_be_given_a_screen_later() -> None:
+    terminal = HeadlessTerminal(clock=lambda: 0.0)
+    async with terminal.live() as session:
+        assert terminal.frames[0].strip() == ""
+        session.show(build_screen)
+
+    assert "T-01  merged" in terminal.frames[1]
+
+
 async def test_frames_track_changing_state() -> None:
     status = "pending"
 
