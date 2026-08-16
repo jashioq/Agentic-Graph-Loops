@@ -20,14 +20,18 @@ import pytest
 from agl.core.agent import AgentSpec, Tool
 from agl.core.store.impl.file_store import FileStore
 from agl.runtime.record import STATE_KEY, StateFile
-from agl.workflows.tickets.models import TICKETS_SCHEMA, Status, Ticket, tickets_from_json
-from agl.workflows.tickets.reviews import Finding, Severity, review_key
-from agl.workflows.tickets.snapshot import RunFile
-from agl.workflows.tickets.state import Run, with_bugs, with_tickets
-from agl.workflows.tickets.tools import (
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.documents.store_keys import (
     SPEC_KEY,
     STANDARDS_KEY,
     TICKETS_KEY,
+    review_key,
+)
+from agl.workflows.tickets.documents.tickets_document import TICKETS_SCHEMA, tickets_from_json
+from agl.workflows.tickets.findings import Finding, Severity
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import Run, with_bugs, with_tickets
+from agl.workflows.tickets.tools import (
     decompose_tools,
     get_ticket,
     implement_tools,
@@ -106,7 +110,7 @@ def store(tmp_path: Path) -> FileStore:
     store.write(SPEC_KEY, SPEC)
     store.write(STANDARDS_KEY, STANDARDS)
     store.write_json(TICKETS_KEY, PAYLOAD)
-    RunFile(StateFile(store)).write(a_run())
+    StateDocument(StateFile(store)).write(a_run())
     return store
 
 
@@ -232,7 +236,7 @@ async def test_get_ticket_reads_the_state_at_call_time(store: FileStore) -> None
     # Not a snapshot taken when the tool was built: a ticket the run has since
     # edited — another round of bugs filed against it — reads as it is now.
     tool = get_ticket(store, "T-03")
-    state = RunFile(StateFile(store))
+    state = StateDocument(StateFile(store))
     second = Ticket(
         id="T-03-bug-2",
         title="Log the failure",

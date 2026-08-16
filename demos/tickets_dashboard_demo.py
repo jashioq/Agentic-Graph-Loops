@@ -23,8 +23,8 @@ from agl.core.terminal import Screen
 from agl.core.terminal.impl.rich_terminal import RichTerminal
 from agl.runtime.display import Board
 from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import Run, with_bugs, with_status, with_tickets
 from agl.workflows.tickets.screens import dashboard
-from agl.workflows.tickets.state import Run, with_bugs, with_status, with_tickets
 
 LABEL = "add-auth-ticket-18732"
 

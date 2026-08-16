@@ -19,9 +19,9 @@ import pytest
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
 from agl.core.vcs.impl.git import Git
+from agl.workflows.tickets.documents.store_keys import REVIEWERS, review_key
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.reviews import REVIEWERS, review_key
-from agl.workflows.tickets.state import Run, with_status, with_tickets
+from agl.workflows.tickets.run_state import Run, with_status, with_tickets
 from agl.workflows.tickets.steps import Facts, Stage, Step, look, stage_of, step_for
 from tests.conftest import commit_file, git
 

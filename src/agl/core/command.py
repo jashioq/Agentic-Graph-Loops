@@ -52,6 +52,12 @@ class ExecResult:
         command."""
         return self.code == 0
 
+    @property
+    def output(self) -> str:
+        """Both streams as one text — which one carries the diagnosis is the
+        command's choice, not the caller's."""
+        return "\n".join(stream.strip("\n") for stream in (self.stdout, self.stderr) if stream)
+
 
 class ExecError(Exception):
     """A command failed under `check=True`. Carries the `ExecResult`."""

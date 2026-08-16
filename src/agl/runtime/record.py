@@ -29,6 +29,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from agl.core.store import MissingKeyError, Store
+from agl.runtime.json_fields import as_text, as_whole_number
 
 __all__ = [
     "RUN_KEY",
@@ -95,12 +96,14 @@ def read_record(store: Store) -> RunRecord:
     payload = _read_object(store, RUN_KEY, RecordError, "record")
     _require_version(payload, RecordError, "record")
     return RunRecord(
-        workflow=_text(payload, "workflow"),
-        label=_text(payload, "label"),
-        request=_text(payload, "request"),
-        base_branch=_text(payload, "base_branch"),
-        project=_text(payload, "project"),
-        max_concurrent=_count(payload, "max_concurrent"),
+        workflow=as_text(payload.get("workflow"), "workflow", "record", RecordError),
+        label=as_text(payload.get("label"), "label", "record", RecordError),
+        request=as_text(payload.get("request"), "request", "record", RecordError),
+        base_branch=as_text(payload.get("base_branch"), "base_branch", "record", RecordError),
+        project=as_text(payload.get("project"), "project", "record", RecordError),
+        max_concurrent=as_whole_number(
+            payload.get("max_concurrent"), "max_concurrent", "record", RecordError
+        ),
     )
 
 
@@ -169,22 +172,6 @@ def _read_object(
     if not isinstance(payload, dict):
         raise error(f"{noun} at {key!r} is not a JSON object")
     return payload
-
-
-def _text(payload: Mapping[str, Any], name: str) -> str:
-    """A string field of the record, or `RecordError` naming what is wrong with it."""
-    value = payload.get(name)
-    if not isinstance(value, str):
-        raise RecordError(f"record field {name!r} is missing or not a string: {value!r}")
-    return value
-
-
-def _count(payload: Mapping[str, Any], name: str) -> int:
-    """An integer field of the record. `bool` is an `int` and is refused anyway."""
-    value = payload.get(name)
-    if not isinstance(value, int) or isinstance(value, bool):
-        raise RecordError(f"record field {name!r} is missing or not an integer: {value!r}")
-    return value
 
 
 def _require_version(payload: Mapping[str, Any], error: type[Exception], noun: str) -> None:

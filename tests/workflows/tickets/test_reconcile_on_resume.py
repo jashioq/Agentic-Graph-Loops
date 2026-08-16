@@ -1,4 +1,4 @@
-"""Picking a run back up: what `settle` reconciles, and what `resume` refuses.
+"""Picking a run back up: what `reconcile` settles, and what `resume` refuses.
 
 Real git in `tmp_path` throughout, because everything here is about the two
 halves disagreeing — a branch that moved after the status was written, a tree
@@ -7,7 +7,7 @@ would only ever agree with the state, which is the one thing these tests are
 looking for.
 
 A test builds the mess a killed process leaves — a state document written by
-hand, worktrees opened and walked away from — and then calls `settle` over it,
+hand, worktrees opened and walked away from — and then calls `reconcile` over it,
 which is what a second process is, minus the process.
 
 The last test drives a whole resumed run. It needs no agent at all: a ticket
@@ -21,16 +21,17 @@ from pathlib import Path
 import pytest
 
 from agl.core.store import Store
+from agl.runtime import worktrees
 from agl.runtime.context import RunContext
 from agl.runtime.record import StateFile
 from agl.runtime.worktrees import Work
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.documents.store_keys import REVIEWERS, review_key
+from agl.workflows.tickets.errors import Halt, NothingToResumeError
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.resume import settle
-from agl.workflows.tickets.reviews import REVIEWERS, review_key
-from agl.workflows.tickets.snapshot import RunFile
-from agl.workflows.tickets.state import Halt, Run
-from agl.workflows.tickets.ticket import trees_for
-from agl.workflows.tickets.workflow import NothingToResumeError, resume
+from agl.workflows.tickets.reconcile_on_resume import reconcile
+from agl.workflows.tickets.run_state import Run
+from agl.workflows.tickets.workflow import resume
 from tests.conftest import commit_file, git
 from tests.runtime.conftest import context, feature
 
@@ -58,18 +59,18 @@ def ticket(
 
 def started(
     repo: Path, *tickets: Ticket, halt: Halt | None = None
-) -> tuple[RunContext, RunFile]:
+) -> tuple[RunContext, StateDocument]:
     """A context over a run that has already written a state document."""
     feature(repo)
     ctx = context(repo)
-    state = RunFile(StateFile(ctx.store))
+    state = StateDocument(StateFile(ctx.store))
     state.write(Run(tickets=tickets, halt=halt))
     return ctx, state
 
 
 def open_tree(ctx: RunContext, ticket_id: str = "T-01") -> Work:
     """A worktree checked out for one ticket and then walked away from."""
-    trees = trees_for(ctx)
+    trees = worktrees.for_run(ctx)
     return trees.acquire(ticket_id, trees.branch_for(ticket_id), ctx.base_branch)
 
 
@@ -103,7 +104,7 @@ def test_every_claimed_ticket_goes_back_to_the_queue(repo: Path) -> None:
         ticket("T-04", Status.AWAITING_INPUT, resume_to=Status.IN_PROGRESS),
     )
 
-    settle(ctx)
+    reconcile(ctx)
 
     settled = state.load()
     assert [t.status for t in settled.tickets] == [Status.PENDING] * 4
@@ -113,7 +114,7 @@ def test_every_claimed_ticket_goes_back_to_the_queue(repo: Path) -> None:
 def test_a_pending_ticket_and_a_merged_one_are_left_where_they_are(repo: Path) -> None:
     ctx, state = started(repo, ticket("T-01"), ticket("T-02", Status.MERGED))
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert [t.status for t in state.load().tickets] == [Status.PENDING, Status.MERGED]
 
@@ -127,7 +128,7 @@ def test_the_halt_the_last_process_stopped_on_does_not_stop_this_one(repo: Path)
     """
     ctx, state = started(repo, ticket(), halt=Halt("T-01 conflicts with the base branch"))
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert state.load().halt is None
 
@@ -140,7 +141,7 @@ def test_a_merged_ticket_s_worktree_is_removed(repo: Path) -> None:
     ctx, _ = started(repo, ticket(status=Status.MERGED))
     work = open_tree(ctx)
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert not work.tree.exists()
     assert [w.path for w in ctx.vcs.list_worktrees()] == [repo.resolve()]
@@ -151,10 +152,10 @@ def test_an_unfinished_ticket_keeps_its_worktree(repo: Path) -> None:
     ctx, _ = started(repo, ticket(status=Status.IN_PROGRESS))
     work = open_tree(ctx)
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert work.tree.exists()
-    assert trees_for(ctx).reopen() == (work,)
+    assert worktrees.for_run(ctx).reopen() == (work,)
 
 
 def test_uncommitted_work_in_a_ticket_tree_is_discarded(repo: Path) -> None:
@@ -164,7 +165,7 @@ def test_uncommitted_work_in_a_ticket_tree_is_discarded(repo: Path) -> None:
     (work.tree / "scratch.py").write_text("half a thought\n", encoding="utf-8")
     (work.tree / "README.md").write_text("rewritten\n", encoding="utf-8")
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert not (work.tree / "scratch.py").exists()
     assert not ctx.vcs.is_dirty(work.tree)
@@ -177,7 +178,7 @@ def test_a_merge_nobody_resolved_is_aborted(repo: Path) -> None:
     ctx, _ = started(repo, ticket(status=Status.MERGING))
     work = mid_merge(ctx, repo)
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert not ctx.vcs.merge_in_progress(work.tree)
     assert not ctx.vcs.is_ancestor(ctx.base_branch, work.branch)
@@ -191,7 +192,7 @@ def test_a_merge_somebody_resolved_is_committed(repo: Path) -> None:
     (work.tree / "shared.txt").write_text("resolved\n", encoding="utf-8")
     git(work.tree, "add", "--", "shared.txt")
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert not ctx.vcs.merge_in_progress(work.tree)
     assert ctx.vcs.is_ancestor(ctx.base_branch, work.branch)
@@ -210,7 +211,7 @@ def test_a_merge_the_repository_root_was_left_in_is_settled_too(repo: Path) -> N
     assert not ctx.vcs.merge(repo, "other").clean
     (repo / "notes.txt").write_text("mine\n", encoding="utf-8")
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert not ctx.vcs.merge_in_progress(repo)
     assert (repo / "notes.txt").read_text(encoding="utf-8") == "mine\n"
@@ -223,10 +224,10 @@ def test_a_branch_with_no_base_sha_recorded_gets_one(repo: Path) -> None:
     """The process died between creating the branch and writing the mark, so
     the branch still stands exactly where it was cut."""
     ctx, state = started(repo, ticket())
-    trees = trees_for(ctx)
+    trees = worktrees.for_run(ctx)
     ctx.vcs.create_branch(trees.branch_for("T-01"), ctx.base_branch)
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert state.load().ticket("T-01").base_sha == ctx.vcs.rev_parse(ctx.base_branch)
 
@@ -239,7 +240,7 @@ def test_a_base_sha_already_recorded_is_left_alone(repo: Path) -> None:
     state.write(Run(tickets=(ticket(status=Status.IN_PROGRESS, base_sha=cut),)))
     commit_file(work.tree, "auth.py", "auth\n", "T-01: add auth")
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert state.load().ticket("T-01").base_sha == cut
 
@@ -247,7 +248,7 @@ def test_a_base_sha_already_recorded_is_left_alone(repo: Path) -> None:
 def test_a_ticket_with_no_branch_yet_stays_unmarked(repo: Path) -> None:
     ctx, state = started(repo, ticket())
 
-    settle(ctx)
+    reconcile(ctx)
 
     assert state.load().ticket("T-01").base_sha is None
 

@@ -1,28 +1,11 @@
 """What each role may reach, built as closures over the store.
 
-Layer: workflows. Composes `agent` and `store`, and imports both from their
-package roots.
-
-**Scoping is the closure, not a permission check.** A factory closes over
+Layer: workflows. Composes `agent` and `store`, imported from their package
+roots. Scoping is the closure, not a permission check: a factory closes over
 exactly what a role may touch — one store, one key, one ticket id — and the tool
-it hands back has no parameter that could widen it. `get_ticket` for `T-03` has
-an empty schema, so a reviewer holding it has no argument it could pass to reach
-`T-05`. There is no policy object here, no allow list, and no check inside a
-handler that could be bypassed by an argument nobody thought of: what is not in
-the closure is not reachable, full stop.
-
-Writes are the same fact in the other direction. A save tool takes the content
-and nothing else; the key belongs to the closure, so an agent cannot choose
-where its output lands or overwrite another role's document.
-
-Invalid input to `save_tickets` comes back as a string the agent reads, rather
-than as an exception, and nothing is written. That in-session correction is the
-whole reason these are tools rather than an `output_schema`: a run that produced
-an unusable set of tickets can be told what was wrong and try again inside the
-same session, instead of failing and being started over.
-
-Every description here is written for the model that will read it — what the
-tool answers with and when to reach for it, not what it is called.
+it hands back has no parameter that could widen it. Invalid input comes back as
+a string the agent reads, and nothing is written. Every `description` is a
+prompt, written for the model that will read it.
 """
 
 import json
@@ -32,31 +15,31 @@ from typing import Any
 from agl.core.agent import NO_PARAMS, Tool
 from agl.core.store import MissingKeyError, Store
 from agl.runtime.record import STATE_KEY, StateFile
-from agl.workflows.tickets.models import (
-    TICKETS_SCHEMA,
-    InvalidTicketsError,
-    Ticket,
-    tickets_from_json,
-)
-from agl.workflows.tickets.reviews import (
+from agl.workflows.tickets.documents.review_documents import (
     FINDINGS_SCHEMA,
     TRIAGE_SCHEMA,
-    CoverageError,
-    Finding,
-    InvalidFindingsError,
-    InvalidGroupsError,
     bug_groups_from_json,
-    check_coverage,
     findings_from_json,
+)
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.documents.store_keys import (
+    SPEC_KEY,
+    STANDARDS_KEY,
+    TICKETS_KEY,
     review_key,
 )
-from agl.workflows.tickets.snapshot import RunFile
-from agl.workflows.tickets.state import InvalidStateError
+from agl.workflows.tickets.documents.tickets_document import TICKETS_SCHEMA, tickets_from_json
+from agl.workflows.tickets.errors import (
+    CoverageError,
+    InvalidFindingsError,
+    InvalidGroupsError,
+    InvalidStateError,
+    InvalidTicketsError,
+)
+from agl.workflows.tickets.findings import Finding, check_coverage
+from agl.workflows.tickets.models import Ticket
 
 __all__ = [
-    "SPEC_KEY",
-    "STANDARDS_KEY",
-    "TICKETS_KEY",
     "decompose_tools",
     "get_ticket",
     "implement_tools",
@@ -71,10 +54,6 @@ __all__ = [
     "save_triage",
     "triage_tools",
 ]
-
-SPEC_KEY = "spec.md"
-STANDARDS_KEY = "standards.md"
-TICKETS_KEY = "tickets.json"
 
 _CONTENT = "content"
 
@@ -124,18 +103,12 @@ def read_standards(store: Store) -> Tool:
 def get_ticket(store: Store, ticket_id: str) -> Tool:
     """One ticket, bound at build time. The model is given no way to say which.
 
-    Answered out of the run's state rather than the decompose agent's output,
-    because the state is where every ticket is. A bug ticket is filed into the
-    state and never appears in `tickets.json`, so a tool reading the
-    decomposition had nothing to say to the bug-fix agents whose prompt opens
-    "Call `get_ticket` first" — it told them their own ticket did not exist.
-
-    Read at call time rather than captured when the tool was built, so a ticket
-    the run has since edited — another round of bugs to wait on, say — reads as
-    it is now.
+    Answered out of the run's state rather than the decomposition, because a bug
+    ticket is filed into the state and never appears in `tickets.json`. Read at
+    call time, so a ticket the run has since edited reads as it is now.
     """
 
-    state = RunFile(StateFile(store))
+    state = StateDocument(StateFile(store))
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
@@ -194,8 +167,7 @@ def save_spec(store: Store) -> Tool:
 def save_tickets(store: Store) -> Tool:
     """Stores the decomposition, refusing anything that is not a usable set.
 
-    Validated by `tickets_from_json` before a byte is written, so what reaches
-    the store is always something the workflow can read back.
+    Validated by `tickets_from_json` before a byte is written.
     """
 
     async def handler(arguments: dict[str, Any]) -> str:
@@ -265,8 +237,7 @@ def save_triage(store: Store, ticket_id: str, round_: int, highs: Sequence[Findi
     """Stores the triage groups, refusing anything that does not cover every `HIGH`.
 
     Validated in two stages: `bug_groups_from_json` for shape, then
-    `check_coverage` against the `highs` this closure holds — the same check
-    the caller runs again after reading back, as a backstop.
+    `check_coverage` against the `highs` this closure holds.
     """
 
     key = review_key(ticket_id, round_, "triage")
@@ -317,19 +288,15 @@ def decompose_tools(store: Store) -> tuple[Tool, ...]:
 
 
 def implement_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
-    """Doing one ticket's work: everything to read, nothing to write.
-
-    What it produces is a commit in its own worktree, not a document.
-    """
+    """Doing one ticket's work: everything to read, nothing to write."""
     return (get_ticket(store, ticket_id), read_spec(store), read_standards(store))
 
 
 def review_quality_tools(store: Store, ticket_id: str, round_: int) -> tuple[Tool, ...]:
     """Reviewing one ticket against the standards. **No spec access.**
 
-    It judges the code as code. Handed the spec it starts re-arguing design
-    decisions that were settled with the user, which is not its job and which
-    would file findings nobody can act on.
+    It judges the code as code. Handed the spec it re-argues design decisions
+    settled with the user, and files findings nobody can act on.
     """
     return (
         get_ticket(store, ticket_id),
@@ -360,9 +327,8 @@ def triage_tools(
 def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awaitable[str]]:
     """A no-argument handler over one document, missing or not.
 
-    A store with no `standards.md` is a project that has not written any, which
-    is a fact the agent should work around rather than a reason to end a run
-    that had already started.
+    A store with no `standards.md` is a project that has not written any: a fact
+    the agent works around, not a reason to end a run that had already started.
     """
 
     async def handler(arguments: dict[str, Any]) -> str:
@@ -377,12 +343,10 @@ def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awa
 def _entry(ticket: Ticket) -> dict[str, Any]:
     """One ticket as the role holding it reads it: what to build, and what it waits for.
 
-    The run's own bookkeeping — the status it is parked at, which review round
-    it is on, the sha its branch stood at — is deliberately not here. None of it
-    is anything an agent decides, and a field a role cannot act on is one it can
-    only be misled by. `parent` stays, because on a bug ticket it names the work
-    being fixed, and it is rendered on every ticket rather than only on bugs so
-    that the answer has one shape.
+    The run's own bookkeeping — status, review round, base sha — is deliberately
+    not here: none of it is anything an agent decides. `parent` stays, and is
+    rendered on every ticket rather than only on bugs, so the answer has one
+    shape.
     """
     return {
         "id": ticket.id,

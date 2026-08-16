@@ -13,11 +13,10 @@ import pytest
 
 from agl.core.store.impl.file_store import FileStore
 from agl.runtime.record import STATE_KEY, VERSION, StateFile
+from agl.workflows.tickets.documents.state_document import StateDocument, from_json, to_json
+from agl.workflows.tickets.errors import Halt, InvalidStateError
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.snapshot import RunFile, from_json, to_json
-from agl.workflows.tickets.state import (
-    Halt,
-    InvalidStateError,
+from agl.workflows.tickets.run_state import (
     Run,
     with_bugs,
     with_halt,
@@ -57,9 +56,9 @@ def a_run() -> Run:
 
 
 @pytest.fixture
-def state(tmp_path: Path) -> RunFile:
+def state(tmp_path: Path) -> StateDocument:
     """A state document in a real store, with nothing written to it yet."""
-    return RunFile(StateFile(FileStore(tmp_path / "run")))
+    return StateDocument(StateFile(FileStore(tmp_path / "run")))
 
 
 def written(tmp_path: Path) -> dict[str, object]:
@@ -195,11 +194,11 @@ def test_tickets_must_be_an_array() -> None:
 # -- the file -------------------------------------------------------------
 
 
-def test_a_run_that_has_written_nothing_loads_as_an_empty_run(state: RunFile) -> None:
+def test_a_run_that_has_written_nothing_loads_as_an_empty_run(state: StateDocument) -> None:
     assert state.load() == Run()
 
 
-def test_write_then_load_comes_back_equal(state: RunFile, tmp_path: Path) -> None:
+def test_write_then_load_comes_back_equal(state: StateDocument, tmp_path: Path) -> None:
     run = a_run()
 
     state.write(run)
@@ -208,7 +207,7 @@ def test_write_then_load_comes_back_equal(state: RunFile, tmp_path: Path) -> Non
     assert written(tmp_path)["version"] == VERSION
 
 
-def test_update_reads_decides_and_writes_in_one_call(state: RunFile) -> None:
+def test_update_reads_decides_and_writes_in_one_call(state: StateDocument) -> None:
     state.write(with_tickets(Run(), (feature("T-01"),)))
 
     returned = state.update(lambda run: with_status(run, "T-01", Status.IN_PROGRESS))
@@ -217,7 +216,7 @@ def test_update_reads_decides_and_writes_in_one_call(state: RunFile) -> None:
     assert state.load() == returned
 
 
-def test_a_document_from_another_version_is_refused(state: RunFile, tmp_path: Path) -> None:
+def test_a_document_from_another_version_is_refused(state: StateDocument, tmp_path: Path) -> None:
     state.write(Run())
     corrupt(tmp_path, json.dumps({"version": VERSION + 1, "tickets": [], "halt": None}))
 
@@ -225,7 +224,7 @@ def test_a_document_from_another_version_is_refused(state: RunFile, tmp_path: Pa
         state.load()
 
 
-def test_a_document_that_is_not_json_is_refused(state: RunFile, tmp_path: Path) -> None:
+def test_a_document_that_is_not_json_is_refused(state: StateDocument, tmp_path: Path) -> None:
     state.write(Run())
     corrupt(tmp_path, "{not json at all")
 
@@ -234,7 +233,7 @@ def test_a_document_that_is_not_json_is_refused(state: RunFile, tmp_path: Path) 
 
 
 def test_latest_keeps_drawing_the_last_good_run_over_a_broken_file(
-    state: RunFile, tmp_path: Path
+    state: StateDocument, tmp_path: Path
 ) -> None:
     """A frame is painted four times a second and must not raise over an edit
     somebody is halfway through."""
@@ -250,7 +249,7 @@ def test_latest_keeps_drawing_the_last_good_run_over_a_broken_file(
 
 
 def test_latest_picks_the_new_run_up_again_once_the_file_parses(
-    state: RunFile, tmp_path: Path
+    state: StateDocument, tmp_path: Path
 ) -> None:
     state.write(a_run())
     corrupt(tmp_path, "{oops")
@@ -262,7 +261,7 @@ def test_latest_picks_the_new_run_up_again_once_the_file_parses(
 
 
 def test_latest_on_a_file_that_never_parsed_is_an_empty_run(
-    state: RunFile, tmp_path: Path
+    state: StateDocument, tmp_path: Path
 ) -> None:
     state.write(Run())
     corrupt(tmp_path, "{oops")

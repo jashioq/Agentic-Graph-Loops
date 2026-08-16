@@ -33,10 +33,10 @@ from agl.runtime import paths
 from agl.runtime.context import RunContext
 from agl.runtime.record import RunRecord, StateFile, write_record
 from agl.workflows.tickets import workflow as tickets_workflow
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.errors import Halt, HaltedError
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.snapshot import RunFile
-from agl.workflows.tickets.state import Halt, Run
-from agl.workflows.tickets.workflow import HaltedError
+from agl.workflows.tickets.run_state import Run
 from tests.conftest import git
 
 PROJECT = "demo"
@@ -570,7 +570,7 @@ def write_record_for(
 
 def write_state(home: Path, label: str = LABEL) -> None:
     """A state document with one unfinished ticket, so the run has work left."""
-    RunFile(StateFile(FileStore(paths.run_dir(home, label)))).write(
+    StateDocument(StateFile(FileStore(paths.run_dir(home, label)))).write(
         Run(
             tickets=(
                 Ticket(

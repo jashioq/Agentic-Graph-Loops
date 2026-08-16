@@ -18,7 +18,16 @@ from rich.console import Console
 from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
 from agl.core.terminal.impl.screen import to_layout
 from agl.runtime.display import Board
+from agl.workflows.tickets.errors import Halt
 from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import (
+    Run,
+    display_order,
+    with_bugs,
+    with_halt,
+    with_status,
+    with_tickets,
+)
 from agl.workflows.tickets.screens import (
     APPROVED,
     SESSION_ACTIVITY_WIDTH,
@@ -26,15 +35,6 @@ from agl.workflows.tickets.screens import (
     decompose,
     session,
     session_header,
-)
-from agl.workflows.tickets.state import (
-    Halt,
-    Run,
-    display_order,
-    with_bugs,
-    with_halt,
-    with_status,
-    with_tickets,
 )
 
 NOW = 1_000.0

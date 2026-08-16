@@ -21,7 +21,8 @@ import pytest
 from agl.core.vcs import VcsError
 from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
-from agl.runtime.worktrees import Work, Worktrees
+from agl.runtime.context import RunContext
+from agl.runtime.worktrees import Work, Worktrees, for_run
 from tests.conftest import git
 from tests.integration.conftest import PROJECT
 
@@ -183,3 +184,33 @@ def test_adopt_checks_an_existing_branch_out_again(
 def test_adopt_refuses_a_branch_that_is_not_there(worktrees: Worktrees) -> None:
     with pytest.raises(VcsError):
         worktrees.adopt("T-01", worktrees.branch_for("T-01"))
+
+
+# -- a run's pool ----------------------------------------------------------
+
+
+def test_for_run_builds_the_pool_this_run_s_project_and_label_name(ctx: RunContext) -> None:
+    trees = for_run(ctx)
+
+    w = trees.acquire("T-01", trees.branch_for("T-01"), ctx.base_branch)
+
+    assert w.branch == paths.branch(ctx.label, "T-01")
+    assert (
+        w.tree
+        == paths.worktree_dir(
+            ctx.project.trees_root, ctx.project.name, ctx.label, "T-01"
+        ).resolve()
+    )
+
+
+def test_for_run_comes_back_owning_nothing_until_reopen(ctx: RunContext) -> None:
+    """Two processes over one run: the second names the same trees but holds
+    none of them until it asks for what is on disk."""
+    first = for_run(ctx)
+    left = first.acquire("T-01", first.branch_for("T-01"), ctx.base_branch)
+
+    later = for_run(ctx)
+
+    with pytest.raises(KeyError):
+        later.tree_of("T-01")
+    assert later.reopen() == (left,)

@@ -24,7 +24,13 @@ from string import Template
 
 from agl.core.agent import AgentQuestion, AgentResult, AgentRunner, AgentSpec, Model, Tool
 
-__all__ = ["PromptError", "Prompts", "call"]
+__all__ = ["Activity", "Ask", "PromptError", "Prompts", "call"]
+
+type Activity = Callable[[str], None]
+"""Where a long-running call reports the one line it is doing right now."""
+
+type Ask = Callable[[AgentQuestion], Awaitable[str]]
+"""How a call puts its own question to whoever is watching the run."""
 
 
 class PromptError(Exception):
@@ -62,8 +68,8 @@ async def call(
     disallowed: tuple[str, ...] = (),
     permission_mode: str = "default",
     model: Model,
-    on_activity: Callable[[str], None] | None = None,
-    ask: Callable[[AgentQuestion], Awaitable[str]] | None = None,
+    on_activity: Activity | None = None,
+    ask: Ask | None = None,
 ) -> AgentResult:
     """Build one spec and run it — the only place an `AgentSpec` is assembled.
 

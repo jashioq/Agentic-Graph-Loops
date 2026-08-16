@@ -7,25 +7,23 @@ asked for.
 """
 
 from dataclasses import replace
-from typing import Any
 
 import pytest
 
-from agl.core.command import ExecResult
 from agl.runtime.dag import NodeState
-from agl.runtime.merge import MergeOutcome, MergeStatus
-from agl.workflows.tickets.models import IllegalTransitionError, Status, Ticket
-from agl.workflows.tickets.state import (
-    TAIL_LINES,
+from agl.workflows.tickets.errors import (
     DuplicateTicketError,
     Halt,
+    IllegalTransitionError,
     InvalidStateError,
-    Run,
     UnknownTicketError,
+)
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import (
+    Run,
     check,
     dag_of,
     display_order,
-    halt_for,
     with_base_sha,
     with_bugs,
     with_halt,
@@ -493,78 +491,3 @@ def test_check_catches_a_cycle() -> None:
 
     with pytest.raises(InvalidStateError, match="cycle"):
         check(run)
-
-
-# -- halt -----------------------------------------------------------------
-
-
-def test_halt_carries_a_reason_and_a_detail() -> None:
-    halt = Halt(reason="budget", detail="ran out at $4.10")
-
-    assert halt.reason == "budget"
-    assert halt.detail == "ran out at $4.10"
-
-
-def test_halt_defaults_to_resumable() -> None:
-    assert Halt(reason="budget").resumable is True
-    assert Halt(reason="budget", resumable=False).resumable is False
-
-
-# -- halt_for -------------------------------------------------------------
-
-
-def outcome(status: MergeStatus, **overrides: Any) -> MergeOutcome:
-    return MergeOutcome(key="T-01", status=status, **overrides)
-
-
-def test_a_conflict_is_resumable_and_names_what_to_resolve() -> None:
-    halt = halt_for(outcome(MergeStatus.CONFLICT, conflicted=("a.py", "b.py")))
-
-    assert halt.resumable is True
-    assert "T-01" in halt.reason
-    assert "a.py, b.py" in halt.detail
-
-
-def test_a_failed_build_is_resumable_and_carries_the_tail_of_its_output() -> None:
-    lines = "\n".join(f"line {index}" for index in range(1, 41))
-    build = ExecResult(argv=("build",), code=1, stdout=lines, stderr="", timed_out=False)
-
-    halt = halt_for(outcome(MergeStatus.BUILD_FAILED, build=build))
-
-    assert halt.resumable is True
-    assert "exit 1" in halt.reason
-    assert halt.detail.splitlines() == [f"line {index}" for index in range(41 - TAIL_LINES, 41)]
-
-
-def test_a_failed_build_carries_both_streams() -> None:
-    """Which stream carries the diagnosis is the build tool's choice, not this run's."""
-    build = ExecResult(
-        argv=("build",), code=1, stdout="compiling\n", stderr="error: boom\n", timed_out=False
-    )
-
-    halt = halt_for(outcome(MergeStatus.BUILD_FAILED, build=build))
-
-    assert halt.detail.splitlines() == ["compiling", "error: boom"]
-
-
-def test_a_failed_build_says_so_when_it_timed_out_instead() -> None:
-    build = ExecResult(argv=("build",), code=-9, stdout="", stderr="killed", timed_out=True)
-
-    halt = halt_for(outcome(MergeStatus.BUILD_FAILED, build=build))
-
-    assert "timed out" in halt.reason
-    assert "killed" in halt.detail
-
-
-def test_a_vcs_error_cannot_be_resumed() -> None:
-    halt = halt_for(outcome(MergeStatus.VCS_ERROR, error="no such branch"))
-
-    assert halt.resumable is False
-    assert halt.detail == "no such branch"
-
-
-def test_anything_else_cannot_be_resumed_either() -> None:
-    halt = halt_for(outcome(MergeStatus.ERROR, error="FileNotFoundError: gradlew"))
-
-    assert halt.resumable is False
-    assert "gradlew" in halt.reason

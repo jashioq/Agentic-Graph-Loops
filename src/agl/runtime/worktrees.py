@@ -1,8 +1,8 @@
 """A pool of git worktrees, one per node, for the length of one run.
 
-Layer: runtime. Imports `agl.runtime.paths` and `agl.core.vcs`, and nothing
-about any particular workflow: a node is a key, and where its branch is cut
-from is the caller's business, handed in as `base`.
+Layer: runtime. Imports `agl.runtime.paths`, `agl.runtime.context` and
+`agl.core.vcs`, and nothing about any particular workflow: a node is a key, and
+where its branch is cut from is the caller's business, handed in as `base`.
 
 `Worktrees` is a run's only place that creates or removes a worktree. The
 kept-alive behaviour is the subtle part: a node whose work is not finished must
@@ -24,8 +24,9 @@ from pathlib import Path
 
 from agl.core.vcs import Vcs
 from agl.runtime import paths
+from agl.runtime.context import RunContext
 
-__all__ = ["Work", "Worktrees"]
+__all__ = ["Work", "Worktrees", "for_run"]
 
 
 @dataclass(frozen=True)
@@ -114,3 +115,18 @@ class Worktrees:
 
     def _worktree_dir(self, key: str) -> Path:
         return paths.worktree_dir(self._trees_root, self._project, self._label, key)
+
+
+def for_run(ctx: RunContext) -> Worktrees:
+    """This run's worktree pool, owning nothing until `reopen` is called.
+
+    A function rather than a method, so the class stays free of run knowledge.
+    A pool is addressed by project and label alone, so two processes over the
+    same run name the same trees.
+    """
+    return Worktrees(
+        ctx.vcs,
+        trees_root=ctx.project.trees_root,
+        project=ctx.project.name,
+        label=ctx.label,
+    )

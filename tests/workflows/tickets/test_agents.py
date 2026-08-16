@@ -30,15 +30,16 @@ from agl.runtime.context import RunContext
 from agl.workflows.tickets import agents
 from agl.workflows.tickets.agents import (
     GIT_WRITES,
-    RoleIncompleteError,
     decompose,
     implement,
     interview,
     review,
     triage,
 )
+from agl.workflows.tickets.documents.store_keys import review_key
+from agl.workflows.tickets.errors import CoverageError, RoleIncompleteError
+from agl.workflows.tickets.findings import Finding, Severity
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.reviews import CoverageError, Finding, Severity, review_key
 from tests.fakes import FakeAgentRunner, ScriptedRun
 from tests.runtime.conftest import context as run_context
 

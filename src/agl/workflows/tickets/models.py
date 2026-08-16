@@ -1,45 +1,16 @@
 """The ticket: what one unit of work is, and the states it may pass through.
 
-Layer: workflows. Pure — no I/O, no async, and nothing imported from `agl`. It
-is the vocabulary the rest of the ticket workflow is written in, so it has to be
-readable on its own.
-
-A `Ticket` holds only what cannot be recomputed. `is_bug` is a property rather
-than a field because a stored copy of something derivable is a second source of
-truth waiting to disagree with the first. The branch a ticket's work lands on is
-not here at all: it is `paths.branch(label, id)`, computed where it is needed
-from two things already known. Whether a ticket has been implemented, reviewed
-or merged is not here either, and for the same reason one step further out: git
-and the review documents already answer it, and `steps.look` is where they are
-asked.
-
-The status machine has no `fixing` state. A ticket whose review filed findings
-goes back to `PENDING` with `blocked_by` edges to the bug tickets that carry
-them; the graph already says "waiting on something", and a second mechanism for
-the same fact is a second thing to keep in sync.
-
-`AWAITING_INPUT` is a *suspension* rather than a place in the life cycle: a
-ticket enters it from wherever an agent happened to be running and has to return
-to exactly there. That memory lives in `resume_to`, written and cleared by
-`transition` itself, so no caller can enter the state and forget to record where
-it came from.
+Layer: workflows. Pure vocabulary — no I/O, no async, and nothing from `agl`
+but this workflow's `errors`. What an agent produces is not here: the decompose
+schema and its parser live in `documents/tickets_document.py`.
 """
 
-import re
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
 
-__all__ = [
-    "TICKETS_SCHEMA",
-    "IllegalTransitionError",
-    "InvalidTicketsError",
-    "Status",
-    "Ticket",
-    "can_transition",
-    "tickets_from_json",
-    "transition",
-]
+from agl.workflows.tickets.errors import IllegalTransitionError
+
+__all__ = ["Status", "Ticket", "can_transition", "transition"]
 
 
 class Status(Enum):
@@ -57,24 +28,8 @@ class Status(Enum):
 class Ticket:
     """One unit of work: what to build, what it waits for, and where it is.
 
-    Frozen, because there is one authority for a ticket and it is not this
-    object: a ticket is a value read out of the run's state, and moving one
-    means writing a new value back where it came from. A mutable ticket invites
-    the opposite — a caller holding a snapshot edits it, the run's own copy
-    changes underneath everything that indexes by id, and nothing goes through
-    the operation that keeps the graph and the board in step. Frozen, a stale
-    snapshot is merely stale, which is a bug you can see.
-
     On a bug ticket — one with a `parent` — `deliverables` are the findings it
-    has to fix. Same field, read differently by context, because a second field
-    that is empty on every feature ticket would carry no more information.
-
-    `base_sha` is the one thing here that is not a decision but a measurement:
-    where this ticket's branch stood before any of its work landed on it. It
-    exists because git cannot answer without it — a branch with no commits yet
-    and a branch whose commits have already been merged away are both ancestors
-    of their base — and it is taken in the same synchronous step that creates
-    the worktree. `None` means no tree has ever been opened for this ticket.
+    has to fix.
     """
 
     id: str
@@ -86,6 +41,7 @@ class Ticket:
     review_round: int = 0
     # Only ever non-None while `status is AWAITING_INPUT`; see `transition`.
     resume_to: "Status | None" = None
+    # `base_sha` is taken once, in the same synchronous step that opens the worktree.
     base_sha: str | None = None
 
     @property
@@ -94,41 +50,18 @@ class Ticket:
         return self.parent is not None
 
 
-class IllegalTransitionError(Exception):
-    """Raised when a ticket is asked to move somewhere it cannot go."""
-
-
-class InvalidTicketsError(Exception):
-    """Raised when agent output does not describe a usable set of tickets."""
-
-
 # -- the life cycle -------------------------------------------------------
 
 # Every status an agent can be running in, and so every status a question can
 # interrupt.
 _RUNNING = (Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING)
 
-# The legal moves, as data. Re-entry (a status to itself) is legal for every
-# resting status, which is what lets a caller re-stamp how long a ticket has
-# been where it is. `MERGED` is terminal and has no moves at all, and
-# `AWAITING_INPUT` has no re-entry because it is a suspension of another status
-# rather than one a ticket rests in.
+# The legal moves, as data. Re-entry is legal for every resting status, which
+# lets a caller re-stamp how long a ticket has been where it is. `MERGED` is
+# terminal; `AWAITING_INPUT` suspends another status rather than being one a
+# ticket rests in, so it has no re-entry.
 #
-# `PENDING` is every claimed status' way in and out, and that is not the life
-# cycle sagging — it is what the status field now means. A status says who is
-# working a ticket and at what, never how far the work got; how far it got is a
-# question for git, asked afresh through `steps.look`. So `PENDING` is exactly
-# "nobody is working this right now", and two moves follow from that.
-#
-# Out of it, anywhere: a run picked back up asks git where each ticket reached
-# and claims it straight into whatever the answer implies. A ticket whose commit
-# is already on its base is claimed as `MERGED` without a merge ever being run in
-# this process, and refusing that move would only mean refusing to notice.
-#
-# Into it, from every status an agent runs in: a claim can always be given back.
-# The scheduler does exactly that when a ticket's pass raises, and a ticket that
-# went back to the queue has lost nothing — its branch is still where its work
-# left it.
+# `_MOVES`: `PENDING` is every claimed status' way in and out.
 _MOVES: dict[Status, frozenset[Status]] = {
     Status.PENDING: frozenset(
         {
@@ -162,10 +95,9 @@ _MOVES: dict[Status, frozenset[Status]] = {
 def can_transition(frm: Status, to: Status) -> bool:
     """Whether `frm` -> `to` is a legal move for some ticket.
 
-    Answers about statuses alone, so it cannot know which state a waiting ticket
-    was suspended from. `AWAITING_INPUT` -> anything an agent runs in is legal
-    here; `transition` narrows that to the one status the ticket actually came
-    from.
+    Answers about statuses alone, so `AWAITING_INPUT` -> anything an agent runs
+    in is legal here; `transition` narrows that to the one status the ticket
+    actually came from.
     """
     return to in _MOVES[frm]
 
@@ -173,15 +105,9 @@ def can_transition(frm: Status, to: Status) -> bool:
 def transition(ticket: Ticket, to: Status) -> Ticket:
     """`ticket` moved to `to`, raising `IllegalTransitionError` on an illegal move.
 
-    Returns a new ticket and leaves the one passed in alone, so the caller is
-    what decides where a moved ticket goes — and validates every rule before it
-    builds anything, so a raising call has produced nothing to put anywhere.
-
-    Entering `AWAITING_INPUT` records the status being suspended; leaving it
-    requires returning to that status and clears the record. A ticket found in
-    `AWAITING_INPUT` with nothing recorded cannot move at all, which is the
-    right answer: something built it by hand into a state the workflow has no
-    way back out of.
+    Returns a new ticket and leaves the one passed in alone. Entering
+    `AWAITING_INPUT` records the status being suspended; leaving it requires
+    returning to that status, and clears the record.
     """
     frm = ticket.status
     if not can_transition(frm, to):
@@ -200,161 +126,3 @@ def transition(ticket: Ticket, to: Status) -> Ticket:
     elif to is Status.AWAITING_INPUT:
         resume_to = frm
     return replace(ticket, status=to, resume_to=resume_to)
-
-
-# -- what the decompose agent produces ------------------------------------
-
-# The same shape `paths.validate_node_id` enforces, spelled out rather than
-# imported: this file stays free of `agl.core`, and an id that reaches a branch
-# name has to satisfy that function regardless of which one of us checks first.
-_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]*$"
-_ID_RE = re.compile(_ID_PATTERN)
-
-TICKETS_KEY = "tickets"
-_REQUIRED = ["id", "title", "deliverables"]
-_OPTIONAL = ["blocked_by"]
-
-TICKETS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        TICKETS_KEY: {
-            "type": "array",
-            "minItems": 1,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "pattern": _ID_PATTERN},
-                    "title": {"type": "string", "minLength": 1},
-                    "deliverables": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {"type": "string", "minLength": 1},
-                    },
-                    "blocked_by": {
-                        "type": "array",
-                        "items": {"type": "string", "pattern": _ID_PATTERN},
-                    },
-                },
-                "required": _REQUIRED,
-                "additionalProperties": False,
-            },
-        }
-    },
-    "required": [TICKETS_KEY],
-    "additionalProperties": False,
-}
-"""The `output_schema` handed to the decompose agent.
-
-It describes what an agent supplies, which is not what a `Ticket` holds:
-`status`, `review_round` and `parent` are the orchestrator's, so asking for them
-would invite an agent to make them up. `additionalProperties: false` is what
-turns a hallucinated field into a validation failure instead of silent data.
-
-Read-only by convention, like `agent.NO_PARAMS` — hand it to an `AgentSpec`
-rather than mutating it."""
-
-
-def tickets_from_json(data: Any) -> tuple[Ticket, ...]:
-    """Parse decompose-agent output into tickets, raising `InvalidTicketsError`.
-
-    Re-checks everything `TICKETS_SCHEMA` states, because a schema handed to a
-    model is a request rather than a guarantee, plus the two rules JSON schema
-    cannot express: ids are unique, and every `blocked_by` names a ticket in the
-    same set. The fields an agent does not supply take their defaults —
-    `PENDING`, round zero, no parent.
-    """
-    payload = _object(data, "output")
-    _known_fields(payload, [TICKETS_KEY], (), "output")
-    raw = payload[TICKETS_KEY]
-    if not isinstance(raw, list):
-        raise InvalidTicketsError(f"{TICKETS_KEY!r} must be an array, got {_kind(raw)}")
-    if not raw:
-        raise InvalidTicketsError(f"{TICKETS_KEY!r} is empty: a run needs at least one ticket")
-
-    tickets = tuple(_one_ticket(item, index) for index, item in enumerate(raw))
-    _check_ids(tickets)
-    return tickets
-
-
-def _one_ticket(item: Any, index: int) -> Ticket:
-    """Build one ticket from one array entry, checking every field it names."""
-    where = f"ticket {index}"
-    fields = _object(item, where)
-    _known_fields(fields, _REQUIRED, _OPTIONAL, where)
-
-    ticket_id = fields["id"]
-    if not isinstance(ticket_id, str) or not _ID_RE.fullmatch(ticket_id):
-        raise InvalidTicketsError(
-            f"{where}: id {ticket_id!r} must be letters, digits and hyphens, "
-            "starting with a letter or digit"
-        )
-    where = f"ticket {ticket_id!r}"
-
-    title = fields["title"]
-    if not isinstance(title, str) or not title.strip():
-        raise InvalidTicketsError(f"{where}: title must be non-empty text, got {title!r}")
-
-    return Ticket(
-        id=ticket_id,
-        title=title,
-        status=Status.PENDING,
-        deliverables=_text_list(fields["deliverables"], "deliverables", where, allow_empty=False),
-        blocked_by=_text_list(fields.get("blocked_by", []), "blocked_by", where, allow_empty=True),
-    )
-
-
-def _check_ids(tickets: tuple[Ticket, ...]) -> None:
-    """The two rules a JSON schema cannot state: unique ids, resolvable blockers."""
-    seen: set[str] = set()
-    for ticket in tickets:
-        if ticket.id in seen:
-            raise InvalidTicketsError(f"duplicate ticket id {ticket.id!r}")
-        seen.add(ticket.id)
-    for ticket in tickets:
-        for blocker in ticket.blocked_by:
-            if blocker == ticket.id:
-                raise InvalidTicketsError(f"ticket {ticket.id!r} is blocked by itself")
-            if blocker not in seen:
-                raise InvalidTicketsError(
-                    f"ticket {ticket.id!r} is blocked by unknown ticket {blocker!r}"
-                )
-
-
-# -- validation helpers ---------------------------------------------------
-
-
-def _object(value: Any, where: str) -> dict[str, Any]:
-    """Narrow `value` to a JSON object or raise."""
-    if not isinstance(value, dict):
-        raise InvalidTicketsError(f"{where} must be an object, got {_kind(value)}")
-    return value
-
-
-def _known_fields(
-    fields: dict[str, Any], required: list[str], optional: tuple[str, ...] | list[str], where: str
-) -> None:
-    """Require every `required` key and refuse anything outside the two lists."""
-    for name in required:
-        if name not in fields:
-            raise InvalidTicketsError(f"{where}: missing required field {name!r}")
-    allowed = {*required, *optional}
-    for name in fields:
-        if name not in allowed:
-            raise InvalidTicketsError(f"{where}: unknown field {name!r}")
-
-
-def _text_list(value: Any, name: str, where: str, *, allow_empty: bool) -> tuple[str, ...]:
-    """Narrow `value` to a tuple of non-empty strings or raise."""
-    if not isinstance(value, list):
-        raise InvalidTicketsError(f"{where}: {name} must be an array, got {_kind(value)}")
-    if not value and not allow_empty:
-        raise InvalidTicketsError(f"{where}: {name} is empty")
-    for entry in value:
-        if not isinstance(entry, str) or not entry.strip():
-            raise InvalidTicketsError(f"{where}: every {name} entry must be non-empty text")
-    return tuple(value)
-
-
-def _kind(value: Any) -> str:
-    """What something is, for an error message a person has to act on."""
-    return type(value).__name__

@@ -36,7 +36,7 @@ particular loop. The first workflow is a ticket orchestrator.
    its data types; `impl/` holds the implementation. `__init__.py` re-exports the
    API only. Workflows and runtime import from the package root; only `cli.py`
    imports `impl`.
-7. **`dag` and `paths` are pure single files** under `runtime`. One
+7. **`dag`, `paths` and `json_fields` are pure single files** under `runtime`. One
    implementation forever, so no ABC. Do not add a Protocol or ABC for something
    with one implementation. They are leaves: they import nothing else in AGL.
 8. **Fakes, not mocks.** Real fake classes in `tests/fakes.py`, inheriting the ABC
