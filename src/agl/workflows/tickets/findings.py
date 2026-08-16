@@ -57,10 +57,9 @@ def high(findings: Sequence[Finding]) -> tuple[Finding, ...]:
 
 
 def check_coverage(groups: Sequence[BugGroup], highs: Sequence[Finding]) -> None:
-    """Raise `CoverageError` unless every finding in `highs` is in exactly one group.
+    """Raises `CoverageError` unless every finding in `highs` is in exactly one group.
 
-    A group naming an id outside `highs` — because it does not exist, or because
-    it names a `MEDIUM` or `LOW` finding — fails the same check.
+    A group naming an id outside `highs` fails the same check.
     """
     high_ids = {finding.id for finding in highs}
     covered: set[str] = set()
@@ -101,11 +100,7 @@ def to_bug_tickets(parent: Ticket, groups: Sequence[BugGroup], start: int) -> tu
 
 
 def next_bug_start(ticket_ids: Iterable[str], parent_id: str) -> int:
-    """One past the highest `<parent_id>-bug-N` id already among `ticket_ids`.
-
-    A second review round must not reuse the first round's ids — the caller
-    passes this to `to_bug_tickets` as `start`.
-    """
+    """One past the highest `<parent_id>-bug-N` already in use, for `to_bug_tickets`."""
     prefix = f"{parent_id}-bug-"
     used = [
         int(ticket_id[len(prefix) :])

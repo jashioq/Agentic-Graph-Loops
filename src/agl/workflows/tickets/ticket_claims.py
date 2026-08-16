@@ -1,9 +1,8 @@
 """How the scheduler claims a ticket off the state document, and hands it back.
 
 Layer: workflows. The four questions `drive` asks, answered from the state every
-time and holding nothing between them, so a document a person edited mid-run is
-what the next admission is decided from. Imports `ticket_pass` for the run's
-collaborators; nothing in `ticket_pass` imports this.
+time and holding nothing between them. Imports `ticket_pass`; nothing in
+`ticket_pass` imports this.
 """
 
 from agl.runtime.dag import NodeId, NodeState
@@ -16,9 +15,8 @@ from agl.workflows.tickets.ticket_pass import Loop, base_for
 __all__ = ["claims"]
 
 
-# The status a ticket is claimed into, per step it is owed: a ticket whose work
-# is already done and only needs merging is claimed as `MERGING`, not started
-# over as `IN_PROGRESS`.
+# The status a ticket is claimed into, per step it is owed: work already done
+# and only needing a merge is claimed `MERGING`, not restarted `IN_PROGRESS`.
 _STATUS_FOR: dict[Step, Status] = {
     Step.IMPLEMENT: Status.IN_PROGRESS,
     Step.REVIEW: Status.IN_REVIEW,
@@ -51,12 +49,7 @@ def claims(loop: Loop) -> Claims:
         return node
 
     def release(node: NodeId) -> None:
-        """Hand a ticket whose pass raised back to the queue.
-
-        A merged ticket is left alone: it is terminal, and a resumed run can
-        admit one. This runs inside the scheduler's own error handler, where an
-        exception would leave the loop waiting on a slot nothing will free.
-        """
+        """Hand a ticket whose pass raised back to the queue, leaving a merged one alone."""
         state.update(
             lambda run: run
             if run.ticket(node).status is Status.MERGED

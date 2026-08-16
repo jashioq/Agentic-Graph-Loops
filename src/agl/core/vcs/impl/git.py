@@ -156,10 +156,9 @@ class Git(MergeOps, Vcs):
     # -- internals --------------------------------------------------------
 
     def _create_branch(self, name: str, base: str) -> None:
-        """Create a branch, mapping git's refusal onto the API's errors.
+        """Creates a branch, mapping git's refusal onto the API's errors.
 
-        Not locked: the two public callers hold the lock already, and one of
-        them needs the create and the worktree add to be one atomic step.
+        Not locked: both public callers hold it already.
         """
         result = self._run(["branch", "--", name, base], None, check=False)
         if result.code == 0:
@@ -171,11 +170,9 @@ class Git(MergeOps, Vcs):
         raise VcsError(f"cannot create branch {name}: {self._reason(result)}")
 
     def _worktrees(self) -> tuple[Worktree, ...]:
-        """Parse `worktree list --porcelain` — never the human-readable form.
+        """Parses `worktree list --porcelain` — never the human-readable form.
 
-        Entries are blank-line separated records of `key value` lines. A
-        worktree with a detached HEAD has no `branch` line; it is not something
-        this module creates, so it is skipped rather than guessed at.
+        A detached-HEAD entry has no `branch` line and is skipped, not guessed at.
         """
         result = self._run(["worktree", "list", "--porcelain"], None)
         worktrees: list[Worktree] = []

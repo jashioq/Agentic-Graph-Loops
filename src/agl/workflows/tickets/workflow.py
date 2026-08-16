@@ -62,8 +62,7 @@ async def resume(ctx: RunContext) -> None:
     """The same run, picked back up. Edit this to change what resuming means.
 
     The two states with nothing to continue are refused before the repository is
-    so much as looked at. `reconcile` stands where `write_record` does in `run`,
-    because the record was written by the process that started this.
+    looked at. `reconcile` stands where `write_record` does in `run`.
     """
     stage = stage_of(StateDocument(StateFile(ctx.store)).load(), ctx.store)
     if stage is Stage.INTERVIEW:
@@ -76,10 +75,10 @@ async def resume(ctx: RunContext) -> None:
 
 
 async def loop(ctx: RunContext) -> None:
-    """React to the state until it says the run is done, or a halt outlives a stage.
+    """Reacts to the state until it says the run is done, or a halt outlives a stage.
 
-    No stage returns anything the next one needs: what one stage produced is a
-    document the next one reads.
+    No stage returns anything the next needs: one stage's output is a document
+    the next reads. Raises `HaltedError` if a halt is still set at the end.
     """
     board = Board(started_at=time.monotonic())
     state = StateDocument(StateFile(ctx.store))
@@ -111,10 +110,10 @@ async def interview(ctx: RunContext, display: Display, board: Board) -> None:
 
 
 async def decompose(ctx: RunContext, display: Display, state: StateDocument, board: Board) -> None:
-    """Propose tickets, ask for approval, and loop on a revision until settled.
+    """Proposes tickets, asks for approval, loops on a revision until settled.
 
-    A revision is appended to the spec rather than passed to the next call, so
-    the agent re-reads one document that says everything.
+    A revision is appended to the spec rather than passed on, so the agent
+    re-reads one document that says everything.
     """
     tickets: tuple[Ticket, ...] = ()
     display.show(lambda: screens.decompose(ctx.label, board, tickets))
@@ -162,14 +161,12 @@ async def implement_all(
     )
     pool = worktrees.for_run(ctx)
     # `reopen` on every run, not only a resumed one: a fresh run finds an empty
-    # trees directory, and a picked-up one takes over the trees a dead process
-    # left rather than checking the same branches out a second time.
+    # trees directory, a picked-up one takes over what a dead process left.
     pool.reopen()
     run_loop = Loop(ctx, display, state, board, pool, merges)
     async with merges.running():
-        # A ticket whose merge did not land is parked in `submit` until
-        # `resolve` deals with it, so a halt still set when a pass returns is
-        # one nothing resolved — exactly `drive`'s stopping condition.
+        # An unlanded merge is parked in `submit` until `resolve` deals with it,
+        # so a halt still set when a pass returns is one nothing resolved.
         await drive(
             claims(run_loop),
             partial(one_ticket, run_loop),

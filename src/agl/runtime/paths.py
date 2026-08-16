@@ -1,33 +1,16 @@
 """Where things live: run directories, worktree paths, and branch names.
 
-Layer: runtime. Pure functions over `Path` and `str` — nothing here creates,
-checks, or touches anything on disk, and the paths it returns need not exist.
-The modules that do the I/O receive concrete paths in their constructors, which
-is what keeps `store` and `vcs` free of any config knowledge.
-
-The layout::
+Layer: runtime. Pure functions over `Path` and `str` — nothing touches disk and
+the paths returned need not exist.
 
     <home>/projects/<project>/                  AGL's own settings for a project
     <home>/runs/<label>/                        one run's artifacts
     <trees_root>/<project>/<label>/<node_id>/   one worktree per node
 
-Worktrees sit outside both the orchestrator repo and the target repo, and the
-trees root is supplied by the caller rather than derived from the home, so it
-stays configurable.
-
-Branches are `agl/<label>/<node_id>` — exactly one level below the namespace,
-never deeper. Git stores refs as files, so `agl/add-auth/N-03` existing as a
-file rules out anything at `agl/add-auth/N-03/…`; one path cannot be both a
-file and a directory. A workflow that derives a node from another one composes
-the id itself, hyphenated, and node-id validation refusing `/` is what keeps the
-derived branch a sibling rather than an impossible child. Filesystem paths carry
-no such constraint and nest freely. The `agl/` prefix keeps a user's own branch
-named exactly the label clear of everything this tool creates and deletes.
-
-Three names reach both a filesystem path and a git ref: `label`, `project`, and
-`node_id`. Each is validated by every function that takes it, so a name that
-would escape its directory or nest a ref is refused here rather than discovered
-as a git error several steps later.
+Branches are `agl/<label>/<node_id>`, exactly one level below the namespace:
+git stores refs as files, so nothing can nest under one. `label`, `project` and
+`node_id` reach both a path and a ref, so every function that takes one
+validates it here rather than letting git discover it later.
 """
 
 import re
@@ -50,12 +33,10 @@ __all__ = [
 
 BRANCH_PREFIX = "agl"
 
-# One shape, two character sets. Both refuse everything that would escape a
-# directory or nest a ref; they differ only on case, and only because a label
-# and a project are typed by a person — on a case-insensitive filesystem
-# `Add-Auth` and `add-auth` are one directory, and two runs would share it. A
-# node id is composed by a workflow from a single scheme, so it never produces
-# both spellings of one id and keeps its capitals.
+# One shape, two character sets. They differ only on case: a label and a project
+# are typed by a person, and on a case-insensitive filesystem `Add-Auth` and
+# `add-auth` would be one directory shared by two runs. A node id is composed by
+# a workflow from a single scheme, so it keeps its capitals.
 _SUPPLIED = re.compile(r"\A[a-z0-9][a-z0-9-]*\Z")
 _COMPOSED = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9-]*\Z")
 
@@ -134,8 +115,7 @@ def validate_project(project: str) -> None:
 def validate_node_id(node_id: str) -> None:
     """Raise `InvalidNameError` unless `node_id` matches `[A-Za-z0-9][A-Za-z0-9-]*`.
 
-    The refusal of `/` is load-bearing: it is what makes a derived id a sibling
-    branch of the one it came from instead of a ref nested under a file.
+    Refusing `/` is load-bearing: it keeps a derived id a sibling branch.
     """
     _validate("node id", node_id, _COMPOSED, _ANY_CASE)
 

@@ -1,20 +1,13 @@
 """Subprocess plumbing shared by the operation groups that make up `Git`.
 
-Layer: core. Not an operation group itself: it holds the repository root, the
-lock, and the handful of things every group needs — running git somewhere,
-reading a porcelain status, naming a failure. `merges.py` and `git.py` build on
-it, and nothing outside `impl/` touches it.
+Layer: core. Holds the repository root, the lock, and what every group needs:
+running git somewhere, reading a porcelain status, naming a failure. Nothing
+outside `impl/` touches it.
 
-Every operation is a subprocess call through `agl.core.command`, with refs and
-paths passed as arguments so nothing is ever interpolated into a shell string,
-and machine-readable output only — `--porcelain`, `-z`, `for-each-ref
---format` — because the human-readable forms are explicitly not an interface.
-
-Failures are classified after the fact rather than guarded against in advance.
-Asking `ref_exists` before every operation would double or triple the number of
-processes on the path where nothing is wrong, and it would still be a guess:
-git checks again anyway. So the command runs, and only when it refuses does the
-implementation ask what was wrong.
+Refs and paths are arguments, never interpolated into a shell string, and only
+machine-readable output is parsed. Failures are classified after the fact rather
+than guarded against: pre-checking every ref would triple the process count on
+the path where nothing is wrong, and git checks again anyway.
 """
 
 import threading
@@ -30,19 +23,11 @@ class GitRunner:
     """One repository, the lock over it, and the way commands reach it."""
 
     def __init__(self, path: Path) -> None:
-        """Resolve the main repository root from `path`.
+        """Resolves the *main* repository root from `path`, even inside a linked worktree.
 
-        Raises `VcsError` if `path` is not inside a git repository. The root is
-        the *main* one even when `path` is a linked worktree, so every later
-        call has one fixed place to run repository-wide commands from.
-
-        The lock guards operations that mutate shared repository state:
-        worktree add and remove, branch create and delete. Git's own
-        `index.lock` covers the index of one worktree and says nothing about
-        the worktree registry or `refs/heads`, so two threads adding worktrees
-        at once can otherwise lose an entry. A plain lock works whether the
-        caller is on the event loop or in a thread, and everything it guards is
-        milliseconds long.
+        Raises `VcsError` if `path` is not inside a git repository. The lock
+        guards what mutates shared state — the worktree registry, `refs/heads` —
+        which git's own per-worktree `index.lock` says nothing about.
         """
         try:
             common = self._git(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
@@ -87,16 +72,11 @@ class GitRunner:
                 raise UnknownRefError(ref)
 
     def _porcelain(self, cwd: Path | None) -> tuple[FileStatus, ...]:
-        """Parse `status --porcelain=v1 -z`.
+        """Parses `status --porcelain=v1 -z`.
 
-        Each field is `XY<space><path>`: the code is exactly two columns wide,
-        so it cannot be split off on whitespace — ` M` would lose its meaning.
-        NUL separation is what keeps a filename with a space in it one field. A
-        rename or copy is followed by an extra field holding the original path,
-        which is consumed and dropped: the entry is reported under its new path.
-
-        The two columns are reported with padding stripped, so an unstaged edit
-        and a staged one are both `M`, while `??` and `UU` stay as they are.
+        Each field is `XY<space><path>`, the code exactly two columns, so it
+        cannot be split on whitespace — ` M` would lose its meaning. A rename's
+        extra original-path field is dropped. Codes come back padding-stripped.
         """
         result = self._run(["status", "--porcelain=v1", "-z"], cwd)
         fields = iter(result.stdout.split("\0"))

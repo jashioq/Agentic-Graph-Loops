@@ -1,9 +1,9 @@
 """One ticket's pass: implement it, review it, then merge it or file bugs.
 
-Layer: workflows. The body the scheduler calls once per admitted ticket, and
-the steps it is made of. Every step asks `step_for` whether it is still owed and
-skips itself when it is not, which is what makes a resumed pass and a fresh one
-the same code. It imports nothing from `ticket_claims`, `halting` or `workflow`.
+Layer: workflows. The body the scheduler calls once per admitted ticket. Every
+step asks `step_for` whether it is still owed and skips itself when it is not,
+which is what makes a resumed pass and a fresh one the same code. Imports
+nothing from `ticket_claims`, `halting` or `workflow`.
 """
 
 from dataclasses import dataclass
@@ -47,11 +47,11 @@ class Loop:
 
 @dataclass(frozen=True)
 class Job:
-    """One ticket, bound to the worktree its work happens in and its two callbacks.
+    """One ticket bound to its worktree and its two callbacks.
 
-    Both callbacks close over the ticket id: concurrent tickets sharing either
-    would report into each other's rows. `ticket` is the snapshot this pass
-    began from, so anything asking about its status asks the state instead.
+    Both callbacks close over the ticket id, so concurrent tickets cannot report
+    into each other's rows. `ticket` is the snapshot this pass began from: ask
+    the state, not this, for a current status.
     """
 
     ticket: Ticket
@@ -71,8 +71,8 @@ def base_for(loop: Loop, ticket: Ticket) -> str:
 def step_of(loop: Loop, ticket: Ticket) -> Step:
     """What this ticket is owed right now, asked of git and the store.
 
-    Called before each of the three steps below rather than once at the top: a
-    step that has just run changes the answer.
+    Called before each step rather than once at the top: a step that has just
+    run changes the answer.
     """
     return step_for(
         look(
@@ -115,10 +115,9 @@ async def one_ticket(loop: Loop, node_id: NodeId) -> None:
 
 
 def _with_base(loop: Loop, ticket: Ticket, work: Work) -> Ticket:
-    """Record where this ticket's branch stood before any of its work, once.
+    """Records where this ticket's branch stood before any of its work, once.
 
-    A second pass finds the mark already there and leaves it: re-taking it
-    after the ticket's commit landed would erase the difference it measures.
+    A second pass finds the mark already there and leaves it.
     """
     # `base_sha` is taken once, in the same synchronous step that opens the worktree.
     if ticket.base_sha is not None:
@@ -139,12 +138,10 @@ def job(loop: Loop, ticket: Ticket, work: Work) -> Job:
 
 
 def asker(state: StateDocument, display: Display, ticket_id: str) -> Ask:
-    """The `ask` one ticket's calls are given, closed over the ticket it is for.
+    """Builds the `ask` one ticket's calls are given, closed over that ticket.
 
-    The ticket is suspended into `AWAITING_INPUT` for as long as the question is
-    open, so the dashboard says which row is waiting. The resume is in a
-    `finally` because a question that failed still leaves a ticket that is no
-    longer waiting on anybody.
+    Suspends the ticket into `AWAITING_INPUT` while the question is open, and
+    resumes it in a `finally`: a failed question still leaves nobody waiting.
     """
 
     async def ask(question: AgentQuestion) -> str:
@@ -158,10 +155,9 @@ def asker(state: StateDocument, display: Display, ticket_id: str) -> Ask:
 
 
 def _resumed(run: Run, ticket_id: str) -> Run:
-    """A waiting ticket put back where it was suspended from.
+    """A waiting ticket put back where it was suspended from, or left alone.
 
-    A ticket that is no longer waiting has already been resumed by something
-    else and is left alone, so the `finally` above is safe to run twice.
+    Idempotent, so the `finally` above is safe to run twice.
     """
     waiting = run.ticket(ticket_id)
     if waiting.resume_to is None:
@@ -194,12 +190,11 @@ async def review(loop: Loop, job: Job) -> tuple[Ticket, ...]:
 
 
 async def merge_it(loop: Loop, ticket: Ticket, branch: str) -> None:
-    """Hand the ticket's branch to the queue and record what became of it.
+    """Hands the ticket's branch to the merge queue and records what became of it.
 
-    A bug merges into its parent's branch, in the parent's still-open worktree;
-    everything else into the run's base branch, in the repository root.
-    `STOPPED` leaves the ticket `MERGING`: the queue is saying nobody will ever
-    deal with it, because the run is already ending on somebody else's halt.
+    A bug merges into its parent's branch in the parent's worktree, everything
+    else into the run's base branch at the repository root. `STOPPED` leaves the
+    ticket `MERGING`: the run is already ending on somebody else's halt.
     """
     loop.state.update(lambda run: with_status(run, ticket.id, Status.MERGING))
     cwd = loop.ctx.project.repo if ticket.parent is None else loop.trees.tree_of(ticket.parent)

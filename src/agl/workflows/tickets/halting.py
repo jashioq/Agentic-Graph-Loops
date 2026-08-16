@@ -1,8 +1,7 @@
 """Everything about a run stopping: what a halt says, and what puts one there.
 
-Layer: workflows. This run's halt policy — the runtime reports an outcome and
-these decide what it means. It writes the state document and reads the display;
-nothing below `workflows` may import it.
+Layer: workflows. This run's halt policy — the runtime reports an outcome, these
+decide what it means. Nothing below `workflows` may import it.
 """
 
 from agl.runtime.dag import NodeId
@@ -24,10 +23,9 @@ TAIL_LINES = 20
 
 
 def halt_for(outcome: MergeOutcome) -> Halt:
-    """The halt this run shows for a merge that did not land.
+    """Takes a merge outcome that did not land, returns the halt this run shows for it.
 
-    Resumable when a person editing the repository changes the answer — a
-    conflict to resolve, a build to fix — and not otherwise.
+    return: Halt - resumable only when editing the repository changes the answer
     """
     if outcome.status is MergeStatus.CONFLICT:
         return Halt(
@@ -51,7 +49,7 @@ def halt_for(outcome: MergeOutcome) -> Halt:
 
 
 def _tail(text: str, lines: int) -> str:
-    """The last `lines` lines of `text`, and nothing about which ones matter."""
+    """The last `lines` lines of `text`."""
     kept = text.strip("\n").split("\n")[-lines:]
     return "\n".join(kept)
 
@@ -59,11 +57,9 @@ def _tail(text: str, lines: int) -> str:
 async def resolve(
     display: Display, state: StateDocument, label: str, outcome: MergeOutcome
 ) -> MergeDecision:
-    """What a merge that did not land means to this run.
+    """Decides what a merge that did not land means to this run.
 
-    A halt a person can act on holds the run at the dashboard until they press
-    enter, then looks at git again. One they cannot ends the queue, and the run
-    comes back with the halt still set.
+    return: MergeDecision - `RETRY` after a person cleared an actionable halt, else `STOP`
     """
     halt = halt_for(outcome)
     state.update(lambda run: with_halt(run, halt))  # the dashboard shows it next frame
@@ -75,7 +71,10 @@ async def resolve(
 
 
 def failed(state: StateDocument, node_id: NodeId | None, error: BaseException) -> None:
-    """An exception out of a ticket, or out of the loop itself: a halt to restart from."""
+    """Records an exception out of a ticket, or the loop itself, as a halt to restart from.
+
+    param: node_id - the ticket that raised, or `None` for the loop
+    """
     who = node_id if node_id is not None else "the run"
     halt = Halt(f"{who} failed: {error}", str(error), resumable=False)
     state.update(lambda run: with_halt(run, halt))

@@ -1,11 +1,9 @@
 """What each role may reach, built as closures over the store.
 
-Layer: workflows. Composes `agent` and `store`, imported from their package
-roots. Scoping is the closure, not a permission check: a factory closes over
-exactly what a role may touch — one store, one key, one ticket id — and the tool
-it hands back has no parameter that could widen it. Invalid input comes back as
-a string the agent reads, and nothing is written. Every `description` is a
-prompt, written for the model that will read it.
+Layer: workflows. Scoping is the closure: a factory closes over what a role may
+touch, and the tool it returns has no parameter that could widen it. Invalid
+input comes back as a string and nothing is written. Every `description` is a
+prompt written for the model.
 """
 
 import json
@@ -63,17 +61,14 @@ _CONTENT_SCHEMA: dict[str, Any] = {
     "required": [_CONTENT],
     "additionalProperties": False,
 }
-"""The schema for a write: the document, and nothing about where it goes.
-
-Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
-than mutating it."""
+"""The schema for a write: the document, and nothing about where it goes. Read-only."""
 
 
 # -- reads ----------------------------------------------------------------
 
 
 def read_spec(store: Store) -> Tool:
-    """The spec, for a role that is allowed to know what was agreed."""
+    """Builds a no-argument tool returning the run's spec, or a note if none was written."""
     return Tool(
         name="read_spec",
         description=(
@@ -87,7 +82,7 @@ def read_spec(store: Store) -> Tool:
 
 
 def read_standards(store: Store) -> Tool:
-    """The project's coding standards."""
+    """Builds a no-argument tool returning the coding standards, or a note if unwritten."""
     return Tool(
         name="read_standards",
         description=(
@@ -101,11 +96,10 @@ def read_standards(store: Store) -> Tool:
 
 
 def get_ticket(store: Store, ticket_id: str) -> Tool:
-    """One ticket, bound at build time. The model is given no way to say which.
+    """Builds a tool answering with one ticket, read from the state at call time.
 
-    Answered out of the run's state rather than the decomposition, because a bug
-    ticket is filed into the state and never appears in `tickets.json`. Read at
-    call time, so a ticket the run has since edited reads as it is now.
+    param: ticket_id - the only ticket it will ever answer with; the model cannot widen it
+    return: Tool - the ticket as JSON, or why it could not be read
     """
 
     state = StateDocument(StateFile(store))
@@ -143,7 +137,7 @@ def get_ticket(store: Store, ticket_id: str) -> Tool:
 
 
 def save_spec(store: Store) -> Tool:
-    """Stores the spec at the key this closure chose."""
+    """Builds a tool storing the spec at the key this closure chose."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         content = arguments.get(_CONTENT)
@@ -165,10 +159,7 @@ def save_spec(store: Store) -> Tool:
 
 
 def save_tickets(store: Store) -> Tool:
-    """Stores the decomposition, refusing anything that is not a usable set.
-
-    Validated by `tickets_from_json` before a byte is written.
-    """
+    """Builds a tool storing the decomposition, validated by `tickets_from_json` first."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
@@ -195,10 +186,10 @@ def save_tickets(store: Store) -> Tool:
 
 
 def save_findings(store: Store, ticket_id: str, round_: int, source: str) -> Tool:
-    """Stores one reviewer's findings, refusing anything that is not a usable set.
+    """Builds a tool storing one reviewer's findings under a closed-over key.
 
-    The key is closed over — `review_key(ticket_id, round_, source)` — so
-    nothing an agent passes can land its findings anywhere else.
+    param: source - which reviewer, one of `REVIEWERS`
+    return: Tool - validates, then writes; nothing an agent passes can move the key
     """
 
     key = review_key(ticket_id, round_, source)
@@ -234,10 +225,10 @@ def save_findings(store: Store, ticket_id: str, round_: int, source: str) -> Too
 
 
 def save_triage(store: Store, ticket_id: str, round_: int, highs: Sequence[Finding]) -> Tool:
-    """Stores the triage groups, refusing anything that does not cover every `HIGH`.
+    """Builds a tool storing triage groups, checked for shape then for coverage.
 
-    Validated in two stages: `bug_groups_from_json` for shape, then
-    `check_coverage` against the `highs` this closure holds.
+    param: highs - the `HIGH` findings the groups must cover exactly
+    return: Tool - refuses and writes nothing unless coverage holds
     """
 
     key = review_key(ticket_id, round_, "triage")
@@ -293,11 +284,7 @@ def implement_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
 
 
 def review_quality_tools(store: Store, ticket_id: str, round_: int) -> tuple[Tool, ...]:
-    """Reviewing one ticket against the standards. **No spec access.**
-
-    It judges the code as code. Handed the spec it re-argues design decisions
-    settled with the user, and files findings nobody can act on.
-    """
+    """Reviewing one ticket against the standards. No spec access: it judges code as code."""
     return (
         get_ticket(store, ticket_id),
         read_standards(store),
@@ -325,11 +312,7 @@ def triage_tools(
 
 
 def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awaitable[str]]:
-    """A no-argument handler over one document, missing or not.
-
-    A store with no `standards.md` is a project that has not written any: a fact
-    the agent works around, not a reason to end a run that had already started.
-    """
+    """A no-argument handler reading one key, answering with `what` when it is missing."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
@@ -341,12 +324,9 @@ def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awa
 
 
 def _entry(ticket: Ticket) -> dict[str, Any]:
-    """One ticket as the role holding it reads it: what to build, and what it waits for.
+    """One ticket as an agent reads it: what to build and what it waits for.
 
-    The run's own bookkeeping — status, review round, base sha — is deliberately
-    not here: none of it is anything an agent decides. `parent` stays, and is
-    rendered on every ticket rather than only on bugs, so the answer has one
-    shape.
+    Omits the run's own bookkeeping — status, round, base sha — which no agent decides.
     """
     return {
         "id": ticket.id,

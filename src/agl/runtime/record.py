@@ -1,27 +1,13 @@
 """A run's two documents: the record it was started from, and its state.
 
-Layer: runtime. Imports `agl.core.store` and nothing else — a run's documents
-are keys in a store, and where that store puts them is the store's business.
+Layer: runtime. Imports `agl.core.store` and nothing else.
 
-The two differ in when they are written, and that is the whole design. The
-**record** is written once, after preflight, and never again: it is what a run
-was asked for — workflow, label, request, base branch, project, concurrency —
-and none of that can change without the run being a different run. `agl resume`
-reads it before it can build a `RunContext` at all, which is why it is separate
-from the state rather than a corner of it.
-
-The **state** is the run's only mutable truth, rewritten whole every time it
-moves. This module says nothing about what is in it; it owns the reading, the
-writing and the version stamp, and leaves the shape to the workflow whose state
-it is. Everything a run could derive instead — the stage it has reached, the
-dependency graph, the merge queue's contents — is derived, because a stored copy
-is a second truth waiting to disagree with the first.
-
-Both documents carry `version`. A document from a build that is not this one is
-refused rather than guessed at: half-understanding a state document is how a run
-resumes into a shape nobody wrote. The stamp is this module's concern alone, so
-a caller neither writes it nor sees it — `save` puts it on and `load` takes it
-off, and what a caller gets back is exactly the payload it gave.
+The **record** is written once after preflight and never again — what a run was
+asked for, which `agl resume` must read before it can build a `RunContext`. The
+**state** is the run's only mutable truth, rewritten whole on every move; this
+module owns reading, writing and the version stamp, and leaves the shape to the
+workflow. A document from another build is refused, never guessed at. The stamp
+is invisible to callers: `save` puts it on, `load` takes it off.
 """
 
 from collections.abc import Callable, Mapping
@@ -62,10 +48,7 @@ class StateError(Exception):
 class RunRecord:
     """What a run was asked for, fixed at preflight and true for its whole life.
 
-    Every field is something `agl resume` needs before it has a context to ask
-    anything else with: which workflow to hand the run back to, which label
-    names it, and the request, branch, project and concurrency the original
-    invocation settled on.
+    Every field is one `agl resume` needs before it has a context at all.
     """
 
     workflow: str
@@ -77,21 +60,17 @@ class RunRecord:
 
 
 def write_record(store: Store, record: RunRecord) -> None:
-    """Write the record under `RUN_KEY`, stamped with this build's version.
+    """Writes the record under `RUN_KEY`, stamped with this build's version.
 
-    Called once, after preflight. Writing it twice is not an error the store can
-    see, but it is one the run has: the record is the thing that does not change.
+    Called once, after preflight: the record is the thing that does not change.
     """
     store.write_json(RUN_KEY, {_VERSION_FIELD: VERSION, **asdict(record)})
 
 
 def read_record(store: Store) -> RunRecord:
-    """The record a run was started from. Raises `RecordError`.
+    """The record a run was started from.
 
-    Every way of failing is one `RecordError`, because the caller does the same
-    thing about all of them — there is no run here it can resume. That covers a
-    missing document, one that is not JSON, one from a version this build does
-    not know, and one whose fields are absent or of the wrong type.
+    return: RunRecord - every way of failing is one `RecordError`: there is no run to resume
     """
     payload = _read_object(store, RUN_KEY, RecordError, "record")
     _require_version(payload, RecordError, "record")
@@ -122,11 +101,7 @@ class StateFile:
     def load(self) -> dict[str, Any] | None:
         """The stored payload, or `None` when the run has never written one.
 
-        `None` is not an error: a run that has not saved its state yet is the
-        ordinary first moment of a run, and it is the caller that knows what an
-        absent state means. Anything else that stops the document from being
-        understood — not JSON, not an object, a version this build does not know
-        — raises `StateError`.
+        `None` is not an error; anything else unreadable raises `StateError`.
         """
         if not self._store.exists(self._key):
             return None
@@ -135,25 +110,19 @@ class StateFile:
         return {key: value for key, value in payload.items() if key != _VERSION_FIELD}
 
     def save(self, payload: Mapping[str, Any]) -> None:
-        """Replace the document with `payload`, stamped with this build's version.
+        """Replaces the document with `payload`, whole, stamped with this build's version.
 
-        The whole state, every time. The store writes through a temp file and
-        `os.replace`, so a reader meets the old document or the new one and
-        never half of either.
+        The store writes atomically, so a reader never meets half a document.
         """
         self._store.write_json(self._key, {_VERSION_FIELD: VERSION, **payload})
 
     def update(
         self, change: Callable[[dict[str, Any] | None], Mapping[str, Any]]
     ) -> dict[str, Any]:
-        """Read, hand the payload to `change`, store what it returns, and return that.
-
-        Synchronous on purpose, and `change` must be too. Load, decide and save
-        contain no `await`, so on a single-threaded event loop no other task can
-        run between the read and the write and no mutation can be interleaved
-        with another. An `await` anywhere in here — or in `change` — gives that
-        up, and two tasks each save a state built from the same stale read.
-        """
+        """Read, hand the payload to `change`, store what it returns, and return that."""
+        # `StateFile.update` must stay synchronous, with no `await` in it or in
+        # `change`: an await between the read and the write lets two tasks each
+        # save a state built from the same stale read.
         updated = dict(change(self.load()))
         self.save(updated)
         return updated

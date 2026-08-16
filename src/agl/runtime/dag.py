@@ -1,28 +1,14 @@
 """A directed acyclic graph of work items and the scheduling questions about it.
 
-Layer: runtime. A pure data structure — no I/O, no async, no imports from the rest
-of `agl`. Node ids are opaque strings; the graph knows nothing about what they
-stand for. A workflow that wants to attach a payload keeps its own dict keyed by
-the same ids.
+Layer: runtime. A pure data structure — no I/O, no async, nothing imported from
+`agl`. Node ids are opaque strings. Edges point from blocked to blocker:
+`add_edge(blocked, blocker)` means `blocked` waits for `blocker` to be `DONE`.
+Every mutation validates first, so a raising one leaves the graph unchanged.
 
-Edges point from blocked to blocker: `add_edge(blocked, blocker)` means `blocked`
-cannot start until `blocker` is `DONE`. Every mutation validates before it
-touches anything, so a raising mutation leaves the graph exactly as it was.
-
-Mutating a graph that is already running has one load-bearing ordering. When
-work discovered mid-run must block a node that is already claimed — the claimed
-node turning out to depend on something nobody knew about when it started — the
-sequence is: **add the new nodes, add the edges, then release the claimed one.**
-Releasing first leaves it ready for a beat, and a scheduler that happens to look
-in that window claims it out from under the work meant to block it. Adding an
-edge to a still-`CLAIMED` node is legal by design, which is what makes
-edges-first safe.
-
-That same permissiveness is what lets a graph be *derived* rather than replayed.
-A live graph adds `PENDING` nodes and moves them; a graph rebuilt from a
-snapshot states each node's state as it adds it and then adds the edges, in one
-pass and in any order. Nothing is kept between rebuilds, so a derived graph
-cannot disagree with the snapshot it came from.
+Mutating a running graph has one load-bearing ordering: add the new nodes, add
+the edges, *then* release the claimed one — releasing first leaves a window a
+scheduler can claim through. Edges onto `CLAIMED` and `DONE` nodes are legal,
+which is also what lets a graph be rebuilt from a snapshot in a single pass.
 """
 
 from collections.abc import Callable, Iterable
@@ -47,8 +33,7 @@ type NodeId = str
 class CycleError(Exception):
     """Raised when a mutation would introduce a cycle. The graph is unchanged.
 
-    `cycle` runs from the edge's `blocked` node along blocker edges back around
-    to it, so its first and last entries are the same node.
+    `cycle` starts and ends on the same node.
     """
 
     def __init__(self, cycle: tuple[NodeId, ...]) -> None:
@@ -78,11 +63,9 @@ class Dag:
     def __init__(
         self, priority: "Callable[[NodeId], SupportsRichComparison] | None" = None
     ) -> None:
-        """Build an empty graph.
+        """Builds an empty graph.
 
-        `priority` is a sort key applied to `ready()` results; `None` keeps
-        insertion order. Ties keep insertion order either way. The key must
-        return something sortable, and a checker says so at the call site.
+        param: priority - sort key over `ready()`; `None` keeps insertion order, as do ties
         """
         self._priority = priority
         self._states: dict[NodeId, NodeState] = {}
@@ -92,15 +75,9 @@ class Dag:
     # -- mutation ---------------------------------------------------------
 
     def add_node(self, node_id: NodeId, state: NodeState = NodeState.PENDING) -> None:
-        """Add a node, `PENDING` unless told otherwise. Raises `ValueError` on a duplicate id.
+        """Adds a node, raising `ValueError` on a duplicate id.
 
-        The default is the live path: work appears not yet started and the
-        transitions above are what move it. Passing a state is the derive path
-        — a graph rebuilt from a snapshot has no history to replay, so it states
-        each node as it is and reaches the same graph in one pass. That is safe
-        for exactly the reason `add_edge` gives: an edge onto a `DONE` or
-        `CLAIMED` node is already legal, so the nodes can be stated in any order
-        and the edges added afterwards.
+        param: state - omit on the live path; pass it when rebuilding from a snapshot
         """
         if node_id in self._states:
             raise ValueError(f"duplicate node id: {node_id!r}")
@@ -109,16 +86,10 @@ class Dag:
         self._dependents[node_id] = set()
 
     def add_edge(self, blocked: NodeId, blocker: NodeId) -> None:
-        """Make `blocked` wait for `blocker` to be `DONE`.
+        """Makes `blocked` wait for `blocker` to be `DONE`.
 
-        Idempotent for an edge that already exists. Raises `UnknownNodeError` if
-        either id is absent and `CycleError` if the edge would close a loop,
-        leaving the graph unchanged in both cases.
-
-        Either node's state is irrelevant. An edge onto a `DONE` blocker is
-        allowed and changes nothing — a finished blocker is a satisfied one — and
-        a blocker added to a `CLAIMED` node is allowed too: that node keeps
-        running, since `ready()` only ever speaks about `PENDING` nodes.
+        Idempotent, and indifferent to either node's state. Raises
+        `UnknownNodeError` or `CycleError`, leaving the graph unchanged.
         """
         self._require(blocked)
         self._require(blocker)
@@ -131,10 +102,9 @@ class Dag:
         self._dependents[blocker].add(blocked)
 
     def claim(self, node_id: NodeId) -> None:
-        """Hand a ready node to a worker: `PENDING` -> `CLAIMED`.
+        """Hands a ready node to a worker: `PENDING` -> `CLAIMED`.
 
-        Raises `UnknownNodeError`, or `ValueError` if the node is not ready —
-        already claimed, already done, or still blocked.
+        Raises `UnknownNodeError`, or `ValueError` if the node is not ready.
         """
         self._require(node_id)
         if self._states[node_id] is not NodeState.PENDING:
@@ -147,11 +117,8 @@ class Dag:
     def claim_next(self) -> NodeId | None:
         """The highest-priority ready node, claimed, or `None` if nothing is ready.
 
-        Synchronous, and that is the whole point: reading the ready set and
-        claiming out of it is one step no caller can separate. A scheduler that
-        called `ready()`, awaited, and only then called `claim()` would hand the
-        same node to two workers, which is the one thing a claim exists to
-        prevent. Priority ordering is `ready()`'s.
+        Synchronous on purpose: reading the ready set and claiming out of it is
+        one step no caller can split, so no node reaches two workers.
         """
         ready = self.ready()
         if not ready:
@@ -160,14 +127,14 @@ class Dag:
         return ready[0]
 
     def release(self, node_id: NodeId) -> None:
-        """Give a failed node back for a retry: `CLAIMED` -> `PENDING`.
+        """Gives a failed node back for a retry: `CLAIMED` -> `PENDING`.
 
         Raises `UnknownNodeError`, or `ValueError` from any other state.
         """
         self._transition(node_id, NodeState.CLAIMED, NodeState.PENDING)
 
     def complete(self, node_id: NodeId) -> None:
-        """Finish a node: `CLAIMED` -> `DONE`, and it stops blocking dependents.
+        """Finishes a node: `CLAIMED` -> `DONE`, and it stops blocking dependents.
 
         Raises `UnknownNodeError`, or `ValueError` from any other state.
         """
@@ -217,8 +184,7 @@ class Dag:
     def ready(self) -> tuple[NodeId, ...]:
         """Every `PENDING` node whose blockers are all `DONE`, sorted by priority.
 
-        `CLAIMED` and `DONE` nodes are excluded, so this is exactly the set a
-        scheduler may start right now.
+        Exactly the set a scheduler may start right now.
         """
         pending = [
             node_id
@@ -230,11 +196,7 @@ class Dag:
         return tuple(sorted(pending, key=self._priority))
 
     def levels(self) -> tuple[tuple[NodeId, ...], ...]:
-        """Nodes grouped by depth, where depth is the longest path from any root.
-
-        A node with no blockers sits at level 0; every other node sits one below
-        its deepest blocker. Order within a level is insertion order.
-        """
+        """Nodes grouped by depth, longest path from any root, insertion order within."""
         depths: dict[NodeId, int] = {}
         for node_id in self._states:
             self._depth(node_id, depths)
@@ -250,11 +212,9 @@ class Dag:
         return all(state is NodeState.DONE for state in self._states.values())
 
     def is_stalled(self) -> bool:
-        """Not complete, nothing claimed, and nothing ready — the graph cannot advance.
+        """Not complete, nothing claimed, nothing ready — the graph cannot advance.
 
-        A workflow that sees this has a bug; the graph only reports the condition.
-        It separates a scheduler waiting on work in flight from one that will
-        wait forever, so a bad graph says so instead of hanging silently.
+        Separates a scheduler waiting on work in flight from one waiting forever.
         """
         if self.is_complete() or self.ready():
             return False
@@ -276,8 +236,7 @@ class Dag:
     def _is_blocked(self, node_id: NodeId) -> bool:
         """Whether anything still holds `node_id` back.
 
-        `unsatisfied_blockers` answers the same question, but builds and orders
-        the whole list — a pass over every node — to say whether one exists.
+        `unsatisfied_blockers` answers the same question but builds the list;
         `ready()` asks this of every node, which is linear against quadratic.
         """
         return any(
@@ -295,11 +254,7 @@ class Dag:
         return tuple(node_id for node_id in self._states if node_id in wanted)
 
     def _path_to(self, start: NodeId, target: NodeId) -> tuple[NodeId, ...] | None:
-        """A blocker-edge path from `start` to `target`, or `None` if there is none.
-
-        Used before committing an edge: if the new blocker already depends on the
-        blocked node, the edge would close a loop.
-        """
+        """A blocker-edge path from `start` to `target`, or `None`. Checked before an edge."""
         if start == target:
             return (start,)
         path: list[NodeId] = []

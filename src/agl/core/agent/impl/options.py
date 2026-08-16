@@ -1,32 +1,17 @@
 """One `AgentSpec` turned into one `ClaudeAgentOptions`. Pure — no I/O.
 
-Layer: core. This is where hermetic configuration is decided, which makes it the
-most important thing in the module to get right: a run has to be reproducible,
-and the target project must contribute source code and nothing else.
+Layer: core. Where hermetic configuration is decided: the target project must
+contribute source code and nothing else. Three load-bearing options do it, and
+all three are easy to lose by accident:
 
-Three options do that work, and all three are easy to lose by accident:
+- `setting_sources=[]` — read no settings file anywhere. `None` reads them all.
+- `strict_mcp_config=True` — ignore the project's `.mcp.json`.
+- `settings` — our own file, absolute, because `cwd` is the target repository.
 
-- `setting_sources=[]` — do not read `~/.claude/settings.json`, the project's
-  `.claude/`, or anyone's local overrides. `None` means "read them all", so the
-  empty list is load-bearing and is asserted on in the tests.
-- `strict_mcp_config=True` — ignore the project's `.mcp.json`. Only servers
-  passed in here exist.
-- `settings` — our own file, when the caller has one. It arrives absolute
-  because `ClaudeRunner` resolves it, which is enforcement rather than an
-  assumption: `cwd` is the target repository, so a relative path would be read
-  from inside the very repo these three options exist to seal out.
-
-Nothing is put in `allowed_tools`. The permission callback allows every tool
-that is not the question tool, so an allow rule would only skip a round trip —
-and for `AskUserQuestion` it would skip the callback that carries the user's
-answers, approving a question nobody was asked. `disallowed_tools` is passed
-through: deny rules resolve ahead of the callback and hold even under
-`bypassPermissions`.
-
-Not loading `project` settings also means the target repo's `CLAUDE.md` is not
-loaded. That is intentional: a caller that wants it reads it and passes it
-through `system_prompt_append`, which keeps the loading explicit and visible in
-the prompt rather than implicit in the working directory.
+Nothing is pre-allowed; `disallowed_tools` passes through, since deny rules
+resolve ahead of the permission callback. Skipping `project` settings also
+skips the repo's `CLAUDE.md` — a caller that wants it passes it through
+`system_prompt_append`, where it is visible in the prompt.
 """
 
 from pathlib import Path
@@ -51,14 +36,10 @@ def build_options(
 ) -> ClaudeAgentOptions:
     """The options for one call, with every configuration source pinned shut.
 
-    `mcp_servers` is a separate argument rather than being derived from the
-    spec, because a caller may need a server the spec did not ask for — a
-    keep-alive server, for instance — and this function should not have to know
-    why.
-
-    Raises `ValueError` when the spec's permission mode is not one the SDK
-    knows. The spec types it as `str` to keep the API free of SDK types, so
-    this is where the check the `Literal` would have given us happens.
+    param: mcp_servers - separate from the spec, so a caller can add one the
+        spec never asked for, such as the keep-alive server
+    return: ClaudeAgentOptions - raises `ValueError` on a permission mode the SDK
+        does not know, which the spec's `str` typing cannot catch
     """
     if spec.permission_mode not in PERMISSION_MODES:
         raise ValueError(

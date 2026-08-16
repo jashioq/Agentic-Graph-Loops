@@ -1,20 +1,15 @@
 """Project configuration: `AGL_HOME` and one project's `config.toml`.
 
-Layer: sits below workflows and cli, alongside core, but is not a core module —
-it is the one place that knows about `config.toml` as a file format, which no
-core module needs to know.
-
-AGL lives outside the projects it drives::
+Layer: cli-only, alongside core but not of it — the one place that knows
+`config.toml` as a file format. AGL lives outside the projects it drives::
 
     $AGL_HOME/projects/<dir>/config.toml
     $AGL_HOME/projects/<dir>/standards.md
     $AGL_HOME/runs/<label>/
 
-`<dir>` is for the user's own organisation, not identity — a project is
-identified by its `repo` field, matched against the git root of the repository
-a command is run from. That means loading a project is a scan: every
-`config.toml` under `projects/` is read and the ones whose `repo` matches are
-counted, with zero or more-than-one both being errors a person can act on.
+`<dir>` is the user's own organisation, not identity: a project is identified by
+its `repo` field, so loading one is a scan over every `config.toml`, and zero or
+several matches are both errors a person can act on.
 """
 
 import os
@@ -62,10 +57,7 @@ def agl_home() -> Path:
 def resolve_agl_home() -> Path:
     """`AGL_HOME` from the environment, without requiring it to exist yet.
 
-    `agl init` is often the first command run against a fresh `AGL_HOME` and
-    is what creates the directory, so it resolves the path this way instead
-    of through `agl_home`. Every other caller wants the directory to already
-    be there and should use `agl_home`.
+    For `agl init`, which creates it. Every other caller wants `agl_home`.
     """
     raw = os.environ.get("AGL_HOME")
     if not raw:
@@ -74,11 +66,9 @@ def resolve_agl_home() -> Path:
 
 
 def load_project(home: Path, repo_root: Path) -> ProjectConfig:
-    """The project whose `repo` matches `repo_root`.
+    """The project whose `repo` matches `repo_root`, scanning `projects/*/config.toml`.
 
-    Scans every `projects/*/config.toml` under `home`. Raises `ConfigError` if
-    none match — naming `repo_root` and where configs are read from — or if
-    more than one does, naming every matching file.
+    return: ProjectConfig - raises `ConfigError` on no match or several, naming them
     """
     repo_root = repo_root.resolve()
     projects_dir = home / "projects"
@@ -103,10 +93,7 @@ def load_project(home: Path, repo_root: Path) -> ProjectConfig:
 def find_project_by_repo(home: Path, repo_root: Path) -> Path | None:
     """The `config.toml` that already claims `repo_root`, if any.
 
-    Scans the same `projects/*/config.toml` glob `load_project` does. `agl
-    init` calls this before writing a new project, so the duplicate-repo case
-    `load_project` would raise on later is caught earlier, where naming the
-    conflicting file is friendlier than a failed `agl run`.
+    For `agl init`, so a duplicate repo is caught before it becomes a failed run.
     """
     repo_root = repo_root.resolve()
     projects_dir = home / "projects"

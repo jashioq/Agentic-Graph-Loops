@@ -61,7 +61,27 @@ particular loop. The first workflow is a ticket orchestrator.
 - Frozen dataclasses for data. No metaclasses, no decorator registration,
   no dynamic imports.
 - Files under ~300 lines. Split into a package when exceeded.
-- Module docstring stating the contract and the layer.
+- Module docstring stating the contract and the layer, in ~8 lines or fewer.
+
+### Docstrings are lean
+
+Full prose documentation lives outside the code. A docstring exists to aid
+someone who has already read it, so:
+
+- One summary line saying what the function does: takes something, does
+  something to it, returns something.
+- Then `param:` and `return:` lines, **only where the signature does not
+  already say it**:
+
+      param: dag - the graph of work items and what blocks what
+      param: scheduler - decides which node runs next
+      return: Worktree - the tree the chosen node's work happens in
+
+- Nothing else. No design rationale, no history, no justification of decisions
+  already taken. An invariant a future edit could silently break is a one-line
+  `#` comment on the code it constrains, not a paragraph.
+- A one-line docstring is the common case. Reach for the `param:`/`return:`
+  block when a call site genuinely cannot be written without it.
 
 ## TDD
 

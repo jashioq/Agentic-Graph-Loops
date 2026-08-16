@@ -1,9 +1,8 @@
 """The `state.json` codec, and the document over it, as this workflow's `Run`.
 
 Layer: workflows. The one place that knows what a ticket run's state document
-looks like; `runtime.record` owns how it reaches disk and says nothing about
-what is inside it. Every field is re-checked on the way in, because the writer
-may be a person with an editor.
+looks like; `runtime.record` owns how it reaches disk. Every field is re-checked
+on the way in, because the writer may be a person with an editor.
 """
 
 from collections.abc import Callable, Mapping
@@ -43,11 +42,7 @@ _HALT_FIELDS = ("reason", "detail", "resumable")
 
 
 def to_json(run: Run) -> dict[str, Any]:
-    """`run` as the document's payload — every field, every time.
-
-    Nothing is omitted for being empty or defaulted: people diff one run against
-    another, and a field that appears only sometimes is a default to remember.
-    """
+    """`run` as the document's payload — every field, every time, none omitted."""
     return {
         _HALT: None if run.halt is None else _halt_json(run.halt),
         _TICKETS: [_ticket_json(ticket) for ticket in run.tickets],
@@ -57,8 +52,7 @@ def to_json(run: Run) -> dict[str, Any]:
 def from_json(payload: Mapping[str, Any]) -> Run:
     """The `Run` a payload describes, raising `InvalidStateError` if it describes none.
 
-    `check` has the last word: a document that parses into tickets which cannot
-    all be true at once is refused whole, before a run acts on half of it.
+    `check` has the last word, so a document is refused whole or not at all.
     """
     reject_unknown_fields(payload, [_TICKETS, _HALT], "state", InvalidStateError)
     raw = payload.get(_TICKETS, [])
@@ -83,8 +77,7 @@ class StateDocument:
     def load(self) -> Run:
         """The stored state, strictly. An absent document is an empty `Run`.
 
-        Nothing written yet is the ordinary first moment of a run; anything else
-        that stops the document being understood raises `InvalidStateError`.
+        Anything else unreadable raises `InvalidStateError`.
         """
         try:
             payload = self._file.load()
@@ -95,11 +88,7 @@ class StateDocument:
         return run
 
     def latest(self) -> Run:
-        """The stored state, or the last one that parsed if this one will not.
-
-        For the render loop alone: a picture that is a second out of date is
-        better than a traceback where the dashboard was.
-        """
+        """The stored state, or the last one that parsed. For the render loop alone."""
         try:
             return self.load()
         except InvalidStateError:

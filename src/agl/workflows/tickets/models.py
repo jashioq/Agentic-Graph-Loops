@@ -56,12 +56,9 @@ class Ticket:
 # interrupt.
 _RUNNING = (Status.IN_PROGRESS, Status.IN_REVIEW, Status.MERGING)
 
-# The legal moves, as data. Re-entry is legal for every resting status, which
-# lets a caller re-stamp how long a ticket has been where it is. `MERGED` is
-# terminal; `AWAITING_INPUT` suspends another status rather than being one a
-# ticket rests in, so it has no re-entry.
-#
-# `_MOVES`: `PENDING` is every claimed status' way in and out.
+# The legal moves, as data. Re-entry is legal for every resting status; `MERGED`
+# is terminal; `AWAITING_INPUT` suspends a status rather than being one, so it
+# has no re-entry. `PENDING` is every claimed status' way in and out.
 _MOVES: dict[Status, frozenset[Status]] = {
     Status.PENDING: frozenset(
         {

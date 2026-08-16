@@ -22,8 +22,7 @@ from agl.workflows.tickets.models import Status, Ticket
 __all__ = ["TICKETS_KEY", "TICKETS_SCHEMA", "tickets_from_json"]
 
 # The same shape `paths.validate_node_id` enforces, spelled out rather than
-# imported: this file stays free of `agl.core`, and an id that reaches a branch
-# name has to satisfy that function regardless of which one of us checks first.
+# imported so this file stays free of `agl.core`.
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]*$"
 _ID_RE = re.compile(_ID_PATTERN)
 
@@ -61,20 +60,17 @@ TICKETS_SCHEMA: dict[str, Any] = {
     "required": [TICKETS_KEY],
     "additionalProperties": False,
 }
-"""The schema `tools.save_tickets` hands the model for its `tickets` argument.
+"""The schema `tools.save_tickets` hands the model. Read-only.
 
-It describes what an agent supplies, not what a `Ticket` holds: `status`,
-`review_round` and `parent` are the orchestrator's. Read-only by convention,
-like `agent.NO_PARAMS` — hand it to a `Tool` rather than mutating it."""
+Describes what an agent supplies, not what a `Ticket` holds: `status`,
+`review_round` and `parent` are the orchestrator's."""
 
 
 def tickets_from_json(data: Any) -> tuple[Ticket, ...]:
-    """Parse decompose-agent output into tickets, raising `InvalidTicketsError`.
+    """Parses decompose-agent output into tickets, raising `InvalidTicketsError`.
 
-    Re-checks everything `TICKETS_SCHEMA` states, because a schema handed to a
-    model is a request rather than a guarantee, plus the two rules JSON schema
-    cannot express: ids are unique, and every `blocked_by` names a ticket in the
-    same set.
+    Re-checks the whole schema — a schema handed to a model is a request, not a
+    guarantee — plus unique ids and resolvable blockers, which it cannot state.
     """
     payload = as_object(data, "output", InvalidTicketsError)
     require_fields(payload, [TICKETS_KEY], "output", InvalidTicketsError)
@@ -91,7 +87,7 @@ def tickets_from_json(data: Any) -> tuple[Ticket, ...]:
 
 
 def _one_ticket(item: Any, index: int) -> Ticket:
-    """Build one ticket from one array entry, checking every field it names."""
+    """Builds one ticket from one array entry, checking every field it names."""
     where = f"ticket {index}"
     fields = as_object(item, where, InvalidTicketsError)
     require_fields(fields, _REQUIRED, where, InvalidTicketsError)

@@ -1,20 +1,12 @@
 """Running an external command and getting its output back.
 
-Layer: core. A shared helper rather than a module in its own right: `vcs` runs
-git through it and the merge gate runs a project's build through it. It is
-outside the independence contract for that reason, and it stays outside by
-knowing nothing about git, builds, agents, or anything else above it. Two
-callers sharing one subprocess runner is what the helper is for; the contract
-exists to stop `vcs` reaching into `store`.
+Layer: core. The shared subprocess runner `vcs` and the merge build gate both
+call. Outside the core independence contract deliberately, and it stays outside
+by knowing nothing about git, builds or agents.
 
-Never `shell=True`: arguments are passed as a list so a ref or a filename can
-never be read as syntax. Both streams are captured and decoded as UTF-8 with
-`errors="replace"`, because a diff may carry bytes that are not text and a
-mangled character is a better outcome than an exception from the middle of a
-merge.
-
-Output is never truncated. Which slice of a failed build matters is
-language-specific, so the caller that knows what it is running decides.
+Never `shell=True`: argv is a list, so a ref or filename can never be read as
+syntax. Both streams are decoded UTF-8 with `errors="replace"`, and output is
+never truncated — which slice matters is the caller's call.
 """
 
 import asyncio
@@ -26,13 +18,8 @@ from pathlib import Path
 __all__ = ["TIMEOUT_CODE", "ExecError", "ExecResult", "run", "run_async"]
 
 TIMEOUT_CODE = -1
-"""The `code` a timed-out command is reported with. Non-zero, so a caller
-checking only for success still sees a failure.
-
-It is **not** unique to a timeout, and nothing here pretends otherwise: a child
-killed by a signal reports `-signum`, and SIGHUP is signal 1. `timed_out` is the
-only thing that distinguishes a hang from a command that died some other way,
-and it is what a caller reads. `code == TIMEOUT_CODE` proves nothing."""
+"""The `code` a timed-out command reports. Not unique to a timeout — a child
+killed by SIGHUP reports `-1` too — so read `timed_out`, never this."""
 
 
 @dataclass(frozen=True)
@@ -47,15 +34,12 @@ class ExecResult:
 
     @property
     def ok(self) -> bool:
-        """Whether the command succeeded. Reads better than `code == 0` at a
-        call site asking a yes-or-no question of a build or a git plumbing
-        command."""
+        """Whether the command succeeded."""
         return self.code == 0
 
     @property
     def output(self) -> str:
-        """Both streams as one text — which one carries the diagnosis is the
-        command's choice, not the caller's."""
+        """Both streams as one text: which one carries the diagnosis is the command's choice."""
         return "\n".join(stream.strip("\n") for stream in (self.stdout, self.stderr) if stream)
 
 
@@ -79,26 +63,13 @@ def run(
     check: bool = True,
     timeout: float | None = None,
 ) -> ExecResult:
-    """Run `argv` in `cwd` and return both streams.
+    """Runs `argv` in `cwd` and returns both streams.
 
-    Raises `ExecError` on a non-zero exit when `check` is true. With
-    `check=False` the failure comes back as a result instead, which is what
-    callers of exit-code-signalling commands — `merge-base --is-ancestor`,
-    `merge` — need in order to tell "no" from "broken".
-
-    `timeout` is a wall-clock limit in seconds; `None` means wait forever. On
-    expiry the child is killed and the call reports `timed_out=True` with
-    `code=TIMEOUT_CODE` (-1) and whatever output was captured before the kill,
-    raising `ExecError` under `check=True` like any other failure.
-
-    `timed_out` is the only signal that a timeout happened, and the only one a
-    caller should read for it. The code is not: a child killed by SIGHUP exits
-    `-1` too, so `code == TIMEOUT_CODE` on a result whose `timed_out` is false
-    means a signal, not a hang.
-
-    The kill reaches the direct child only, not its descendants: a build tool
-    that spawns a daemon can leave one running. Process-group handling is a
-    later problem.
+    param: check - raise `ExecError` on a non-zero exit; `False` reports it as a
+        result instead, which exit-code-signalling git commands need
+    param: timeout - wall-clock seconds, `None` to wait forever; on expiry the
+        direct child (not its descendants) is killed
+    return: ExecResult - `timed_out=True` and `code=TIMEOUT_CODE` after a timeout
     """
     try:
         completed = subprocess.run(
@@ -139,23 +110,10 @@ async def run_async(
 ) -> ExecResult:
     """`run`, but with a real process handle a caller can kill.
 
-    Same `ExecResult`, `check`, and `timeout` semantics as `run` — the
-    difference is what happens when the *awaiting* coroutine is cancelled or
-    the timeout expires. `run` wraps `subprocess.run`, which blocks a thread
-    that cannot be cancelled: `asyncio.to_thread(run, ...)` leaves the thread
-    running the command underneath a cancelled await, and since that thread is
-    non-daemon, the interpreter will not exit until it finishes — a build that
-    takes minutes makes Ctrl-C look hung for exactly that long. `run_async` is
-    built on `asyncio.create_subprocess_exec` instead, so cancellation and a
-    timeout both reach the child: it is killed and awaited before the
-    cancellation or the timeout is allowed to propagate, so nothing is left
-    running behind a call that has already returned.
-
-    Killing `./gradlew` kills the client process, not the Gradle daemon it
-    talks to over a socket. That is correct, not a shortcut: the daemon is
-    meant to outlive any one build and be reused by the next one, and tearing
-    it down on every interrupt would trade a fast cancel for a slow cold start
-    on the next run.
+    Same `check` and `timeout` semantics. The difference: cancelling the await
+    reaches the child, which is killed and reaped before the cancellation
+    propagates, so nothing runs on behind a call that has returned. A daemon the
+    child talks to over a socket — Gradle's — survives, deliberately.
     """
     process = await asyncio.create_subprocess_exec(
         *argv,
@@ -213,8 +171,7 @@ async def _collect(
 
 
 def _decoded(partial: str | bytes | None) -> str:
-    """Whatever `TimeoutExpired` captured, as text. It may be `None`, and it is
-    bytes rather than `str` on some platforms despite the `encoding` above."""
+    """Whatever `TimeoutExpired` captured, as text: it may be `None`, or bytes."""
     if partial is None:
         return ""
     if isinstance(partial, bytes):

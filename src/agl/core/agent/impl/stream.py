@@ -1,24 +1,13 @@
 """The SDK's message stream, folded into one `AgentResult`.
 
-Layer: core. Everything here is a function of the messages that arrived; the
-only side effect is `on_activity`, which is fire-and-forget UI and is wrapped so
-a broken dashboard can never fail an agent run.
+Layer: core. A function of the messages that arrived; the only side effect is
+`on_activity`, wrapped so a broken dashboard cannot fail a run.
 
-Token counts on assistant messages cover the top-level loop only and exclude
-anything a subagent spent, so they understate a run that delegated. `cost_usd`
-comes from the result message and is the number to trust.
-
-A result the SDK marked as an error is raised, not returned: `AgentResult` has
-no way to say "this failed", and a caller handed one as a success would never
-send it back round the retry ladder. Exhaustion is the exception — it is not
-retryable, and the caller has a distinct error and a better message for it — so
-an exhausted run comes back as an ordinary result for the caller to classify.
-
-`expect_json` failures raise `AgentOutputError`, not the bare `AgentError`
-every other failure here raises: a model that answered in prose instead of
-JSON gives the same prose back on an identical retry, so this is the second
-failure — after exhaustion — that a caller should not send back round the
-retry ladder.
+Token counts on assistant messages exclude subagent spend, so trust `cost_usd`.
+A result the SDK marked as an error is raised, since `AgentResult` cannot say
+"this failed" — except exhaustion, which comes back as a result for the caller
+to classify. `expect_json` failures raise `AgentOutputError`, the second failure
+a caller should not retry.
 """
 
 import json
@@ -54,11 +43,9 @@ SUBJECT_KEYS = (
 
 
 def summarize_tool_use(tool: str, tool_input: Mapping[str, Any]) -> str:
-    """A short one-line description of a tool call, for a status footer.
+    """A one-line description of a tool call, for a status footer.
 
-    `Edit src/auth/TokenStore.kt`, `Bash ./gradlew build`, `Read README.md`. An
-    input with no obvious subject gives the bare tool name, which is still more
-    informative than a blank footer.
+    return: str - `Edit src/auth/TokenStore.kt`, or the bare tool name if it has no subject
     """
     name = tool.removeprefix(MCP_PREFIX)
     subject = next(
@@ -85,13 +72,11 @@ async def fold(
     on_activity: Callable[[str], None] | None,
     expect_json: bool,
 ) -> AgentResult:
-    """Consume the stream and return what the run produced.
+    """Consumes the stream and returns what the run produced.
 
-    Raises `AgentError` if the stream ends without a result message — a run
-    that never resolved is not a result with fields missing — or if the
-    result reports an error that is not exhaustion. Raises `AgentOutputError`,
-    an `AgentError` subclass, if `expect_json` was asked for and the final
-    text does not parse.
+    return: AgentResult - raises `AgentError` if the stream never resolved or
+        reported a non-exhaustion error, `AgentOutputError` if `expect_json`
+        was asked for and the final text does not parse
     """
     text = ""
     session_id: str | None = None
@@ -148,10 +133,8 @@ def _report(on_activity: Callable[[str], None] | None, block: ToolUseBlock) -> N
 def _terminal_reason(outcome: ResultMessage) -> str | None:
     """Why the loop stopped, preferring the subtype when it names a limit.
 
-    `terminal_reason` is `None` on older CLIs and says `"completed"` or
-    `"max_turns"` on newer ones — it never mentions the budget. The `error_max_`
-    subtypes do, and telling budget exhaustion apart from an ordinary failure is
-    the difference between retrying and not.
+    `terminal_reason` never mentions the budget; the `error_max_` subtypes do,
+    and that difference is the difference between retrying and not.
     """
     if outcome.subtype.startswith("error_max_"):
         return outcome.subtype

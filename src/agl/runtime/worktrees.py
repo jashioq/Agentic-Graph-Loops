@@ -1,22 +1,13 @@
 """A pool of git worktrees, one per node, for the length of one run.
 
 Layer: runtime. Imports `agl.runtime.paths`, `agl.runtime.context` and
-`agl.core.vcs`, and nothing about any particular workflow: a node is a key, and
-where its branch is cut from is the caller's business, handed in as `base`.
+`agl.core.vcs`. A node is a key; where its branch is cut from is the caller's
+business, handed in as `base`.
 
-`Worktrees` is a run's only place that creates or removes a worktree. The
-kept-alive behaviour is the subtle part: a node whose work is not finished must
-not have its tree recreated on the second pass, because anything branched off
-it points at the branch that tree is sitting on. `acquire` reuses a kept tree
-rather than checking one out again; `keep` is how a scheduler body says "this
-node is not done yet"; `release` is how it says "it is."
-
-A resumed run starts with a pool that owns nothing and a repository full of
-trees a dead process checked out, so `reopen` takes them over: the same
-kept-alive state a first pass would have built, recovered from git rather than
-from anything written down. `adopt` covers the other half of what a killed run
-leaves — a branch whose tree is gone — and is the only other way a tree gets
-made here.
+The only place a run creates or removes a worktree. Keep-alive is the subtle
+part: a node that is not finished must keep its tree, because anything branched
+off it points at that branch. `keep` says "not done yet", `release` says "done".
+`reopen` recovers the same state from git for a resumed run.
 """
 
 from dataclasses import dataclass
@@ -51,34 +42,28 @@ class Worktrees:
     def acquire(self, key: str, branch: str, base: str) -> Work:
         """The node's worktree: a kept one from a prior round, else a fresh checkout.
 
-        A kept tree is handed back as it is, so `branch` and `base` describe
-        only the checkout this call might have to make.
+        param: branch - the branch to create; ignored when a kept tree is returned
+        param: base - what a fresh branch is cut from
+        return: Work - the key bound to its tree and branch
         """
         return self._open.pop(key, None) or self._checkout(key, branch, base)
 
     def adopt(self, key: str, branch: str) -> Work:
-        """Open a worktree onto a branch that already exists.
+        """Opens a worktree onto a branch that already exists.
 
-        The case where the branch survived but its tree did not: `acquire`
-        creates a branch and would refuse this one as taken, so a resume needs
-        the operation that only attaches. Like `acquire`, the tree comes back
-        rather than being kept — the caller says whether the node is done.
+        For a branch that survived a killed run but lost its tree; `acquire`
+        would refuse it as taken. Not kept — the caller says when the node is done.
         """
         tree = self._vcs.attach_worktree(self._worktree_dir(key), branch)
         return Work(key=key, tree=tree.path, branch=branch)
 
     def reopen(self) -> tuple[Work, ...]:
-        """Take over the worktrees a previous process left behind.
+        """Takes over the worktrees a previous process left behind, registering each as open.
 
-        Pruned first, so a directory deleted under git is dropped from the
-        registry rather than reported as a tree that is there. What is left is
-        every registered worktree sitting directly under this run's trees
-        directory, keyed by its directory name — which is the node id, because
-        that is what `_worktree_dir` puts there. Another label's trees and the
-        main worktree are somebody else's and are ignored.
+        Pruned first. Only trees directly under this run's directory are taken,
+        keyed by directory name, which is the node id.
 
-        Each one is registered as open, so the resumed run reuses the tree it
-        found for exactly the reason a first pass reuses a kept one.
+        return: tuple[Work, ...] - what was adopted, sorted by key
         """
         self._vcs.prune_worktrees()
         root = paths.trees_dir(self._trees_root, self._project, self._label).resolve()
@@ -120,9 +105,7 @@ class Worktrees:
 def for_run(ctx: RunContext) -> Worktrees:
     """This run's worktree pool, owning nothing until `reopen` is called.
 
-    A function rather than a method, so the class stays free of run knowledge.
-    A pool is addressed by project and label alone, so two processes over the
-    same run name the same trees.
+    A function, not a method, so the class stays free of run knowledge.
     """
     return Worktrees(
         ctx.vcs,

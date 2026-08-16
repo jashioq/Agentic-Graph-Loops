@@ -1,9 +1,9 @@
 """One run's state as a value, and the pure transitions that move it.
 
-Layer: workflows. Pure — no I/O, no async, and nothing from below but `dag`.
+Layer: workflows. Pure — no I/O, no async, nothing from below but `dag`.
 Everything derivable is derived: the graph and the display order are rebuilt on
-every question, so neither can contradict the tickets it came from.
-`documents/state_document.py` stores a `Run`; nothing here knows how.
+every question. `documents/state_document.py` stores a `Run`; nothing here
+knows how.
 """
 
 from collections.abc import Callable, Sequence
@@ -36,8 +36,8 @@ __all__ = [
 class Run:
     """One run's whole state, as a value. Every change produces a new one.
 
-    Tickets are in insertion order, which is itself state: it is what
-    `display_order` and the graph's node ordering are built from.
+    Tickets are in insertion order, which is itself state: `display_order` and
+    the graph's node ordering are built from it.
     """
 
     tickets: tuple[Ticket, ...] = ()
@@ -51,7 +51,7 @@ class Run:
         return found
 
     def get(self, ticket_id: str) -> Ticket | None:
-        """The ticket, or `None` — for a caller that is asking rather than assuming."""
+        """The ticket, or `None` — for a caller asking rather than assuming."""
         for ticket in self.tickets:
             if ticket.id == ticket_id:
                 return ticket
@@ -62,10 +62,10 @@ class Run:
 
 
 def with_tickets(run: Run, tickets: Sequence[Ticket]) -> Run:
-    """`run` plus `tickets`: the approved set, or a round of bugs.
+    """Takes a run and new tickets, validates them, returns the widened run.
 
-    Every id has to be new and every blocker has to resolve, to a ticket in the
-    run or in this batch. `check` catches a cycle closed within the batch.
+    param: tickets - the approved set, or a round of bugs; ids must be new
+    return: Run - raises `DuplicateTicketError`/`UnknownTicketError` instead, building nothing
     """
     incoming = tuple(tickets)
     seen: set[str] = set()
@@ -92,18 +92,19 @@ def with_tickets(run: Run, tickets: Sequence[Ticket]) -> Run:
 def with_status(run: Run, ticket_id: str, status: Status) -> Run:
     """`run` with one ticket moved to `status`, through the life cycle's own rules.
 
-    Raises `UnknownTicketError` for an unheld id and `IllegalTransitionError`
-    for a forbidden move; nothing is built in either case.
+    Raises `UnknownTicketError` or `IllegalTransitionError`, building nothing.
     """
     return _replaced(run, transition(run.ticket(ticket_id), status))
 
 
 def with_bugs(run: Run, parent_id: str, bugs: Sequence[Ticket]) -> Run:
-    """Fold review findings into the run as work the parent now waits on.
+    """Folds review findings into the run as work the parent now waits on.
 
     One write: the bugs, the parent's new blockers, its released status and its
-    advanced `review_round` all land together. Raises `ValueError` for a bug
-    that does not name `parent_id`, or that waits on the ticket it fixes.
+    advanced `review_round` all land together.
+
+    param: bugs - each must name `parent_id` and must not wait on it, or `ValueError`
+    return: Run - parent back at `PENDING`, blocked by the new bugs
     """
     parent = run.ticket(parent_id)
     incoming = tuple(bugs)
@@ -163,10 +164,9 @@ _NODE_STATE: dict[Status, NodeState] = {
 
 
 def dag_of(run: Run) -> Dag:
-    """The run's dependency graph, built fresh and thrown away by the caller.
+    """The run's dependency graph: a node per ticket, an edge per `blocked_by`.
 
-    A node per ticket at the state its status implies, then an edge per
-    `blocked_by` entry. Nothing is kept between calls.
+    Built fresh on every call and kept nowhere.
     """
     dag = Dag(priority=bugs_first(run))
     for ticket in run.tickets:
@@ -178,10 +178,7 @@ def dag_of(run: Run) -> Dag:
 
 
 def bugs_first(run: Run) -> Callable[[NodeId], bool]:
-    """A `Dag` priority key that puts every ready bug ahead of every ready feature.
-
-    `Dag.ready()` sorts stably, so ties keep insertion order for free.
-    """
+    """A `Dag` priority key putting every ready bug ahead of every ready feature."""
     bugs = {ticket.id: ticket.is_bug for ticket in run.tickets}
 
     def priority(node_id: NodeId) -> bool:
@@ -191,11 +188,7 @@ def bugs_first(run: Run) -> Callable[[NodeId], bool]:
 
 
 def display_order(run: Run) -> tuple[str, ...]:
-    """Every ticket in insertion order, each bug directly under its parent.
-
-    A bug whose parent is not in the run — which `check` refuses — keeps its
-    own place rather than disappearing.
-    """
+    """Every ticket id in insertion order, each bug directly under its parent."""
     children: dict[str, list[str]] = {}
     held = {ticket.id for ticket in run.tickets}
     for ticket in run.tickets:
@@ -219,10 +212,10 @@ def display_order(run: Run) -> tuple[str, ...]:
 
 
 def check(run: Run) -> None:
-    """Raise `InvalidStateError` unless `run` is a state this workflow could reach.
+    """Raises `InvalidStateError` unless `run` is a state this workflow could reach.
 
-    A hand-edited document is a supported input, so the message names the
-    ticket and the field a person has to go and fix.
+    A hand-edited document is supported input, so the message names the ticket
+    and the field to fix.
     """
     seen: set[str] = set()
     for ticket in run.tickets:

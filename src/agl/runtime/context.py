@@ -1,22 +1,10 @@
 """What a run was given: its settings, its connectors, and the checks before it starts.
 
-Layer: runtime. `RunContext` is data and nothing else — the connectors a run
-was handed, the project it is against, and the four things that make this run
-this run. It has no lifecycle and no `start()`: every resource a run needs is
-opened by the workflow, visibly, in its own `run()`, so reading that function
-tells you what is open and when it closes. A context that opened things would
-move half of that story in here, where it is nobody's local variable.
-
-`preflight` is a function rather than something imposed on a workflow. It is the
-first line of `run` because a workflow decides its own first line — and
-`resume_preflight` is what that looked like once a workflow actually had a
-second entry point: a different set of checks, chosen by the caller, rather than
-one function that has to be told which kind of start it is looking at.
-
-`build_gate` is the one place a project's build command becomes the callable the
-merge queue holds. The queue never learns what a build is: it gets something to
-await that answers with an `ExecResult`, which is why a run with no build and a
-run behind Gradle are the same code path there.
+Layer: runtime. `RunContext` is data and nothing else — no lifecycle, no
+`start()`: every resource is opened by the workflow, visibly, in its own `run`.
+The two preflights are functions a workflow calls rather than checks imposed on
+it, so each entry point picks the set it wants. `build_gate` is the one place a
+project's build command becomes the callable the merge queue awaits.
 """
 
 from dataclasses import dataclass
@@ -40,21 +28,16 @@ __all__ = [
 ]
 
 _TRUNK = ("main", "master")
-"""Branch names a run refuses to start on. Not configuration: the point is that
-a run creates and deletes branches under a namespace and merges into the branch
-it was started from, and doing that to a shared trunk is a mistake in every
-project, whatever the trunk is called."""
+"""Branch names a run refuses to start on. Not configuration: a run branches from
+and merges into wherever it started, which must never be a shared trunk."""
 
 
 @dataclass(frozen=True)
 class ProjectSettings:
     """What runtime needs to know about a project, as data.
 
-    A translation of the cli's `config.toml`, kept deliberately narrow: five
-    fields a workflow uses, and none of the file-format knowledge that produced
-    them. `agl.config` stays a cli concern, and a workflow can be handed
-    settings assembled any other way — by a test, or by a caller with no config
-    file at all.
+    A narrow translation of the cli's `config.toml`, carrying none of the
+    file-format knowledge that produced it.
     """
 
     name: str
@@ -68,16 +51,9 @@ class ProjectSettings:
 class RunContext:
     """One run's inputs: what it was asked to do, and what it may use to do it.
 
-    Frozen, and holding no run state — nothing here changes between the first
-    line of a run and the last. What a run has *done* lives in the workflow's
-    own state and on the display's board, both of which the workflow creates and
-    owns; this is only the part that was decided before it started.
-
-    `workflow` is the one field a run cannot work out from the inside: a
-    workflow knows what it does, not what it is called. It is here because the
-    record a run writes has to name the workflow `agl resume` will hand the run
-    back to, and the context is where every other field of that record already
-    lives.
+    Frozen, and holding no run state — nothing here changes between a run's
+    first line and its last. `workflow` is the one field a run cannot work out
+    from the inside, and the record has to name it for `agl resume`.
     """
 
     workflow: str
@@ -97,15 +73,10 @@ class PreflightError(Exception):
 
 
 def preflight(vcs: Vcs, store: Store, label: str) -> None:
-    """Refuse to start unless the repository and the label are clear.
+    """Refuses to start unless the repository and the label are clear.
 
-    Every check is about work that already exists and would be silently mixed
-    into this run's: uncommitted edits that a worktree's commits would land on
-    top of, a trunk that must not be branched from and merged into, and a label
-    whose branches or documents are still around from a run that did not finish.
-    The last one names both remedies, because leftovers are two situations and
-    not one: a run worth picking up where it stopped, and a run worth throwing
-    away. Only the person who left it there knows which.
+    Raises `PreflightError` on uncommitted changes, a trunk branch, or a label
+    already in use — every case being work that would silently mix into this run.
     """
     if vcs.is_dirty():
         raise PreflightError("the repository has uncommitted changes")
@@ -121,13 +92,11 @@ def preflight(vcs: Vcs, store: Store, label: str) -> None:
 
 
 def resume_preflight(vcs: Vcs, base_branch: str) -> None:
-    """Refuse to resume unless the repository is where the run left it.
+    """Refuses to resume unless the repository is where the run left it.
 
-    The branch has to be the one the run was started from, and the tree has to
-    be clean except for a merge this run left in progress — which is the one
-    kind of mess a resume knows how to settle. Deliberately none of
-    `preflight`'s other checks: existing branches and an occupied run directory
-    are the point of resuming, not a reason to refuse.
+    The base branch must be checked out and the tree clean, except for a merge
+    left in progress, which is the one mess a resume knows how to settle. None
+    of `preflight`'s other checks: leftovers are the point of resuming.
     """
     branch = vcs.current_branch()
     if branch != base_branch:
@@ -142,10 +111,8 @@ def resume_preflight(vcs: Vcs, base_branch: str) -> None:
 def build_gate(project: ProjectSettings) -> Build:
     """The project's build, as the callable a merge queue awaits.
 
-    `check=False`: a failing build is the answer to the question the gate asked,
-    not an error to raise past the queue that asked it. The timeout is the
-    project's, and `run_async` kills the child when it expires, so a hung build
-    ends the merge rather than the run.
+    return: Build - `check=False`, so a failing build is an answer, not an error;
+        a timeout kills the child, ending the merge rather than the run
     """
 
     async def build() -> ExecResult:

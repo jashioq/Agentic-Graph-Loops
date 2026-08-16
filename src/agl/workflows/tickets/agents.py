@@ -1,10 +1,9 @@
 """The five roles: which prompt each runs, which tools it holds, what it reads back.
 
-Layer: workflows. The only file in the workflow that calls an agent at all.
-Every role reports through a tool rather than an `output_schema`, and one that
-ends without calling its tool raises `RoleIncompleteError`; a report already on
-disk is read rather than re-run. Judgement roles run on opus, execution roles on
-sonnet, each named at its own call site.
+Layer: workflows. The only file here that calls an agent. Every role reports
+through a tool, not an `output_schema`; one that ends without calling it raises
+`RoleIncompleteError`, and a report already on disk is read rather than re-run.
+Judgement roles run on opus, execution roles on sonnet.
 """
 
 import asyncio
@@ -49,11 +48,7 @@ GIT_WRITES: tuple[str, ...] = (
     "Bash(git rebase:*)",
     "Bash(git reset:*)",
 )
-"""Denies the git writes Python owns, on every role that runs in a worktree.
-
-An agent running `git checkout main` inside its worktree silently moves it off
-the ticket branch, and a stray `git commit` breaks the one-commit guarantee.
-"""
+"""Denies the git writes Python owns, on every role that runs in a worktree."""
 
 _NO_FILE_ACCESS: tuple[str, ...] = ("Read", "Write", "Edit", "Glob", "Grep", "Bash", "NotebookEdit")
 """Denies triage the file and shell tools entirely: it works from the prompt alone."""
@@ -125,12 +120,11 @@ async def review(
     on_activity: Activity | None = None,
     ask: Ask | None = None,
 ) -> tuple[Finding, ...]:
-    """Both reviewers' findings, concatenated — running only the ones still owed.
+    """Runs whichever reviewers are still owed, returns both reviewers' findings.
 
-    `base_branch` is substituted into both reviewer prompts so each can run its
-    own `git diff $base_branch...HEAD` — three dots, so it shows only what this
-    ticket's branch added since diverging. Either reviewer failing raises before
-    anything is read back.
+    param: tree - the worktree each reviewer runs in
+    param: base_branch - substituted into the prompts for `git diff $base...HEAD`
+    return: tuple[Finding, ...] - quality's findings then spec's, read back off disk
     """
     # A reviewer skips itself when its findings document already exists.
     owed = tuple(
@@ -161,12 +155,13 @@ async def triage(
     on_activity: Activity | None = None,
     ask: Ask | None = None,
 ) -> tuple[BugGroup, ...]:
-    """Group the `HIGH` findings into bug tickets one agent can fix in a pass.
+    """Groups the `HIGH` findings into bug tickets one agent can fix in a pass.
 
-    Always leaves a triage document behind. Skips the call when there is nothing
-    to decide: zero `HIGH` findings records no groups, and exactly one records
-    the group built from that finding. Both are parsed back out of what was
-    written, so the document and the return value cannot disagree.
+    Always leaves a triage document behind, and skips the agent call when zero or
+    one `HIGH` finding leaves nothing to decide.
+
+    param: findings - both reviewers' findings; only the `HIGH` ones are grouped
+    return: tuple[BugGroup, ...] - parsed back out of the document just written
     """
     highs = high(findings)
     key = review_key(ticket.id, ticket.review_round, "triage")
@@ -242,11 +237,7 @@ def _read_findings(ctx: RunContext, ticket: Ticket, source: str) -> tuple[Findin
 
 
 def _read_groups(ctx: RunContext, key: str, highs: Sequence[Finding]) -> tuple[BugGroup, ...]:
-    """The triage document, parsed and re-checked against the findings it covers.
-
-    A backstop: `save_triage` already refused to store groups that fail the
-    check, so a failure means the document came from somewhere else.
-    """
+    """The triage document, parsed and re-checked against the findings it covers."""
     groups = bug_groups_from_json(ctx.store.read_json(key), allow_empty=True)
     check_coverage(groups, highs)
     return groups
@@ -270,11 +261,9 @@ async def _call(
     on_activity: Activity | None = None,
     ask: Ask | None = None,
 ) -> None:
-    """One role's call: the model it named, plus what the run context carries.
+    """One role's call. Returns nothing: a role reports by writing through a tool.
 
-    `model` has no default: a new role that forgets to name one should not
-    silently inherit somebody else's. Nothing is returned — every role reports
-    through a tool, and what it wrote is read back from the store.
+    `model` has no default, so a new role cannot silently inherit another's.
     """
     await call(
         ctx.agent,
@@ -291,11 +280,7 @@ async def _call(
 
 
 def _prefixed(on_activity: Activity | None, label: str) -> Activity | None:
-    """`label · activity`, or `None` when nobody is watching.
-
-    All three review roles write to the same ticket's row, so each is told apart
-    by what it says rather than where it says it.
-    """
+    """Wraps `on_activity` to prefix `label · `, or `None` when nobody is watching."""
     if on_activity is None:
         return None
 
@@ -306,7 +291,7 @@ def _prefixed(on_activity: Activity | None, label: str) -> Activity | None:
 
 
 def _render_findings(findings: Sequence[Finding]) -> str:
-    """`HIGH` findings, rendered for a prompt — triage has no tool to fetch them itself."""
+    """Findings rendered into prompt text — triage has no tool to fetch them itself."""
     return "\n".join(
         f"- {finding.id}: {finding.title}\n"
         f"  {finding.detail}\n"

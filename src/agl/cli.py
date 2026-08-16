@@ -1,22 +1,14 @@
 """`agl run`, `agl resume`, `agl clean`, and `agl init` — the composition root.
 
-Layer: cli. This is the only file that constructs concrete `impl` classes;
-everything below it takes them injected. `run` resolves a project, takes a
-label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and
-hands a `RunContext` to that workflow's `run`. A workflow is exactly that: a
-package under `agl.workflows` exposing `workflow.run(ctx)`. Nothing here reaches
-into a run afterwards — the exception `run` raises is the exit status.
-`resume` takes a label and nothing else, because everything else it needs was
-written down when the run started: it reads the run's record and rebuilds the
-context from it, so the repository a person happens to be standing in cannot
-quietly change what the run was asked for. `clean` removes what a label left
-behind — worktrees, branches, and its run directory — tolerating anything
-already gone. `init` writes the `config.toml` and `standards.md` a project needs
-before `run` can find it.
+Layer: cli. The only file that constructs concrete `impl` classes; everything
+below takes them injected. A workflow is a package under `agl.workflows`
+exposing `workflow.run(ctx)`, discovered by name. Nothing here reaches into a
+run afterwards — the exception it raises is the exit status.
 
-`_settings` is the only place `ProjectConfig` and `ProjectSettings` meet, which
-is what keeps the config file format a cli concern: below this file a project is
-five fields of data, and nothing knows they came out of a TOML file.
+`resume` takes a label and nothing else: the rest was written to `run.json` at
+preflight, so the repository a person is standing in cannot change what the run
+was asked for. `_settings` is the only place `ProjectConfig` and
+`ProjectSettings` meet, which is what keeps the file format a cli concern.
 """
 
 import argparse
@@ -151,10 +143,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     module = importlib.import_module(f"agl.workflows.{args.workflow}.workflow")
 
-    # Assembling the context is inside the try because it is already doing real
-    # work — reading the current branch, creating the run directory — and a
-    # failure there is the same kind of thing to a person as a failure in the
-    # run itself: a message, not a traceback.
+    # Assembling the context is inside the try because it already does real work
+    # — reading the branch, creating the run directory — and a failure there
+    # deserves a message rather than a traceback, same as one in the run.
     try:
         ctx = RunContext(
             workflow=args.workflow,
@@ -181,9 +172,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _read_description(args: argparse.Namespace) -> str | None:
     """The run description, or `None` if none was given.
 
-    A positional description is used as-is and stdin is left untouched. Absent
-    that, stdin is read whole — unless it is a terminal, which would otherwise
-    leave a person waiting at an empty prompt with no sign it is waiting.
+    A positional argument wins and leaves stdin untouched; otherwise stdin is
+    read whole, unless it is a terminal and would just hang at a blank prompt.
     """
     if args.description:
         text = " ".join(args.description)
@@ -197,9 +187,7 @@ def _read_description(args: argparse.Namespace) -> str | None:
 def _settings(config: ProjectConfig) -> ProjectSettings:
     """The project a run is against, as the data a workflow takes.
 
-    Everything `config.toml` holds that a run may use, and nothing of where it
-    came from: `standards` and `config_dir` are the cli's own bookkeeping and
-    stop here.
+    `standards` and `config_dir` are the cli's own bookkeeping and stop here.
     """
     return ProjectSettings(
         name=config.name,
@@ -218,11 +206,9 @@ def _discover_workflows() -> tuple[str, ...]:
 
 
 def _print_interrupted(vcs: Vcs, label: str) -> None:
-    """Name the worktrees an interrupted run left, and both ways out of them.
+    """Names the worktrees an interrupted run left, and both ways out of them.
 
-    Two remedies because leftovers are two situations: work worth picking up
-    where it stopped, and work worth throwing away. Only the person who pressed
-    ctrl-c knows which, so both are offered and neither is done.
+    Both offered, neither done: only the person who pressed ctrl-c knows which.
     """
     namespace = f"{paths.branch_namespace(label)}/"
     trees = [w.path for w in vcs.list_worktrees() if w.branch.startswith(namespace)]
@@ -237,16 +223,11 @@ def _print_interrupted(vcs: Vcs, label: str) -> None:
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    """Continue a run from the record it wrote when it started.
+    """Continues a run from the record it wrote when it started.
 
-    The label is the whole command line because every other field of the context
-    was settled once, at preflight, and written to `run.json` — reading the base
-    branch off the current checkout instead would let a run be resumed into a
-    branch it was never started from, and merge its tickets there.
-
-    `--max-concurrent` is the one exception, and only because it is a statement
-    about the machine rather than about the run: the same tickets, fewer at a
-    time.
+    The label is the whole command line: reading the base branch off the current
+    checkout would let a run be resumed into a branch it never started from.
+    `--max-concurrent` is the exception, being about the machine, not the run.
     """
     label = args.label
 
@@ -266,9 +247,8 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     except InvalidNameError as error:
         return _fail(error)
 
-    # The directory is checked before the store is built, because building one
-    # creates its root: a mistyped label would otherwise leave an empty run
-    # behind and be a real one the next time it was typed.
+    # Checked before the store is built, because building one creates its root:
+    # a mistyped label would otherwise leave an empty run behind.
     run_directory = paths.run_dir(home, label)
     if not run_directory.is_dir():
         return _fail(f"unknown label {label!r}; runs found: {_existing_runs(home)}")
@@ -286,9 +266,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         )
 
     # `getattr` is the whole registry: resuming is optional, and a workflow opts
-    # in by defining the function. A recorded workflow that no longer imports is
-    # not a case of its own — from here it is a name that does not resolve to a
-    # workflow, which is what `run` says about one too.
+    # in by defining the function.
     try:
         module = importlib.import_module(f"agl.workflows.{record.workflow}.workflow")
     except ImportError:
@@ -478,12 +456,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _guess_build(repo_root: Path) -> tuple[tuple[str, ...], str]:
-    """A build command guessed from a marker file, or a placeholder.
-
-    The placeholder is deliberately a command that fails loudly on the first
-    merge rather than one that looks plausible and quietly does the wrong
-    thing.
-    """
+    """A build command guessed from a marker file, or a placeholder that fails loudly."""
     for marker, build, comment in _BUILD_GUESSES:
         if (repo_root / marker).exists():
             return build, comment

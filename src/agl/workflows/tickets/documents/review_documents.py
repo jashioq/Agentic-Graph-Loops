@@ -58,17 +58,13 @@ FINDINGS_SCHEMA: dict[str, Any] = {
     "required": [FINDINGS_KEY],
     "additionalProperties": False,
 }
-"""The schema `tools.save_findings` hands the model for its `findings` argument.
-
-Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
-than mutating it."""
+"""The schema `tools.save_findings` hands the model. Read-only."""
 
 
 def findings_from_json(data: Any) -> tuple[Finding, ...]:
-    """Parse reviewer output into findings, raising `InvalidFindingsError`.
+    """Parses reviewer output into findings, raising `InvalidFindingsError`.
 
-    Re-checks everything `FINDINGS_SCHEMA` states, plus the one rule JSON schema
-    cannot express: ids are unique. A review with no findings at all is valid.
+    Re-checks the whole schema, plus unique ids. No findings at all is valid.
     """
     payload = as_object(data, "output", InvalidFindingsError)
     require_fields(payload, [FINDINGS_KEY], "output", InvalidFindingsError)
@@ -153,19 +149,15 @@ TRIAGE_SCHEMA: dict[str, Any] = {
     "required": [GROUPS_KEY],
     "additionalProperties": False,
 }
-"""The schema `tools.save_triage` hands the model for its `groups` argument.
-
-Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
-than mutating it."""
+"""The schema `tools.save_triage` hands the model. Read-only."""
 
 
 def bug_groups_from_json(data: Any, *, allow_empty: bool = False) -> tuple[BugGroup, ...]:
-    """Parse triage-agent output into groups, raising `InvalidGroupsError`.
+    """Parses triage-agent output into groups, raising `InvalidGroupsError`.
 
-    `allow_empty` separates the two readers. An agent that produced no groups
-    was asked to group findings and did not, so the default refuses it. A triage
-    document read back off disk is a *recorded* outcome, and "this round left
-    nothing to fix" is one of the outcomes there is to record.
+    param: allow_empty - `True` when reading a recorded outcome back off disk,
+        where "nothing left to fix" is a result; `False` for fresh agent output
+    return: tuple[BugGroup, ...] - shape only; coverage is `check_coverage`'s question
     """
     payload = as_object(data, "output", InvalidGroupsError)
     require_fields(payload, [GROUPS_KEY], "output", InvalidGroupsError)

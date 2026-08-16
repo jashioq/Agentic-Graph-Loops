@@ -1,24 +1,13 @@
 """Agent API: one model call, described as data.
 
-Layer: core. This is the single path through which every model call in the
-system goes. It owns session configuration, the retry ladder, custom tool
-registration, and the translation from a message stream into a result. It has
-never heard of a work item, a worktree, or a workflow: it takes a prompt, a
-directory, and a set of opaque tools, and hands back text.
+Layer: core. The single path every model call goes through — session config, the
+retry ladder, tool registration, and turning a message stream into a result. It
+takes a prompt, a directory and opaque tools, and hands back text.
 
-Tools are how a caller scopes what a run can reach, but the scoping happens in
-the *closure*, not here. A caller that builds a tool over one document passes a
-callable that only ever touches that document, so there is no parameter for the
-model to widen. This module sees a name, a schema, and something to await.
-
-Two callbacks, and only two. `on_activity` is fire-and-forget UI: a call runs
-for minutes, and without it a hung run is indistinguishable from a working one.
-`on_question` is interception — the run stops until it returns. Everything else
-is reported by returning `AgentResult`.
-
-`AgentQuestion` is this module's own type rather than `terminal.Question`. Core
-modules do not import each other, and translating one into the other belongs to
-the layer that knows why the question was asked.
+Scoping happens in a tool's *closure*, not here: this module sees a name, a
+schema and something to await. Two callbacks, both optional: `on_activity` is
+fire-and-forget, `on_question` stops the run until it returns. `AgentQuestion`
+is this module's own type because core modules do not import each other.
 """
 
 from abc import ABC, abstractmethod
@@ -45,19 +34,12 @@ __all__ = [
 NO_PARAMS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 """The schema for a tool that takes no arguments — the canonical scoped shape.
 
-Everything such a tool may reach was closed over when it was built, so there is
-nothing left for the model to pass and nothing for it to widen. Read-only by
-convention: hand it to a `Tool` rather than mutating it."""
+Everything it may reach was closed over, so there is nothing to widen. Read-only."""
 
 
 @dataclass(frozen=True)
 class Tool:
-    """A callable the model may invoke during a run.
-
-    Opaque to this module: a name, a description, a JSON schema for its
-    parameters, and a handler. Whether it reads something, saves something, or
-    does something else entirely is the caller's business.
-    """
+    """A callable the model may invoke during a run. Opaque to this module."""
 
     name: str
     description: str
@@ -66,12 +48,7 @@ class Tool:
 
 
 class Model(StrEnum):
-    """Which model a call runs on, as the CLI's own aliases.
-
-    Aliases rather than pinned ids (`claude-opus-5`): an alias follows the
-    latest release of its tier, and pinning is a decision to revisit on a
-    schedule rather than one to bake into the type.
-    """
+    """Which model a call runs on, as the CLI's own aliases rather than pinned ids."""
 
     HAIKU = "haiku"
     SONNET = "sonnet"
@@ -85,19 +62,14 @@ class AgentSpec:
 
     prompt: str
     cwd: Path
-    # What the caller is calling this run. Opaque here, and used only to name
-    # the run in an error message; a caller with several kinds of call tells
-    # them apart with it.
+    # The caller's own name for this call. Opaque here; used only in messages.
     role: str
     tools: tuple[Tool, ...] = ()
     system_prompt_append: str | None = None
     add_dirs: tuple[Path, ...] = ()
-    # Deny rules only. There is no allow list: the permission callback allows
-    # every tool that is not the question tool, so an allow rule would buy one
-    # skipped round trip — and for the question tool it would skip the callback
-    # that carries the answers. Denials are kept because they resolve ahead of
-    # the callback, hold even under `bypassPermissions`, and speak the CLI's own
-    # pattern language (`Bash(git commit:*)`).
+    # Deny rules only, no allow list: denials resolve ahead of the permission
+    # callback, hold under `bypassPermissions`, and speak the CLI's own pattern
+    # language (`Bash(git commit:*)`).
     disallowed_tools: tuple[str, ...] = ()
     permission_mode: str = "default"  # "default" | "plan" | …
     # `None` leaves the choice to the CLI's own default.
@@ -107,11 +79,7 @@ class AgentSpec:
 
 @dataclass(frozen=True)
 class AgentResult:
-    """What one call produced, and what it cost to produce it.
-
-    There is no error flag. A run that could not be completed raises, so every
-    result that reaches a caller is one that finished.
-    """
+    """What one call produced, and what it cost. No error flag: a failed call raises."""
 
     text: str  # the final assistant text
     structured: Any | None  # parsed JSON when output_schema was set
@@ -145,20 +113,14 @@ class AgentError(Exception):
 class AgentBudgetError(AgentError):
     """Raised when the CLI ended a call because it ran out of budget or turns.
 
-    A spec asks for no ceiling; this reports one the CLI applied for its own
-    reasons. Distinct because it is the one failure not worth retrying: the
-    same call fails the same way and spends the budget again. Exhaustion says
-    the task is too large, not that the call went wrong.
+    Distinct because it is not worth retrying: the task is too large.
     """
 
 
 class AgentOutputError(AgentError):
     """Raised when `output_schema` was set and the final text did not parse as JSON.
 
-    Distinct for the same reason as `AgentBudgetError`: a model that answered
-    in prose instead of JSON says the same thing back word for word on an
-    identical retry, so retrying spends the budget again for a failure that
-    will recur unchanged. Not retried by `AgentRunner` implementations.
+    Not retried: an identical call answers in prose again.
     """
 
 
@@ -172,15 +134,11 @@ class AgentRunner(ABC):
         on_activity: Callable[[str], None] | None = None,
         on_question: Callable[[AgentQuestion], Awaitable[str]] | None = None,
     ) -> AgentResult:
-        """Run `spec` and return what it produced.
+        """Runs `spec` to completion.
 
-        `on_activity` receives a short human string per tool use, for a status
-        line. It is fire-and-forget: raising from it must not fail the run.
-
-        `on_question` is awaited when the model asks the user something, and
-        returns the chosen label or the user's free text. When it is `None` the
-        question is refused and the model is told to use its own judgment.
-
-        Raises `AgentBudgetError` when the run exhausted its budget or turns,
-        and `AgentError` when it could not be completed for any other reason.
+        param: on_activity - one short line per tool use; fire-and-forget, and
+            raising from it must not fail the run
+        param: on_question - awaited when the model asks the user something,
+            returning a label or free text; `None` refuses the question
+        return: AgentResult - raises `AgentBudgetError` on exhaustion, `AgentError` otherwise
         """

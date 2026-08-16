@@ -1,11 +1,9 @@
 """What the state says to do next — for the run as a whole, and for one ticket.
 
-Layer: workflows. Reads git and the store and reports; the workflow above is
-what turns the answer into a call. Nothing here is stored: a stage and a step
-are asked again every time they matter, of the documents and branches that are
-already the truth. That is what makes a resumed ticket and a fresh one the same
-code, and what makes deleting a document walk the run back to the step that
-produces it.
+Layer: workflows. Reads git and the store and reports; the workflow turns the
+answer into a call. Nothing is stored: a stage and a step are re-derived every
+time they matter, which is what makes a resumed ticket and a fresh one the same
+code, and deleting a document walk the run back to the step that produces it.
 """
 
 from dataclasses import dataclass
@@ -42,9 +40,8 @@ class Step(Enum):
 def stage_of(run: Run, store: Store) -> Stage:
     """The furthest stage the state supports.
 
-    Tickets in the state and all of them merged is a finished run; tickets at
-    all means implementing them; a spec alone means it is owed a decomposition,
-    and nothing at all means it is owed the interview.
+    All tickets merged is `DONE`; any tickets, `IMPLEMENT`; a spec alone,
+    `DECOMPOSE`; nothing at all, `INTERVIEW`.
     """
     if run.tickets:
         if all(ticket.status is Status.MERGED for ticket in run.tickets):
@@ -65,11 +62,11 @@ class Facts:
 
 
 def look(vcs: Vcs, store: Store, ticket: Ticket, branch: str, target: str) -> Facts:
-    """Ask git and the store where `ticket` actually got to.
+    """Asks git and the store where `ticket` actually got to.
 
-    Cheap enough to ask before every step of every pass. `implemented` guards
-    the rest, so a ticket that has never had a worktree opened is never asked
-    about a branch that does not exist yet.
+    param: branch - the ticket's own branch
+    param: target - what it merges into: the run's base, or its parent's branch
+    return: Facts - `implemented` guards the rest, so a branchless ticket is never queried
     """
     implemented = ticket.base_sha is not None and vcs.rev_parse(branch) != ticket.base_sha
     return Facts(
@@ -80,11 +77,7 @@ def look(vcs: Vcs, store: Store, ticket: Ticket, branch: str, target: str) -> Fa
 
 
 def step_for(facts: Facts) -> Step:
-    """The one step those facts leave owed.
-
-    Ordered by how far the work got, not by the order the steps run in: a merged
-    ticket is done whatever else is true of it.
-    """
+    """The one step those facts leave owed, ordered by how far the work got."""
     if facts.merged:
         return Step.DONE
     if facts.settled:
@@ -95,11 +88,7 @@ def step_for(facts: Facts) -> Step:
 
 
 def _settled(store: Store, ticket: Ticket) -> bool:
-    """Whether this round's review finished and found nothing left to fix.
-
-    An empty `groups` is a recorded outcome rather than a missing one, which is
-    why the triage document is read with `allow_empty=True`.
-    """
+    """Whether this round's review finished and found nothing left to fix."""
     triage = review_key(ticket.id, ticket.review_round, "triage")
     keys = [review_key(ticket.id, ticket.review_round, source) for source in REVIEWERS]
     if not all(store.exists(key) for key in (*keys, triage)):
