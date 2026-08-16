@@ -51,10 +51,6 @@ def build_options(
     if spec.system_prompt_append is not None:
         system_prompt["append"] = spec.system_prompt_append
 
-    output_format = None
-    if spec.output_schema is not None:
-        output_format = {"type": "json_schema", "schema": spec.output_schema}
-
     return ClaudeAgentOptions(
         cwd=spec.cwd,
         add_dirs=list(spec.add_dirs),
@@ -62,7 +58,6 @@ def build_options(
         disallowed_tools=list(spec.disallowed_tools),
         permission_mode=cast(PermissionMode, spec.permission_mode),
         model=spec.model.value if spec.model is not None else None,
-        output_format=output_format,
         mcp_servers=cast(dict[str, McpServerConfig], mcp_servers),
         setting_sources=[],
         strict_mcp_config=True,

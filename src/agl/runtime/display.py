@@ -26,7 +26,7 @@ from agl.core.terminal import (
 
 __all__ = ["Board", "Display", "live"]
 
-
+# TODO I feel like all of this should be in the workflow. This does not seem very reusable between workflows, each workflow will have to build something like that again if it doesn't use tickets. Workflows should just use the simple core module, define their own screens and then request them to be disaplyed. This is unnecessary complexity.
 @dataclass
 class Board:
     """Ephemeral, in-memory, read only by rendering.

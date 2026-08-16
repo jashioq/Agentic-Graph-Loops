@@ -1,8 +1,8 @@
 """The five roles: which prompt each runs, which tools it holds, what it reads back.
 
 Layer: workflows. The only file here that calls an agent. Every role reports
-through a tool, not an `output_schema`; one that ends without calling it raises
-`RoleIncompleteError`, and a report already on disk is read rather than re-run.
+through a tool, never in its final message; one that ends without calling it
+raises `RoleIncompleteError`, and a report on disk is read rather than re-run.
 Judgement roles run on opus, execution roles on sonnet.
 """
 

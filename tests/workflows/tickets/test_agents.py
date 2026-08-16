@@ -202,7 +202,6 @@ async def test_review_specs(repo: Path) -> None:
         "save_findings",
     ]
     assert by_role["review-quality"].disallowed_tools == GIT_WRITES
-    assert by_role["review-quality"].output_schema is None
 
     assert by_role["review-spec"].cwd == tree
     assert [tool.name for tool in by_role["review-spec"].tools] == [
@@ -211,7 +210,6 @@ async def test_review_specs(repo: Path) -> None:
         "save_findings",
     ]
     assert by_role["review-spec"].disallowed_tools == GIT_WRITES
-    assert by_role["review-spec"].output_schema is None
 
 
 async def test_triage_spec(repo: Path) -> None:
@@ -224,7 +222,6 @@ async def test_triage_spec(repo: Path) -> None:
     spec = runner.specs[0]
     assert spec.role == "triage"
     assert [tool.name for tool in spec.tools] == ["save_triage"]
-    assert spec.output_schema is None
 
 
 # -- GIT_WRITES ---------------------------------------------------------------
@@ -614,8 +611,8 @@ async def test_triage_that_never_calls_save_triage_raises_naming_role_and_ticket
     repo: Path,
 ) -> None:
     # The scripted run ends without calling its tool at all — prose instead of
-    # the call, the exact failure this workflow moved off `output_schema` to
-    # make loud instead of silently mistaken for "no groups".
+    # the call, the exact failure reporting through a tool makes loud instead
+    # of silently mistaking a prose answer for "no groups".
     runner = FakeAgentRunner({"triage": ScriptedRun("Here is my analysis...")})
     ctx = context(repo, runner)
     findings = (a_finding(id="Q-1"), a_finding(id="Q-2"))

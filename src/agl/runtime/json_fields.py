@@ -20,7 +20,7 @@ __all__ = [
     "type_name",
 ]
 
-
+# TODO in all of these below I would rather return a callable on error and then the consumer can thorw if it wants or do wahtever else.
 def as_object(value: Any, where: str, error: type[Exception]) -> dict[str, Any]:
     """Narrow `value` to a JSON object or raise `error`."""
     if not isinstance(value, dict):

@@ -71,7 +71,7 @@ class RunContext:
 class PreflightError(Exception):
     """Raised when the repository or the label is not in a state to start a run."""
 
-
+# TODO preflight checks should be defined by each workflow specifically. To achieve that lets add some PreflightConfig object as a param to preflight functions. We can specify there a set of rules like if a workflow can run on main branch, can we allow for uncommited changes and stuff like that. There will be more and some of these requirements might be reused by other workflows but each will have a subset of them.
 def preflight(vcs: Vcs, store: Store, label: str) -> None:
     """Refuses to start unless the repository and the label are clear.
 

@@ -6,8 +6,8 @@ folds the messages; what is left is the retry ladder and the question callback.
 Every call runs in streaming mode, because the SDK rejects a permission callback
 on a plain-string prompt and that callback is how a question reaches the caller.
 `AskUserQuestion` is unavailable to subagents, so a call that may ask must be a
-top-level one. Exhaustion and a bad `output_schema` parse are never retried —
-both fail identically next time; everything else goes round the ladder. Nothing
+top-level one. Exhaustion is never retried — the task is too large and fails
+identically next time; everything else goes round the ladder. Nothing
 is pre-allowed: the callback allows every tool that is not the question tool.
 """
 
@@ -28,7 +28,6 @@ from agl.core.agent.api import (
     AgentBudgetError,
     AgentError,
     AgentOption,
-    AgentOutputError,
     AgentQuestion,
     AgentResult,
     AgentRunner,
@@ -81,7 +80,7 @@ class ClaudeRunner(AgentRunner):
         for _ in range(self._max_attempts):
             try:
                 result = await self._attempt(spec, options, on_activity)
-            except (AgentBudgetError, AgentOutputError):
+            except AgentBudgetError:
                 raise
             except Exception as error:  # noqa: BLE001 - transport, API, or ours
                 failure = error
@@ -99,12 +98,12 @@ class ClaudeRunner(AgentRunner):
         options: ClaudeAgentOptions,
         on_activity: Callable[[str], None] | None,
     ) -> AgentResult:
-        """One call. Raises `AgentBudgetError`, `AgentOutputError`, or `AgentError`.
+        """One call. Raises `AgentBudgetError` or `AgentError`.
 
-        Only the first two are exempt from the retry ladder.
+        Only the first is exempt from the retry ladder.
         """
         stream = self._query(prompt=_streamed(spec.prompt), options=options)
-        result = await fold(stream, on_activity, spec.output_schema is not None)
+        result = await fold(stream, on_activity)
 
         if result.terminal_reason in EXHAUSTED:
             raise AgentBudgetError(

@@ -362,8 +362,8 @@ INVALID: dict[str, dict[str, Any]] = {
 async def test_invalid_tickets_come_back_as_something_to_fix(
     payload: dict[str, Any], empty: FileStore
 ) -> None:
-    # The whole reason these are tools rather than an `output_schema`: the model
-    # is told what was wrong and gets to call again in the same session.
+    # The whole reason these are tools rather than JSON in a final message:
+    # the model is told what was wrong and calls again in the same session.
     answer = await call(save_tickets(empty), **payload)
     assert answer.strip()
     assert not answer.startswith("Saved")
@@ -565,8 +565,8 @@ FINDINGS_INVALID: dict[str, dict[str, Any]] = {
 async def test_save_findings_invalid_shapes_come_back_as_something_to_fix(
     payload: dict[str, Any], empty: FileStore
 ) -> None:
-    # The whole reason this is a tool rather than an `output_schema`: the model
-    # is told what was wrong and gets to call again in the same session.
+    # The whole reason this is a tool rather than JSON in a final message:
+    # the model is told what was wrong and calls again in the same session.
     tool = save_findings(empty, "T-03", 1, "quality")
     answer = await call(tool, **payload)
     assert answer.strip()

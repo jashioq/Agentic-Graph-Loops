@@ -58,7 +58,6 @@ async def test_a_bare_string_is_the_text_the_run_produced() -> None:
 async def test_a_full_result_is_returned_as_given() -> None:
     scripted = AgentResult(
         text="done",
-        structured={"ok": True},
         session_id="s-9",
         cost_usd=1.5,
         num_turns=7,

@@ -56,7 +56,7 @@ class RunRecord:
     request: str
     base_branch: str
     project: str
-    max_concurrent: int
+    max_concurrent: int # TODO this is workflow specific. it should be metadata. in cli also run should take different params for each workflow.
 
 
 def write_record(store: Store, record: RunRecord) -> None:

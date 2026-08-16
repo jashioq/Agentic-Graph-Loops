@@ -39,7 +39,7 @@ class Worktree:
 @dataclass(frozen=True)
 class FileStatus:
     """One entry of a porcelain status: `M`, `A`, `D`, `R`, `??`, `UU`."""
-
+# TODO these should be an enum for MODIFIED, ADDED and so on.
     path: str
     code: str
 

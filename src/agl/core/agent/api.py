@@ -2,7 +2,8 @@
 
 Layer: core. The single path every model call goes through — session config, the
 retry ladder, tool registration, and turning a message stream into a result. It
-takes a prompt, a directory and opaque tools, and hands back text.
+takes a prompt, a directory and opaque tools, and hands back text: a run reports
+what it produced by calling a tool, never as JSON in its final message.
 
 Scoping happens in a tool's *closure*, not here: this module sees a name, a
 schema and something to await. Two callbacks, both optional: `on_activity` is
@@ -22,7 +23,6 @@ __all__ = [
     "AgentBudgetError",
     "AgentError",
     "AgentOption",
-    "AgentOutputError",
     "AgentQuestion",
     "AgentResult",
     "AgentRunner",
@@ -74,7 +74,6 @@ class AgentSpec:
     permission_mode: str = "default"  # "default" | "plan" | …
     # `None` leaves the choice to the CLI's own default.
     model: Model | None = None
-    output_schema: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -82,7 +81,6 @@ class AgentResult:
     """What one call produced, and what it cost. No error flag: a failed call raises."""
 
     text: str  # the final assistant text
-    structured: Any | None  # parsed JSON when output_schema was set
     session_id: str | None
     cost_usd: float
     num_turns: int
@@ -114,13 +112,6 @@ class AgentBudgetError(AgentError):
     """Raised when the CLI ended a call because it ran out of budget or turns.
 
     Distinct because it is not worth retrying: the task is too large.
-    """
-
-
-class AgentOutputError(AgentError):
-    """Raised when `output_schema` was set and the final text did not parse as JSON.
-
-    Not retried: an identical call answers in prose again.
     """
 
 

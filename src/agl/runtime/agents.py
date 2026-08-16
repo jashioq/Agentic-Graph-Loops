@@ -26,7 +26,7 @@ type Ask = Callable[[AgentQuestion], Awaitable[str]]
 class PromptError(Exception):
     """Raised when a prompt could not be assembled — usually a missing substitution."""
 
-
+# TODO Why does this file even exist? We have agents in core, runtime and in workflow. Let's just provide a prompt in workflow as a string. Store them as string and provide them directly to agent definitions in workflow. Unless claude sdk requires them to be provided as an md file then we just provide the path directly in workflow layer.
 @dataclass(frozen=True)
 class Prompts:
     """One directory of `$`-templated markdown files, rendered by name."""

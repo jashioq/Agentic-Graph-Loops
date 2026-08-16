@@ -26,7 +26,6 @@ FULL = AgentSpec(
     disallowed_tools=("WebFetch",),
     permission_mode="acceptEdits",
     model=Model.SONNET,
-    output_schema={"type": "object", "properties": {"ok": {"type": "boolean"}}},
 )
 
 
@@ -57,7 +56,12 @@ def test_every_field_of_a_full_spec_reaches_the_options() -> None:
         "preset": "claude_code",
         "append": "House rules go here.",
     }
-    assert options.output_format == {"type": "json_schema", "schema": FULL.output_schema}
+
+
+def test_no_output_format_is_ever_asked_for() -> None:
+    # A run reports through a tool, not through JSON in its last message, so
+    # there is no spec field to build an `output_format` out of.
+    assert build(FULL).output_format is None
 
 
 def test_the_model_reaches_the_options_as_a_plain_string() -> None:

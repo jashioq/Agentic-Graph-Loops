@@ -157,7 +157,7 @@ class LiveSession(ABC):
     @abstractmethod
     def show(self, build: Callable[[], Screen]) -> None:
         """Replaces the frame source and paints it once, so a stage change shows at once."""
-
+# TODO ask should be a runtime module or workflow defined. Core module should be only for displaying stuff. If a different screen needs to be displayed (for question) then that should be requested by runtime or workflow
     @abstractmethod
     async def ask(self, question: Question) -> Answer:
         """Takes over the screen to ask. Concurrent callers queue FIFO.

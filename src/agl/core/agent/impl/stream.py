@@ -6,17 +6,15 @@ Layer: core. A function of the messages that arrived; the only side effect is
 Token counts on assistant messages exclude subagent spend, so trust `cost_usd`.
 A result the SDK marked as an error is raised, since `AgentResult` cannot say
 "this failed" — except exhaustion, which comes back as a result for the caller
-to classify. `expect_json` failures raise `AgentOutputError`, the second failure
-a caller should not retry.
+to classify.
 """
 
-import json
 from collections.abc import AsyncIterable, Callable, Mapping
 from typing import Any
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent.api import AgentError, AgentOutputError, AgentResult
+from agl.core.agent.api import AgentError, AgentResult
 from agl.core.agent.impl.tools import MCP_PREFIX
 
 __all__ = ["EXHAUSTED", "fold", "summarize_tool_use"]
@@ -70,13 +68,11 @@ def _shorten(text: str, limit: int) -> str:
 async def fold(
     messages: AsyncIterable[Any],
     on_activity: Callable[[str], None] | None,
-    expect_json: bool,
 ) -> AgentResult:
     """Consumes the stream and returns what the run produced.
 
     return: AgentResult - raises `AgentError` if the stream never resolved or
-        reported a non-exhaustion error, `AgentOutputError` if `expect_json`
-        was asked for and the final text does not parse
+        reported a non-exhaustion error
     """
     text = ""
     session_id: str | None = None
@@ -111,7 +107,6 @@ async def fold(
 
     return AgentResult(
         text=text,
-        structured=_parse(text) if expect_json else None,
         session_id=session_id,
         cost_usd=outcome.total_cost_usd or 0.0,
         num_turns=outcome.num_turns,
@@ -139,15 +134,3 @@ def _terminal_reason(outcome: ResultMessage) -> str | None:
     if outcome.subtype.startswith("error_max_"):
         return outcome.subtype
     return outcome.terminal_reason
-
-
-def _parse(text: str) -> Any:
-    """The text as JSON, with any code fence stripped first."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        _, _, rest = stripped.partition("\n")
-        stripped = rest.rpartition("```")[0].strip() or rest.strip()
-    try:
-        return json.loads(stripped)
-    except ValueError as error:
-        raise AgentOutputError(f"expected JSON output, got {text!r}: {error}") from error
