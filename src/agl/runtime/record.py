@@ -12,10 +12,10 @@ is invisible to callers: `save` puts it on, `load` takes it off.
 
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from agl.core.store import MissingKeyError, Store
-from agl.runtime.json_fields import as_text, as_whole_number
+from agl.runtime.json_fields import OnError, as_text, as_whole_number
 
 __all__ = [
     "RUN_KEY",
@@ -42,6 +42,16 @@ class RecordError(Exception):
 
 class StateError(Exception):
     """Raised when the state document is unreadable."""
+
+
+def _bad_record(message: str) -> NoReturn:
+    """This module's `on_error` for the record: every way of failing is one error."""
+    raise RecordError(message)
+
+
+def _bad_state(message: str) -> NoReturn:
+    """This module's `on_error` for the state document."""
+    raise StateError(message)
 
 
 @dataclass(frozen=True)
@@ -72,16 +82,16 @@ def read_record(store: Store) -> RunRecord:
 
     return: RunRecord - every way of failing is one `RecordError`: there is no run to resume
     """
-    payload = _read_object(store, RUN_KEY, RecordError, "record")
-    _require_version(payload, RecordError, "record")
+    payload = _read_object(store, RUN_KEY, _bad_record, "record")
+    _require_version(payload, _bad_record, "record")
     return RunRecord(
-        workflow=as_text(payload.get("workflow"), "workflow", "record", RecordError),
-        label=as_text(payload.get("label"), "label", "record", RecordError),
-        request=as_text(payload.get("request"), "request", "record", RecordError),
-        base_branch=as_text(payload.get("base_branch"), "base_branch", "record", RecordError),
-        project=as_text(payload.get("project"), "project", "record", RecordError),
+        workflow=as_text(payload.get("workflow"), "workflow", "record", _bad_record),
+        label=as_text(payload.get("label"), "label", "record", _bad_record),
+        request=as_text(payload.get("request"), "request", "record", _bad_record),
+        base_branch=as_text(payload.get("base_branch"), "base_branch", "record", _bad_record),
+        project=as_text(payload.get("project"), "project", "record", _bad_record),
         max_concurrent=as_whole_number(
-            payload.get("max_concurrent"), "max_concurrent", "record", RecordError
+            payload.get("max_concurrent"), "max_concurrent", "record", _bad_record
         ),
     )
 
@@ -105,8 +115,8 @@ class StateFile:
         """
         if not self._store.exists(self._key):
             return None
-        payload = _read_object(self._store, self._key, StateError, "state")
-        _require_version(payload, StateError, "state")
+        payload = _read_object(self._store, self._key, _bad_state, "state")
+        _require_version(payload, _bad_state, "state")
         return {key: value for key, value in payload.items() if key != _VERSION_FIELD}
 
     def save(self, payload: Mapping[str, Any]) -> None:
@@ -128,23 +138,25 @@ class StateFile:
         return updated
 
 
-def _read_object(
-    store: Store, key: str, error: type[Exception], noun: str
-) -> Mapping[str, Any]:
-    """The document at `key` as a JSON object, or `error` saying why it is not one."""
+def _read_object(store: Store, key: str, on_error: OnError, noun: str) -> Mapping[str, Any]:
+    """The document at `key` as a JSON object, or `on_error` saying why it is not one.
+
+    `on_error` is called from inside the `except` blocks, so what it raises still
+    carries the underlying store error as its context.
+    """
     try:
         payload = store.read_json(key)
-    except MissingKeyError as missing:
-        raise error(f"no {noun} at {key!r}") from missing
-    except ValueError as invalid:
-        raise error(f"{noun} at {key!r} is not JSON") from invalid
+    except MissingKeyError:
+        on_error(f"no {noun} at {key!r}")
+    except ValueError:
+        on_error(f"{noun} at {key!r} is not JSON")
     if not isinstance(payload, dict):
-        raise error(f"{noun} at {key!r} is not a JSON object")
+        on_error(f"{noun} at {key!r} is not a JSON object")
     return payload
 
 
-def _require_version(payload: Mapping[str, Any], error: type[Exception], noun: str) -> None:
+def _require_version(payload: Mapping[str, Any], on_error: OnError, noun: str) -> None:
     """Refuse a document this build does not claim to understand."""
     version = payload.get(_VERSION_FIELD)
     if version != VERSION:
-        raise error(f"{noun} is version {version!r}, and this build reads version {VERSION}")
+        on_error(f"{noun} is version {version!r}, and this build reads version {VERSION}")

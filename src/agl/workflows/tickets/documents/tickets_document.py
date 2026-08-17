@@ -6,7 +6,7 @@ document, not the store key of the same name in `store_keys`.
 """
 
 import re
-from typing import Any
+from typing import Any, NoReturn
 
 from agl.runtime.json_fields import (
     as_object,
@@ -25,6 +25,13 @@ __all__ = ["TICKETS_KEY", "TICKETS_SCHEMA", "tickets_from_json"]
 # imported so this file stays free of `agl.core`.
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9-]*$"
 _ID_RE = re.compile(_ID_PATTERN)
+
+
+
+def _invalid(message: str) -> NoReturn:
+    """This module's `on_error`: anything `json_fields` cannot read is one error."""
+    raise InvalidTicketsError(message)
+
 
 TICKETS_KEY = "tickets"
 _REQUIRED = ["id", "title", "deliverables"]
@@ -72,9 +79,9 @@ def tickets_from_json(data: Any) -> tuple[Ticket, ...]:
     Re-checks the whole schema — a schema handed to a model is a request, not a
     guarantee — plus unique ids and resolvable blockers, which it cannot state.
     """
-    payload = as_object(data, "output", InvalidTicketsError)
-    require_fields(payload, [TICKETS_KEY], "output", InvalidTicketsError)
-    reject_unknown_fields(payload, [TICKETS_KEY], "output", InvalidTicketsError)
+    payload = as_object(data, "output", _invalid)
+    require_fields(payload, [TICKETS_KEY], "output", _invalid)
+    reject_unknown_fields(payload, [TICKETS_KEY], "output", _invalid)
     raw = payload[TICKETS_KEY]
     if not isinstance(raw, list):
         raise InvalidTicketsError(f"{TICKETS_KEY!r} must be an array, got {type_name(raw)}")
@@ -89,9 +96,9 @@ def tickets_from_json(data: Any) -> tuple[Ticket, ...]:
 def _one_ticket(item: Any, index: int) -> Ticket:
     """Builds one ticket from one array entry, checking every field it names."""
     where = f"ticket {index}"
-    fields = as_object(item, where, InvalidTicketsError)
-    require_fields(fields, _REQUIRED, where, InvalidTicketsError)
-    reject_unknown_fields(fields, _ALLOWED, where, InvalidTicketsError)
+    fields = as_object(item, where, _invalid)
+    require_fields(fields, _REQUIRED, where, _invalid)
+    reject_unknown_fields(fields, _ALLOWED, where, _invalid)
 
     ticket_id = fields["id"]
     if not isinstance(ticket_id, str) or not _ID_RE.fullmatch(ticket_id):
@@ -103,13 +110,13 @@ def _one_ticket(item: Any, index: int) -> Ticket:
 
     return Ticket(
         id=ticket_id,
-        title=as_text(fields["title"], "title", where, InvalidTicketsError),
+        title=as_text(fields["title"], "title", where, _invalid),
         status=Status.PENDING,
         deliverables=as_text_list(
-            fields["deliverables"], "deliverables", where, InvalidTicketsError, allow_empty=False
+            fields["deliverables"], "deliverables", where, _invalid, allow_empty=False
         ),
         blocked_by=as_text_list(
-            fields.get("blocked_by", []), "blocked_by", where, InvalidTicketsError
+            fields.get("blocked_by", []), "blocked_by", where, _invalid
         ),
     )
 
