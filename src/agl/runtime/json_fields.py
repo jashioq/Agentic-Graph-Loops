@@ -2,20 +2,19 @@
 
 Layer: runtime. A pure leaf: imports nothing else in AGL. What it narrows is
 agent output or a document a person hand-edited, so every failure is a message
-someone has to act on. Each function takes the callable to hand that message to,
-so what a failure *means* stays with the caller: this module reads a field and
-either returns it or reports it, and never decides what to raise.
+someone has to act on.
 
-`OnError` returns `NoReturn` because a narrowing that failed has no value to give
-back. A caller is free to log, wrap or count on the way, but it ends by raising
-its own error type.
+Every function raises `InvalidFieldError`, the way `paths` raises
+`InvalidNameError`: one error, stated here, and callers ask for nothing. A caller
+that wants its own type catches it once around the read it is doing and re-raises
+— the message is already the one a person needs, so passing it through is enough.
 """
 
-from collections.abc import Callable, Mapping, Sequence
-from typing import Any, NoReturn
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 __all__ = [
-    "OnError",
+    "InvalidFieldError",
     "as_object",
     "as_optional_text",
     "as_text",
@@ -26,75 +25,72 @@ __all__ = [
     "type_name",
 ]
 
-type OnError = Callable[[str], NoReturn]
-"""What a caller is handed a failure through: the message, and no way back."""
+
+class InvalidFieldError(Exception):
+    """Raised when a field is absent, or is not the type it has to be."""
 
 
-def as_object(value: Any, where: str, on_error: OnError) -> dict[str, Any]:
-    """Narrow `value` to a JSON object, or hand `on_error` why it is not one."""
+def as_object(value: Any, where: str) -> dict[str, Any]:
+    """Narrow `value` to a JSON object or raise `InvalidFieldError`."""
     if not isinstance(value, dict):
-        on_error(f"{where} must be an object, got {type_name(value)}")
+        raise InvalidFieldError(f"{where} must be an object, got {type_name(value)}")
     return value
 
 
-def require_fields(
-    fields: Mapping[str, Any], required: Sequence[str], where: str, on_error: OnError
-) -> None:
-    """Report the first name in `required` that `fields` does not have."""
+def require_fields(fields: Mapping[str, Any], required: Sequence[str], where: str) -> None:
+    """Raise for the first name in `required` that `fields` does not have."""
     for name in required:
         if name not in fields:
-            on_error(f"{where}: missing required field {name!r}")
+            raise InvalidFieldError(f"{where}: missing required field {name!r}")
 
 
-def reject_unknown_fields(
-    fields: Mapping[str, Any], allowed: Sequence[str], where: str, on_error: OnError
-) -> None:
-    """Report a field outside `allowed`, rather than ignoring it.
+def reject_unknown_fields(fields: Mapping[str, Any], allowed: Sequence[str], where: str) -> None:
+    """Raise for a field outside `allowed`, rather than ignoring it.
 
     A misspelled key that is quietly dropped is a person's edit that appeared to
     take and did not, which is worse than being told.
     """
     for name in fields:
         if name not in allowed:
-            on_error(f"{where}: unknown field {name!r}")
+            raise InvalidFieldError(f"{where}: unknown field {name!r}")
 
 
-def as_text(value: Any, name: str, where: str, on_error: OnError) -> str:
-    """Narrow `value` to non-empty text, or hand `on_error` why it is not."""
+def as_text(value: Any, name: str, where: str) -> str:
+    """Narrow `value` to non-empty text or raise `InvalidFieldError`."""
     if not isinstance(value, str) or not value.strip():
-        on_error(f"{where}: {name} must be non-empty text, got {value!r}")
+        raise InvalidFieldError(f"{where}: {name} must be non-empty text, got {value!r}")
     return value
 
 
-def as_optional_text(value: Any, name: str, where: str, on_error: OnError) -> str | None:
+def as_optional_text(value: Any, name: str, where: str) -> str | None:
     """`as_text`, except that `None` is an answer rather than a failure."""
     if value is None:
         return None
-    return as_text(value, name, where, on_error)
+    return as_text(value, name, where)
 
 
 def as_text_list(
-    value: Any, name: str, where: str, on_error: OnError, *, allow_empty: bool = True
+    value: Any, name: str, where: str, *, allow_empty: bool = True
 ) -> tuple[str, ...]:
-    """Narrow `value` to a tuple of non-empty strings, or report why it is not.
+    """Narrow `value` to a tuple of non-empty strings or raise `InvalidFieldError`.
 
     `allow_empty=False` also refuses an array with nothing in it, for a field
     whose whole point is to list something.
     """
     if not isinstance(value, list):
-        on_error(f"{where}: {name} must be an array, got {type_name(value)}")
+        raise InvalidFieldError(f"{where}: {name} must be an array, got {type_name(value)}")
     if not value and not allow_empty:
-        on_error(f"{where}: {name} is empty")
+        raise InvalidFieldError(f"{where}: {name} is empty")
     for entry in value:
         if not isinstance(entry, str) or not entry.strip():
-            on_error(f"{where}: every {name} entry must be non-empty text")
+            raise InvalidFieldError(f"{where}: every {name} entry must be non-empty text")
     return tuple(value)
 
 
-def as_whole_number(value: Any, name: str, where: str, on_error: OnError) -> int:
-    """Narrow `value` to a non-negative `int`, or report why it is not. `bool` is refused."""
+def as_whole_number(value: Any, name: str, where: str) -> int:
+    """Narrow `value` to a non-negative `int` or raise `InvalidFieldError`. `bool` is refused."""
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        on_error(f"{where}: {name} must be a whole number, got {value!r}")
+        raise InvalidFieldError(f"{where}: {name} must be a whole number, got {value!r}")
     return value
 
 

@@ -12,10 +12,10 @@ is invisible to callers: `save` puts it on, `load` takes it off.
 
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
-from typing import Any, NoReturn
+from typing import Any
 
 from agl.core.store import MissingKeyError, Store
-from agl.runtime.json_fields import OnError, as_text, as_whole_number
+from agl.runtime.json_fields import InvalidFieldError, as_text, as_whole_number
 
 __all__ = [
     "RUN_KEY",
@@ -42,16 +42,6 @@ class RecordError(Exception):
 
 class StateError(Exception):
     """Raised when the state document is unreadable."""
-
-
-def _bad_record(message: str) -> NoReturn:
-    """This module's `on_error` for the record: every way of failing is one error."""
-    raise RecordError(message)
-
-
-def _bad_state(message: str) -> NoReturn:
-    """This module's `on_error` for the state document."""
-    raise StateError(message)
 
 
 @dataclass(frozen=True)
@@ -82,17 +72,23 @@ def read_record(store: Store) -> RunRecord:
 
     return: RunRecord - every way of failing is one `RecordError`: there is no run to resume
     """
-    payload = _read_object(store, RUN_KEY, _bad_record, "record")
-    _require_version(payload, _bad_record, "record")
+    try:
+        return _read_record(store)
+    except InvalidFieldError as invalid:
+        raise RecordError(str(invalid)) from invalid
+
+
+def _read_record(store: Store) -> RunRecord:
+    """The read itself, whose `InvalidFieldError`s `read_record` renames."""
+    payload = _read_object(store, RUN_KEY, "record")
+    _require_version(payload, "record")
     return RunRecord(
-        workflow=as_text(payload.get("workflow"), "workflow", "record", _bad_record),
-        label=as_text(payload.get("label"), "label", "record", _bad_record),
-        request=as_text(payload.get("request"), "request", "record", _bad_record),
-        base_branch=as_text(payload.get("base_branch"), "base_branch", "record", _bad_record),
-        project=as_text(payload.get("project"), "project", "record", _bad_record),
-        max_concurrent=as_whole_number(
-            payload.get("max_concurrent"), "max_concurrent", "record", _bad_record
-        ),
+        workflow=as_text(payload.get("workflow"), "workflow", "record"),
+        label=as_text(payload.get("label"), "label", "record"),
+        request=as_text(payload.get("request"), "request", "record"),
+        base_branch=as_text(payload.get("base_branch"), "base_branch", "record"),
+        project=as_text(payload.get("project"), "project", "record"),
+        max_concurrent=as_whole_number(payload.get("max_concurrent"), "max_concurrent", "record"),
     )
 
 
@@ -115,8 +111,11 @@ class StateFile:
         """
         if not self._store.exists(self._key):
             return None
-        payload = _read_object(self._store, self._key, _bad_state, "state")
-        _require_version(payload, _bad_state, "state")
+        try:
+            payload = _read_object(self._store, self._key, "state")
+            _require_version(payload, "state")
+        except InvalidFieldError as invalid:
+            raise StateError(str(invalid)) from invalid
         return {key: value for key, value in payload.items() if key != _VERSION_FIELD}
 
     def save(self, payload: Mapping[str, Any]) -> None:
@@ -138,25 +137,23 @@ class StateFile:
         return updated
 
 
-def _read_object(store: Store, key: str, on_error: OnError, noun: str) -> Mapping[str, Any]:
-    """The document at `key` as a JSON object, or `on_error` saying why it is not one.
-
-    `on_error` is called from inside the `except` blocks, so what it raises still
-    carries the underlying store error as its context.
-    """
+def _read_object(store: Store, key: str, noun: str) -> Mapping[str, Any]:
+    """The document at `key` as a JSON object, or `InvalidFieldError` saying why not."""
     try:
         payload = store.read_json(key)
-    except MissingKeyError:
-        on_error(f"no {noun} at {key!r}")
-    except ValueError:
-        on_error(f"{noun} at {key!r} is not JSON")
+    except MissingKeyError as missing:
+        raise InvalidFieldError(f"no {noun} at {key!r}") from missing
+    except ValueError as invalid:
+        raise InvalidFieldError(f"{noun} at {key!r} is not JSON") from invalid
     if not isinstance(payload, dict):
-        on_error(f"{noun} at {key!r} is not a JSON object")
+        raise InvalidFieldError(f"{noun} at {key!r} is not a JSON object")
     return payload
 
 
-def _require_version(payload: Mapping[str, Any], on_error: OnError, noun: str) -> None:
+def _require_version(payload: Mapping[str, Any], noun: str) -> None:
     """Refuse a document this build does not claim to understand."""
     version = payload.get(_VERSION_FIELD)
     if version != VERSION:
-        on_error(f"{noun} is version {version!r}, and this build reads version {VERSION}")
+        raise InvalidFieldError(
+            f"{noun} is version {version!r}, and this build reads version {VERSION}"
+        )
