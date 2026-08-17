@@ -5,9 +5,10 @@ Layer: workflows. Narrows untrusted JSON with `runtime.json_fields` and raises
 every `HIGH` finding is `findings.check_coverage`'s question, not this module's.
 """
 
-from typing import Any, NoReturn
+from typing import Any
 
 from agl.runtime.json_fields import (
+    InvalidFieldError,
     as_object,
     as_text,
     as_text_list,
@@ -26,17 +27,6 @@ __all__ = [
     "bug_groups_from_json",
     "findings_from_json",
 ]
-
-
-def _invalid_finding(message: str) -> NoReturn:
-    """This module's `on_error` while reading findings."""
-    raise InvalidFindingsError(message)
-
-
-def _invalid_group(message: str) -> NoReturn:
-    """This module's `on_error` while reading bug groups."""
-    raise InvalidGroupsError(message)
-
 
 # -- what a reviewer produces -----------------------------------------------
 
@@ -77,9 +67,17 @@ def findings_from_json(data: Any) -> tuple[Finding, ...]:
 
     Re-checks the whole schema, plus unique ids. No findings at all is valid.
     """
-    payload = as_object(data, "output", _invalid_finding)
-    require_fields(payload, [FINDINGS_KEY], "output", _invalid_finding)
-    reject_unknown_fields(payload, [FINDINGS_KEY], "output", _invalid_finding)
+    try:
+        return _read_findings(data)
+    except InvalidFieldError as invalid:
+        raise InvalidFindingsError(str(invalid)) from invalid
+
+
+def _read_findings(data: Any) -> tuple[Finding, ...]:
+    """The read itself, whose `InvalidFieldError`s the caller above renames."""
+    payload = as_object(data, "output")
+    require_fields(payload, [FINDINGS_KEY], "output")
+    reject_unknown_fields(payload, [FINDINGS_KEY], "output")
     raw = payload[FINDINGS_KEY]
     if not isinstance(raw, list):
         raise InvalidFindingsError(f"{FINDINGS_KEY!r} must be an array, got {type_name(raw)}")
@@ -91,11 +89,11 @@ def findings_from_json(data: Any) -> tuple[Finding, ...]:
 
 def _one_finding(item: Any, index: int) -> Finding:
     where = f"finding {index}"
-    fields = as_object(item, where, _invalid_finding)
-    require_fields(fields, _FINDING_REQUIRED, where, _invalid_finding)
-    reject_unknown_fields(fields, _FINDING_REQUIRED, where, _invalid_finding)
+    fields = as_object(item, where)
+    require_fields(fields, _FINDING_REQUIRED, where)
+    reject_unknown_fields(fields, _FINDING_REQUIRED, where)
 
-    finding_id = as_text(fields["id"], "id", where, _invalid_finding)
+    finding_id = as_text(fields["id"], "id", where)
     where = f"finding {finding_id!r}"
 
     severity_raw = fields["severity"]
@@ -110,11 +108,9 @@ def _one_finding(item: Any, index: int) -> Finding:
     return Finding(
         id=finding_id,
         severity=severity,
-        title=as_text(fields["title"], "title", where, _invalid_finding),
-        detail=as_text(fields["detail"], "detail", where, _invalid_finding),
-        files=as_text_list(
-            fields["files"], "files", where, _invalid_finding, allow_empty=False
-        ),
+        title=as_text(fields["title"], "title", where),
+        detail=as_text(fields["detail"], "detail", where),
+        files=as_text_list(fields["files"], "files", where, allow_empty=False),
     )
 
 
@@ -170,9 +166,17 @@ def bug_groups_from_json(data: Any, *, allow_empty: bool = False) -> tuple[BugGr
         where "nothing left to fix" is a result; `False` for fresh agent output
     return: tuple[BugGroup, ...] - shape only; coverage is `check_coverage`'s question
     """
-    payload = as_object(data, "output", _invalid_group)
-    require_fields(payload, [GROUPS_KEY], "output", _invalid_group)
-    reject_unknown_fields(payload, [GROUPS_KEY], "output", _invalid_group)
+    try:
+        return _read_groups(data, allow_empty=allow_empty)
+    except InvalidFieldError as invalid:
+        raise InvalidGroupsError(str(invalid)) from invalid
+
+
+def _read_groups(data: Any, *, allow_empty: bool) -> tuple[BugGroup, ...]:
+    """The read itself, whose `InvalidFieldError`s the caller above renames."""
+    payload = as_object(data, "output")
+    require_fields(payload, [GROUPS_KEY], "output")
+    reject_unknown_fields(payload, [GROUPS_KEY], "output")
     raw = payload[GROUPS_KEY]
     if not isinstance(raw, list):
         raise InvalidGroupsError(f"{GROUPS_KEY!r} must be an array, got {type_name(raw)}")
@@ -184,16 +188,12 @@ def bug_groups_from_json(data: Any, *, allow_empty: bool = False) -> tuple[BugGr
 
 def _one_group(item: Any, index: int) -> BugGroup:
     where = f"group {index}"
-    fields = as_object(item, where, _invalid_group)
-    require_fields(fields, _GROUP_REQUIRED, where, _invalid_group)
-    reject_unknown_fields(fields, _GROUP_REQUIRED, where, _invalid_group)
+    fields = as_object(item, where)
+    require_fields(fields, _GROUP_REQUIRED, where)
+    reject_unknown_fields(fields, _GROUP_REQUIRED, where)
 
     return BugGroup(
-        title=as_text(fields["title"], "title", where, _invalid_group),
-        deliverables=as_text_list(
-            fields["deliverables"], "deliverables", where, _invalid_group, allow_empty=False
-        ),
-        findings=as_text_list(
-            fields["findings"], "findings", where, _invalid_group, allow_empty=False
-        ),
+        title=as_text(fields["title"], "title", where),
+        deliverables=as_text_list(fields["deliverables"], "deliverables", where, allow_empty=False),
+        findings=as_text_list(fields["findings"], "findings", where, allow_empty=False),
     )

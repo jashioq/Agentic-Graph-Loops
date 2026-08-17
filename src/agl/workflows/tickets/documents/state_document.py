@@ -6,9 +6,10 @@ on the way in, because the writer may be a person with an editor.
 """
 
 from collections.abc import Callable, Mapping
-from typing import Any, NoReturn
+from typing import Any
 
 from agl.runtime.json_fields import (
+    InvalidFieldError,
     as_object,
     as_optional_text,
     as_text,
@@ -23,12 +24,6 @@ from agl.workflows.tickets.models import Status, Ticket
 from agl.workflows.tickets.run_state import Run, check
 
 __all__ = ["StateDocument", "from_json", "to_json"]
-
-
-def _invalid_state(message: str) -> NoReturn:
-    """This module's `on_error`: a document that does not read is one error."""
-    raise InvalidStateError(message)
-
 
 _TICKETS = "tickets"
 _HALT = "halt"
@@ -60,7 +55,15 @@ def from_json(payload: Mapping[str, Any]) -> Run:
 
     `check` has the last word, so a document is refused whole or not at all.
     """
-    reject_unknown_fields(payload, [_TICKETS, _HALT], "state", _invalid_state)
+    try:
+        return _read(payload)
+    except InvalidFieldError as invalid:
+        raise InvalidStateError(str(invalid)) from invalid
+
+
+def _read(payload: Mapping[str, Any]) -> Run:
+    """The read itself, whose `InvalidFieldError`s the caller above renames."""
+    reject_unknown_fields(payload, [_TICKETS, _HALT], "state")
     raw = payload.get(_TICKETS, [])
     if not isinstance(raw, list):
         raise InvalidStateError(f"{_TICKETS!r} must be an array, got {type_name(raw)}")
@@ -135,26 +138,20 @@ def _ticket_json(ticket: Ticket) -> dict[str, Any]:
 def _ticket(item: Any, index: int) -> Ticket:
     """One ticket out of one array entry, checking every field it names."""
     where = f"ticket {index}"
-    fields = as_object(item, where, _invalid_state)
-    reject_unknown_fields(fields, _TICKET_FIELDS, where, _invalid_state)
-    ticket_id = as_text(fields.get("id"), "id", where, _invalid_state)
+    fields = as_object(item, where)
+    reject_unknown_fields(fields, _TICKET_FIELDS, where)
+    ticket_id = as_text(fields.get("id"), "id", where)
     where = f"ticket {ticket_id!r}"
     return Ticket(
         id=ticket_id,
-        title=as_text(fields.get("title"), "title", where, _invalid_state),
+        title=as_text(fields.get("title"), "title", where),
         status=_status(fields.get("status"), "status", where),
-        deliverables=as_text_list(
-            fields.get("deliverables", []), "deliverables", where, _invalid_state
-        ),
-        blocked_by=as_text_list(
-            fields.get("blocked_by", []), "blocked_by", where, _invalid_state
-        ),
-        parent=as_optional_text(fields.get("parent"), "parent", where, _invalid_state),
-        review_round=as_whole_number(
-            fields.get("review_round", 0), "review_round", where, _invalid_state
-        ),
+        deliverables=as_text_list(fields.get("deliverables", []), "deliverables", where),
+        blocked_by=as_text_list(fields.get("blocked_by", []), "blocked_by", where),
+        parent=as_optional_text(fields.get("parent"), "parent", where),
+        review_round=as_whole_number(fields.get("review_round", 0), "review_round", where),
         resume_to=_optional_status(fields.get("resume_to"), "resume_to", where),
-        base_sha=as_optional_text(fields.get("base_sha"), "base_sha", where, _invalid_state),
+        base_sha=as_optional_text(fields.get("base_sha"), "base_sha", where),
     )
 
 
@@ -166,8 +163,8 @@ def _halt(value: Any) -> Halt | None:
     """The halt a payload describes, or `None` for a run that is not stopped."""
     if value is None:
         return None
-    fields = as_object(value, "halt", _invalid_state)
-    reject_unknown_fields(fields, _HALT_FIELDS, "halt", _invalid_state)
+    fields = as_object(value, "halt")
+    reject_unknown_fields(fields, _HALT_FIELDS, "halt")
     resumable = fields.get("resumable", True)
     if not isinstance(resumable, bool):
         raise InvalidStateError(f"halt: resumable must be true or false, got {resumable!r}")
@@ -177,7 +174,7 @@ def _halt(value: Any) -> Halt | None:
     if not isinstance(detail, str):
         raise InvalidStateError(f"halt: detail must be text, got {type_name(detail)}")
     return Halt(
-        reason=as_text(fields.get("reason"), "reason", "halt", _invalid_state),
+        reason=as_text(fields.get("reason"), "reason", "halt"),
         detail=detail,
         resumable=resumable,
     )
