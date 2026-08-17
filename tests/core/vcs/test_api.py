@@ -19,7 +19,7 @@ from agl.core.vcs import (
 
 # -- the abstract base ----------------------------------------------------
 
-REPOSITORY = {"root", "current_branch", "is_dirty", "status"}
+REPOSITORY = {"root", "current_branch", "is_dirty", "status", "discard_changes"}
 REFS = {
     "rev_parse",
     "ref_exists",
@@ -30,7 +30,13 @@ REFS = {
     "merge_base",
     "is_ancestor",
 }
-WORKTREES = {"add_worktree", "remove_worktree", "list_worktrees", "prune_worktrees"}
+WORKTREES = {
+    "add_worktree",
+    "attach_worktree",
+    "remove_worktree",
+    "list_worktrees",
+    "prune_worktrees",
+}
 COMMITS = {"has_changes", "commit_all"}
 DIFFS = {"diff", "changed_files"}
 MERGES = {
@@ -73,6 +79,12 @@ def test_queries_default_to_the_main_repository() -> None:
     for method in ("current_branch", "is_dirty", "status"):
         parameters = inspect.signature(getattr(Vcs, method)).parameters
         assert parameters["cwd"].default is None, method
+
+
+def test_discarding_has_to_name_the_tree_it_acts_on() -> None:
+    # Never something to do to the main repository because an argument was left off.
+    parameters = inspect.signature(Vcs.discard_changes).parameters
+    assert parameters["cwd"].default is inspect.Parameter.empty
 
 
 # -- errors ---------------------------------------------------------------

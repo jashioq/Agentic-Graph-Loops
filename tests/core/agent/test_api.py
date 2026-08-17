@@ -12,7 +12,6 @@ from agl.core.agent import (
     AgentBudgetError,
     AgentError,
     AgentOption,
-    AgentOutputError,
     AgentQuestion,
     AgentResult,
     AgentRunner,
@@ -79,7 +78,6 @@ def test_a_spec_needs_a_prompt_a_cwd_and_a_role_and_nothing_else() -> None:
     assert spec.disallowed_tools == ()
     assert spec.permission_mode == "default"
     assert spec.model is None
-    assert spec.output_schema is None
 
 
 def test_a_spec_takes_a_model_as_the_enum() -> None:
@@ -93,7 +91,6 @@ def test_a_spec_takes_a_model_as_the_enum() -> None:
 def test_a_result_carries_the_text_and_what_the_run_cost() -> None:
     result = AgentResult(
         text="done",
-        structured={"ok": True},
         session_id="s-1",
         cost_usd=0.25,
         num_turns=4,
@@ -102,7 +99,6 @@ def test_a_result_carries_the_text_and_what_the_run_cost() -> None:
     )
 
     assert result.text == "done"
-    assert result.structured == {"ok": True}
     assert result.session_id == "s-1"
     assert result.cost_usd == 0.25
     assert result.num_turns == 4
@@ -120,6 +116,15 @@ def test_a_spec_has_no_allowed_tools() -> None:
     # The permission callback allows every non-question tool, so pre-allowing
     # one bought nothing and allowing `AskUserQuestion` silently disabled asking.
     assert "allowed_tools" not in {field.name for field in dataclasses.fields(AgentSpec)}
+
+
+def test_a_model_reports_through_a_tool_and_not_through_its_last_message() -> None:
+    # A run's data comes back through a tool the workflow routed. A JSON schema
+    # on the final message was a second channel with no recovery: a shape the
+    # model got wrong could only fail the parse, where a tool tells it what was
+    # wrong and gets another call in the same session.
+    assert "output_schema" not in {field.name for field in dataclasses.fields(AgentSpec)}
+    assert "structured" not in {field.name for field in dataclasses.fields(AgentResult)}
 
 
 def test_a_question_is_a_title_and_its_options() -> None:
@@ -168,13 +173,6 @@ def test_a_model_is_a_string() -> None:
 def test_budget_exhaustion_is_an_agent_error() -> None:
     assert issubclass(AgentBudgetError, AgentError)
     assert issubclass(AgentError, Exception)
-
-
-def test_output_parse_failure_is_an_agent_error_distinct_from_budget() -> None:
-    # Distinct from `AgentBudgetError` even though both are never retried: they
-    # are unrelated ways a call can fail, not the same failure under two names.
-    assert issubclass(AgentOutputError, AgentError)
-    assert not issubclass(AgentOutputError, AgentBudgetError)
 
 
 # -- the no-argument schema -----------------------------------------------

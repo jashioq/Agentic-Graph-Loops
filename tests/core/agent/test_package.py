@@ -12,7 +12,6 @@ def test_root_exports_exactly_the_api() -> None:
         "AgentBudgetError",
         "AgentError",
         "AgentOption",
-        "AgentOutputError",
         "AgentQuestion",
         "AgentResult",
         "AgentRunner",

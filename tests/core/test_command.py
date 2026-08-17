@@ -59,6 +59,43 @@ def test_ok_is_false_for_a_failing_command(tmp_path: Path) -> None:
     assert run(["false"], cwd=tmp_path, check=False).ok is False
 
 
+# -- both streams as one text ---------------------------------------------
+
+
+def result(stdout: str = "", stderr: str = "") -> ExecResult:
+    """An `ExecResult` with the two streams a test is about and nothing else."""
+    return ExecResult(argv=("build",), code=0, stdout=stdout, stderr=stderr)
+
+
+def test_output_joins_the_two_streams_stdout_first() -> None:
+    assert result(stdout="out\n", stderr="err\n").output == "out\nerr"
+
+
+def test_output_is_one_stream_when_the_other_is_empty() -> None:
+    assert result(stdout="out\n").output == "out"
+    assert result(stderr="err\n").output == "err"
+
+
+def test_output_of_a_silent_command_is_empty() -> None:
+    assert result().output == ""
+
+
+def test_output_strips_only_the_newlines_at_the_ends() -> None:
+    assert result(stdout="\n\nfirst\n\nsecond\n\n").output == "first\n\nsecond"
+
+
+def test_output_keeps_the_indentation_a_build_printed() -> None:
+    assert result(stdout="  indented\n").output == "  indented"
+
+
+def test_output_is_captured_from_a_real_command(tmp_path: Path) -> None:
+    ran = run(
+        python("import sys; print('out'); print('err', file=sys.stderr)"),
+        cwd=tmp_path,
+    )
+    assert ran.output == "out\nerr"
+
+
 # -- failure --------------------------------------------------------------
 
 

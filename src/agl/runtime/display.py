@@ -1,29 +1,12 @@
 """The one path to the terminal: display-only state, and the session over it.
 
-Layer: runtime. The single module that imports `agl.core.terminal` *and*
-`agl.core.agent` — forbidden inside core, and exactly the cross-module wiring
-this layer exists for. An `AgentQuestion` and a `Question` are the same question
-asked by two modules that must not know about each other, and `ask_agent` is
-where the translation happens, once, rather than in every workflow that runs an
-agent a person can talk to.
+Layer: runtime. The single module importing both `agl.core.terminal` and
+`agl.core.agent` — the cross-module wiring this layer exists for. `ask_agent` is
+where an `AgentQuestion` becomes a `Question`, once.
 
-`Board` is the only mutable state in runtime, and it is display-only by
-construction: nothing here is ever read to decide what a run does. Delete the
-board and the run still finishes correctly, you just cannot watch it. It is
-created and owned by the workflow, which is also what keeps that true — runtime
-holds no shared run state of its own.
-
-Two kinds of clock live on it, and the difference is the reason `marks` is a
-dict rather than a field per stage. `started_at` covers the whole session, from
-before the first question is asked, and is what a header's timer reads.
-Everything else a run wants to time from — approval, a first merge — is a named
-mark set when it happens, so a stage's timer means the stage rather than the
-session. `status_since` is per key and answers "how long has this been where it
-is", which is a different question again.
-
-`Display` holds the session, so a workflow never keeps one itself and never has
-to assert it is still open: the session exists for as long as the `live` block
-does, and every path to the terminal goes through the object that block yields.
+`Board` is the only mutable state in runtime and is display-only: nothing here
+is read to decide what a run does. The workflow owns it. `Display` holds the
+session, which exists for exactly as long as the `live` block does.
 """
 
 import time
@@ -43,14 +26,13 @@ from agl.core.terminal import (
 
 __all__ = ["Board", "Display", "live"]
 
-
+# TODO I feel like all of this should be in the workflow. This does not seem very reusable between workflows, each workflow will have to build something like that again if it doesn't use tickets. Workflows should just use the simple core module, define their own screens and then request them to be disaplyed. This is unnecessary complexity.
 @dataclass
 class Board:
     """Ephemeral, in-memory, read only by rendering.
 
-    Everything here is about watching a run rather than running it: when the
-    session began, the stages that have been reached, when each key last
-    changed, and the one-line activity whatever is working on it last reported.
+    `started_at` covers the whole session; `marks` are named points a stage
+    times from; `status_since` is per key; `activity` is one line per key.
     """
 
     started_at: float
@@ -67,21 +49,11 @@ class Board:
         return self.marks.get(name)
 
     def stamp(self, key: str, now: float | None = None) -> None:
-        """Record when `key` arrived where it is.
-
-        `now` is explicit so a test can assert on the value; the default reads
-        the same monotonic clock `started_at` is taken from, so a caller does
-        not have to thread one through.
-        """
+        """Record when `key` arrived where it is. `now` defaults to the monotonic clock."""
         self.status_since[key] = time.monotonic() if now is None else now
 
     def drop(self, key: str) -> None:
-        """Forget everything the board holds about `key`.
-
-        For a key that has left the run — an addition a later step refused, say.
-        A stamp or an activity line for something no longer there is state
-        rendering would have nothing to draw.
-        """
+        """Forget everything the board holds about `key`, which has left the run."""
         self.status_since.pop(key, None)
         self.activity.pop(key, None)
 
@@ -102,11 +74,10 @@ class Display:
         return await self._session.ask(question)
 
     async def ask_agent(self, header: str, question: AgentQuestion) -> str:
-        """An agent's own question, put to the user under `header`.
+        """An agent's own question, put to the user.
 
-        `header` is who is asking — a run label, a work item id — because a
-        person answering three concurrent agents has no other way to tell which
-        one is waiting on them.
+        param: header - who is asking: a run label or work item id
+        return: str - what the user said
         """
         answer = await self._session.ask(
             Question(
@@ -118,23 +89,14 @@ class Display:
         return answer.text
 
     async def confirm(self, header: str, title: str) -> None:
-        """Hold until the user comes back. Whatever they typed is not an answer.
-
-        The gate for "something out there needs a person, and the run cannot
-        tell when they are done." There is nothing to return: the caller looks
-        at the world again rather than at what was said here.
-        """
+        """Holds until the user comes back. Nothing is returned: the caller re-reads
+        the world rather than what was said here."""
         await self._session.ask(
             Question(header=header, title=title, options=(Option("continue", "carry on"),))
         )
 
     def activity(self, key: str) -> Callable[[str], None]:
-        """A writer for one key's activity line, to hand to a long-running call.
-
-        Built per key and closed over it, so concurrent work reports into its
-        own row rather than into a shared "current" line that only ever shows
-        whichever one wrote last.
-        """
+        """A writer for one key's activity line, closed over the key it writes to."""
 
         def on_activity(text: str) -> None:
             self._board.activity[key] = text
@@ -144,12 +106,9 @@ class Display:
 
 @asynccontextmanager
 async def live(terminal: Terminal, board: Board) -> AsyncIterator[Display]:
-    """Open the terminal once, for the whole run, and yield the way in.
+    """Opens the terminal once for the whole run and yields the way in.
 
-    The session starts with no screen at all — blank until the first `show` —
-    because a run opens the display before it knows what its first stage looks
-    like. Stages swap the screen on the session they were given rather than
-    opening one each, so the terminal is entered and left exactly once.
+    Blank until the first `show`; stages swap the screen on this one session.
     """
     async with terminal.live() as session:
         yield Display(session, board)

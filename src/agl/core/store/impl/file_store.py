@@ -1,16 +1,12 @@
 """The filesystem implementation of `Store`: one directory, one run.
 
 Layer: core. Keys become paths under a root the store owns. Writes go through a
-temp file in the destination directory and then `os.replace`, so a reader — or a
-person inspecting a failed run — never meets a half-written document.
+temp file and `os.replace`, so nobody meets a half-written document. Text is
+UTF-8 everywhere, explicitly, never left to the locale.
 
-Text is UTF-8 everywhere, stated explicitly rather than left to the locale.
-
-Because keys become paths, two ordinary keys can collide: `rounds` cannot be a
-document once `rounds/first` has made it a directory, and vice versa. Both
-directions are detected and refused as `InvalidKeyError` rather than left to
-surface as whichever `OSError` the platform happens to raise — `unlink` on a
-directory alone is `EISDIR` on Linux and `EPERM` on macOS.
+Because keys are paths, two ordinary keys collide: `rounds` cannot be a document
+once `rounds/first` made it a directory. Both directions raise `InvalidKeyError`
+rather than whichever `OSError` the platform picks.
 """
 
 import os
@@ -26,11 +22,7 @@ class FileStore(Store):
     """Documents as files under `root`, addressed by relative path-like keys."""
 
     def __init__(self, root: Path) -> None:
-        """Take ownership of `root`, creating it if it does not exist.
-
-        The root is resolved once, so every later containment check compares
-        real paths and a symlinked root does not read as an escape.
-        """
+        """Takes ownership of `root`, creating it if absent and resolving it once."""
         root.mkdir(parents=True, exist_ok=True)
         self._root = root.resolve()
 
@@ -77,11 +69,7 @@ class FileStore(Store):
         return self._resolve(key).is_file()
 
     def list(self, prefix: str = "") -> tuple[str, ...]:
-        """Keys under the root, sorted. `prefix` is a string prefix of the key.
-
-        Directories are not keys, so only files appear. Symlinked directories
-        are not descended into — nothing outside the root is this store's.
-        """
+        """Keys under the root, sorted. Files only, and symlinked directories are not entered."""
         keys = (
             path.relative_to(self._root).as_posix()
             for path in self._root.rglob("*")
@@ -92,11 +80,10 @@ class FileStore(Store):
     # -- internals --------------------------------------------------------
 
     def _resolve(self, key: str) -> Path:
-        """Turn a key into a path inside the root, or raise `InvalidKeyError`.
+        """Turns a key into a path inside the root, or raises `InvalidKeyError`.
 
-        The syntactic rules reject the obvious escapes; the containment check
-        afterwards is the one that has to hold, since a symlink can leave the
-        root without a single `..` in the key.
+        The containment check after the syntactic rules is the load-bearing one:
+        a symlink leaves the root without a single `..` in the key.
         """
         if not key or key.startswith("/") or "\\" in key or "\0" in key:
             raise InvalidKeyError(key)
@@ -108,13 +95,10 @@ class FileStore(Store):
         return path
 
     def _require_no_collision(self, key: str, path: Path) -> None:
-        """Refuse a key another key has already claimed as the wrong kind of thing.
+        """Refuses a key another key has already claimed as the wrong kind of thing.
 
-        Two ordinary keys are enough: `write("rounds/first", …)` makes `rounds`
-        a directory, and `write("rounds", …)` afterwards has nowhere to put a
-        file. Both directions are checked here so the failure is this
-        module's own error rather than an `IsADirectoryError` or a
-        `NotADirectoryError` escaping from the middle of a write.
+        Checked in both directions, so a write fails with `InvalidKeyError`
+        rather than an `IsADirectoryError` from the middle of it.
         """
         if path.is_dir():
             raise InvalidKeyError(

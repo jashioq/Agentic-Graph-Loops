@@ -1,26 +1,13 @@
 """Our `Tool` objects, registered as one in-process MCP server.
 
-Layer: core. The server runs inside this process, so a tool call is an `await`
-and not a subprocess: handlers keep whatever they closed over, which is how a
-caller scopes what a run can reach.
+Layer: core. In-process, so a tool call is an `await` and handlers keep what
+they closed over — which is how a caller scopes what a run can reach. One
+server named `agl`, so the model sees `mcp__agl__<name>`.
 
-One server holds all of them, named `agl`, so the model sees `mcp__agl__<name>`.
-`MCP_PREFIX` is that namespace, derived from the server name rather than spelled
-out a second time, and the names the model will see are handed back alongside
-the server so a caller never has to reconstruct them.
-
-Two failure modes are treated as different things:
-
-- A handler that *raises* is a fact about the world the model should react to —
-  the file was not there, the command failed — so it becomes an error result
-  carrying the message, and the run continues.
-- A handler that returns a *non-string* violates `Tool`'s own type. The model
-  cannot fix that, and stringifying it would hide the bug behind
-  plausible-looking output, so it raises rather than being coerced. Registration
-  cannot catch this: there is nothing to inspect until the handler has run. MCP's
-  own call boundary catches the exception and reports it, so the run survives —
-  what differs is that the message names a type violation rather than pretending
-  the tool answered.
+Two failure modes, treated differently: a handler that *raises* is a fact about
+the world, so it becomes an error result and the run continues. One that returns
+a *non-string* violates `Tool`'s type, which the model cannot fix, so it raises
+rather than being coerced into plausible-looking output.
 """
 
 from collections.abc import Sequence
@@ -43,9 +30,7 @@ def build_tool_server(
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
     """The `mcp_servers` mapping for `tools`, and the names the model will see.
 
-    No tools means no server: an empty mapping and no names. Raises `ValueError`
-    on a duplicate name, which would otherwise leave one of the two silently
-    unreachable.
+    No tools means no server. Raises `ValueError` on a duplicate name.
     """
     seen: set[str] = set()
     for tool in tools:
@@ -64,12 +49,10 @@ def build_tool_server(
 
 
 def build_keepalive_server() -> dict[str, Any]:
-    """An `agl` server with no tools on it, to hold the SDK's input stream open.
+    """An `agl` server with no tools, to hold the SDK's input stream open.
 
-    The SDK closes the CLI's stdin as soon as the prompt has been written unless
-    an in-process server or a hook is registered, and the permission callback is
-    answered over that same stream. A call that registers no tools still has to
-    be able to ask a question, so it gets an empty server instead.
+    Without a registered server the SDK closes stdin once the prompt is written,
+    and the permission callback — how a question is answered — rides that stream.
     """
     config = create_sdk_mcp_server(name=SERVER_NAME)
 

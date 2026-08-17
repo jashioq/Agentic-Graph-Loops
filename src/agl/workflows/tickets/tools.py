@@ -1,28 +1,9 @@
 """What each role may reach, built as closures over the store.
 
-Layer: workflows. Composes `agent` and `store`, and imports both from their
-package roots.
-
-**Scoping is the closure, not a permission check.** A factory closes over
-exactly what a role may touch — one store, one key, one ticket id — and the tool
-it hands back has no parameter that could widen it. `get_ticket` for `T-03` has
-an empty schema, so a reviewer holding it has no argument it could pass to reach
-`T-05`. There is no policy object here, no allow list, and no check inside a
-handler that could be bypassed by an argument nobody thought of: what is not in
-the closure is not reachable, full stop.
-
-Writes are the same fact in the other direction. A save tool takes the content
-and nothing else; the key belongs to the closure, so an agent cannot choose
-where its output lands or overwrite another role's document.
-
-Invalid input to `save_tickets` comes back as a string the agent reads, rather
-than as an exception, and nothing is written. That in-session correction is the
-whole reason these are tools rather than an `output_schema`: a run that produced
-an unusable set of tickets can be told what was wrong and try again inside the
-same session, instead of failing and being started over.
-
-Every description here is written for the model that will read it — what the
-tool answers with and when to reach for it, not what it is called.
+Layer: workflows. Scoping is the closure: a factory closes over what a role may
+touch, and the tool it returns has no parameter that could widen it. Invalid
+input comes back as a string and nothing is written. Every `description` is a
+prompt written for the model.
 """
 
 import json
@@ -31,27 +12,32 @@ from typing import Any
 
 from agl.core.agent import NO_PARAMS, Tool
 from agl.core.store import MissingKeyError, Store
-from agl.workflows.tickets.models import (
-    TICKETS_KEY as TICKETS_FIELD,  # the field inside the payload, not a store key
-)
-from agl.workflows.tickets.models import TICKETS_SCHEMA, InvalidTicketsError, tickets_from_json
-from agl.workflows.tickets.reviews import (
+from agl.runtime.record import STATE_KEY, StateFile
+from agl.workflows.tickets.documents.review_documents import (
     FINDINGS_SCHEMA,
     TRIAGE_SCHEMA,
-    CoverageError,
-    Finding,
-    InvalidFindingsError,
-    InvalidGroupsError,
     bug_groups_from_json,
-    check_coverage,
     findings_from_json,
+)
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.documents.store_keys import (
+    SPEC_KEY,
+    STANDARDS_KEY,
+    TICKETS_KEY,
     review_key,
 )
+from agl.workflows.tickets.documents.tickets_document import TICKETS_SCHEMA, tickets_from_json
+from agl.workflows.tickets.errors import (
+    CoverageError,
+    InvalidFindingsError,
+    InvalidGroupsError,
+    InvalidStateError,
+    InvalidTicketsError,
+)
+from agl.workflows.tickets.findings import Finding, check_coverage
+from agl.workflows.tickets.models import Ticket
 
 __all__ = [
-    "SPEC_KEY",
-    "STANDARDS_KEY",
-    "TICKETS_KEY",
     "decompose_tools",
     "get_ticket",
     "implement_tools",
@@ -67,10 +53,6 @@ __all__ = [
     "triage_tools",
 ]
 
-SPEC_KEY = "spec.md"
-STANDARDS_KEY = "standards.md"
-TICKETS_KEY = "tickets.json"
-
 _CONTENT = "content"
 
 _CONTENT_SCHEMA: dict[str, Any] = {
@@ -79,17 +61,14 @@ _CONTENT_SCHEMA: dict[str, Any] = {
     "required": [_CONTENT],
     "additionalProperties": False,
 }
-"""The schema for a write: the document, and nothing about where it goes.
-
-Read-only by convention, like `agent.NO_PARAMS` — hand it to a `Tool` rather
-than mutating it."""
+"""The schema for a write: the document, and nothing about where it goes. Read-only."""
 
 
 # -- reads ----------------------------------------------------------------
 
 
 def read_spec(store: Store) -> Tool:
-    """The spec, for a role that is allowed to know what was agreed."""
+    """Builds a no-argument tool returning the run's spec, or a note if none was written."""
     return Tool(
         name="read_spec",
         description=(
@@ -103,7 +82,7 @@ def read_spec(store: Store) -> Tool:
 
 
 def read_standards(store: Store) -> Tool:
-    """The project's coding standards."""
+    """Builds a no-argument tool returning the coding standards, or a note if unwritten."""
     return Tool(
         name="read_standards",
         description=(
@@ -117,27 +96,29 @@ def read_standards(store: Store) -> Tool:
 
 
 def get_ticket(store: Store, ticket_id: str) -> Tool:
-    """One ticket, bound at build time. The model is given no way to say which.
+    """Builds a tool answering with one ticket, read from the state at call time.
 
-    Looked up at call time rather than captured when the tool was built, so a
-    ticket the run has since edited reads as it is now.
+    param: ticket_id - the only ticket it will ever answer with; the model cannot widen it
+    return: Tool - the ticket as JSON, or why it could not be read
     """
+
+    state = StateDocument(StateFile(store))
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
-            payload = store.read_json(TICKETS_KEY)
-        except MissingKeyError:
-            return f"This run holds no {TICKETS_KEY}: no tickets have been stored yet."
-        except ValueError:
-            return f"The tickets in {TICKETS_KEY} could not be read as JSON."
-        entry = _entry(payload, ticket_id)
-        if entry is None:
+            run = state.load()
+        except InvalidStateError as unreadable:
+            return f"The run's state in {STATE_KEY} could not be read: {unreadable}."
+        if not run.tickets:
+            return f"This run holds no {STATE_KEY}: no tickets have been stored yet."
+        ticket = run.get(ticket_id)
+        if ticket is None:
             return (
-                f"There is no ticket {ticket_id!r} in {TICKETS_KEY}. "
+                f"There is no ticket {ticket_id!r} in this run. "
                 "Nothing you can pass to this tool changes which ticket it answers with, "
                 "so this is something for the run to fix, not you."
             )
-        return json.dumps(entry, indent=2, ensure_ascii=False)
+        return json.dumps(_entry(ticket), indent=2, ensure_ascii=False)
 
     return Tool(
         name="get_ticket",
@@ -156,7 +137,7 @@ def get_ticket(store: Store, ticket_id: str) -> Tool:
 
 
 def save_spec(store: Store) -> Tool:
-    """Stores the spec at the key this closure chose."""
+    """Builds a tool storing the spec at the key this closure chose."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         content = arguments.get(_CONTENT)
@@ -178,11 +159,7 @@ def save_spec(store: Store) -> Tool:
 
 
 def save_tickets(store: Store) -> Tool:
-    """Stores the decomposition, refusing anything that is not a usable set.
-
-    Validated by `tickets_from_json` before a byte is written, so what reaches
-    the store is always something the workflow can read back.
-    """
+    """Builds a tool storing the decomposition, validated by `tickets_from_json` first."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
@@ -209,10 +186,10 @@ def save_tickets(store: Store) -> Tool:
 
 
 def save_findings(store: Store, ticket_id: str, round_: int, source: str) -> Tool:
-    """Stores one reviewer's findings, refusing anything that is not a usable set.
+    """Builds a tool storing one reviewer's findings under a closed-over key.
 
-    The key is closed over — `review_key(ticket_id, round_, source)` — so
-    nothing an agent passes can land its findings anywhere else.
+    param: source - which reviewer, one of `REVIEWERS`
+    return: Tool - validates, then writes; nothing an agent passes can move the key
     """
 
     key = review_key(ticket_id, round_, source)
@@ -248,11 +225,10 @@ def save_findings(store: Store, ticket_id: str, round_: int, source: str) -> Too
 
 
 def save_triage(store: Store, ticket_id: str, round_: int, highs: Sequence[Finding]) -> Tool:
-    """Stores the triage groups, refusing anything that does not cover every `HIGH`.
+    """Builds a tool storing triage groups, checked for shape then for coverage.
 
-    Validated in two stages: `bug_groups_from_json` for shape, then
-    `check_coverage` against the `highs` this closure holds — the same check
-    the caller runs again after reading back, as a backstop.
+    param: highs - the `HIGH` findings the groups must cover exactly
+    return: Tool - refuses and writes nothing unless coverage holds
     """
 
     key = review_key(ticket_id, round_, "triage")
@@ -303,20 +279,12 @@ def decompose_tools(store: Store) -> tuple[Tool, ...]:
 
 
 def implement_tools(store: Store, ticket_id: str) -> tuple[Tool, ...]:
-    """Doing one ticket's work: everything to read, nothing to write.
-
-    What it produces is a commit in its own worktree, not a document.
-    """
+    """Doing one ticket's work: everything to read, nothing to write."""
     return (get_ticket(store, ticket_id), read_spec(store), read_standards(store))
 
 
 def review_quality_tools(store: Store, ticket_id: str, round_: int) -> tuple[Tool, ...]:
-    """Reviewing one ticket against the standards. **No spec access.**
-
-    It judges the code as code. Handed the spec it starts re-arguing design
-    decisions that were settled with the user, which is not its job and which
-    would file findings nobody can act on.
-    """
+    """Reviewing one ticket against the standards. No spec access: it judges code as code."""
     return (
         get_ticket(store, ticket_id),
         read_standards(store),
@@ -344,12 +312,7 @@ def triage_tools(
 
 
 def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awaitable[str]]:
-    """A no-argument handler over one document, missing or not.
-
-    A store with no `standards.md` is a project that has not written any, which
-    is a fact the agent should work around rather than a reason to end a run
-    that had already started.
-    """
+    """A no-argument handler reading one key, answering with `what` when it is missing."""
 
     async def handler(arguments: dict[str, Any]) -> str:
         try:
@@ -360,14 +323,15 @@ def _reader(store: Store, key: str, what: str) -> Callable[[dict[str, Any]], Awa
     return handler
 
 
-def _entry(payload: Any, ticket_id: str) -> dict[str, Any] | None:
-    """One ticket out of the stored payload, by id, tolerating a payload it cannot parse."""
-    if not isinstance(payload, dict):
-        return None
-    entries = payload.get(TICKETS_FIELD)
-    if not isinstance(entries, list):
-        return None
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("id") == ticket_id:
-            return entry
-    return None
+def _entry(ticket: Ticket) -> dict[str, Any]:
+    """One ticket as an agent reads it: what to build and what it waits for.
+
+    Omits the run's own bookkeeping — status, round, base sha — which no agent decides.
+    """
+    return {
+        "id": ticket.id,
+        "title": ticket.title,
+        "deliverables": list(ticket.deliverables),
+        "blocked_by": list(ticket.blocked_by),
+        "parent": ticket.parent,
+    }

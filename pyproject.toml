@@ -76,9 +76,9 @@ type = "layers"
 layers = ["agl.cli", "agl.workflows", "agl.runtime", "agl.core"]
 
 [[tool.importlinter.contracts]]
-name = "dag and paths are pure leaves"
+name = "dag, paths and json_fields are pure leaves"
 type = "forbidden"
-source_modules = ["agl.runtime.dag", "agl.runtime.paths"]
+source_modules = ["agl.runtime.dag", "agl.runtime.paths", "agl.runtime.json_fields"]
 forbidden_modules = ["agl.core", "agl.workflows", "agl.cli", "agl.config"]
 
 [[tool.importlinter.contracts]]

@@ -44,6 +44,13 @@ class Git(MergeOps, Vcs):
     def status(self, cwd: Path | None = None) -> tuple[FileStatus, ...]:
         return tuple(sorted(self._porcelain(cwd), key=lambda entry: entry.path))
 
+    def discard_changes(self, cwd: Path) -> None:
+        # Two commands because git has no one command for it: `reset --hard`
+        # only speaks for what is tracked, and `clean` only for what is not.
+        # `-fd` and not `-fdx`, so what `.gitignore` covers survives.
+        self._run(["reset", "--hard"], cwd)
+        self._run(["clean", "-fd"], cwd)
+
     # -- refs -------------------------------------------------------------
 
     def rev_parse(self, ref: str) -> str:
@@ -112,6 +119,19 @@ class Git(MergeOps, Vcs):
                 raise VcsError(f"cannot add worktree at {path}: {self._reason(result)}")
             return Worktree(path=path.resolve(), branch=branch)
 
+    def attach_worktree(self, path: Path, branch: str) -> Worktree:
+        with self._lock:
+            # Asked in advance, unlike everywhere else in this file: git says
+            # the same thing when the branch is missing as when it is held by
+            # another tree, and those are different answers to the caller.
+            if not self.branch_exists(branch):
+                raise UnknownRefError(branch)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            result = self._run(["worktree", "add", str(path), branch], None, check=False)
+            if result.code != 0:
+                raise VcsError(f"cannot attach worktree at {path}: {self._reason(result)}")
+            return Worktree(path=path.resolve(), branch=branch)
+
     def remove_worktree(self, path: Path, force: bool = False) -> None:
         with self._lock:
             target = path.resolve()
@@ -136,10 +156,9 @@ class Git(MergeOps, Vcs):
     # -- internals --------------------------------------------------------
 
     def _create_branch(self, name: str, base: str) -> None:
-        """Create a branch, mapping git's refusal onto the API's errors.
+        """Creates a branch, mapping git's refusal onto the API's errors.
 
-        Not locked: the two public callers hold the lock already, and one of
-        them needs the create and the worktree add to be one atomic step.
+        Not locked: both public callers hold it already.
         """
         result = self._run(["branch", "--", name, base], None, check=False)
         if result.code == 0:
@@ -151,11 +170,9 @@ class Git(MergeOps, Vcs):
         raise VcsError(f"cannot create branch {name}: {self._reason(result)}")
 
     def _worktrees(self) -> tuple[Worktree, ...]:
-        """Parse `worktree list --porcelain` — never the human-readable form.
+        """Parses `worktree list --porcelain` — never the human-readable form.
 
-        Entries are blank-line separated records of `key value` lines. A
-        worktree with a detached HEAD has no `branch` line; it is not something
-        this module creates, so it is skipped rather than guessed at.
+        A detached-HEAD entry has no `branch` line and is skipped, not guessed at.
         """
         result = self._run(["worktree", "list", "--porcelain"], None)
         worktrees: list[Worktree] = []

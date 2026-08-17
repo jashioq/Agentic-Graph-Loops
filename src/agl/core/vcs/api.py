@@ -1,24 +1,15 @@
 """Vcs API: git, as structured data.
 
-Layer: core. Worktrees, branches, commits, diffs, and merges. It takes paths and
-ref names and hands back dataclasses; it has never heard of a work item, an
-agent, or a run.
+Layer: core. Worktrees, branches, commits, diffs and merges, in and out as
+dataclasses. It has never heard of a work item, an agent or a run.
 
-A conflicted merge is reported as the paths that conflicted, and nothing more.
-There is no classifier here deciding which conflicts are trivial, and the shape
-of what a classifier would need — three-way output, the base text — is
-deliberately absent rather than half-provided: a caller resolves in the worktree
-or halts for a person.
+A conflicted merge reports the conflicting paths and nothing more — no
+classifier, so a caller resolves in the worktree or halts for a person.
+Synchronous throughout: git calls are milliseconds, and one made from an async
+task serializes on the event loop rather than racing.
 
-The API is synchronous. Git operations are milliseconds, a sync call is far
-easier to test and reason about, and a sync call made from an async task
-serializes on the event loop rather than racing. A caller that has a genuinely
-slow operation — a merge on a large repository — wraps it in
-`asyncio.to_thread` itself.
-
-`cwd` is how a caller chooses which worktree a question is about. Where it is
-optional, `None` means the main repository root; where a method must act inside
-one particular tree, it is required.
+`cwd` chooses which worktree a question is about; where optional, `None` is the
+main repository root.
 """
 
 from abc import ABC, abstractmethod
@@ -48,7 +39,7 @@ class Worktree:
 @dataclass(frozen=True)
 class FileStatus:
     """One entry of a porcelain status: `M`, `A`, `D`, `R`, `??`, `UU`."""
-
+# TODO these should be an enum for MODIFIED, ADDED and so on.
     path: str
     code: str
 
@@ -57,9 +48,8 @@ class FileStatus:
 class MergeResult:
     """What a merge did: committed, or stopped with files to look at.
 
-    Self-describing on purpose. `conflicted` is what `unmerged_paths` would say
-    at the moment the merge stopped, carried along so a caller writing a halt
-    banner does not have to go back and ask.
+    `conflicted` is what `unmerged_paths` said when the merge stopped, carried
+    along so a caller does not have to go back and ask.
     """
 
     clean: bool
@@ -94,11 +84,7 @@ class Vcs(ABC):
 
     @abstractmethod
     def current_branch(self, cwd: Path | None = None) -> str:
-        """The checked-out branch, in the main repo or in the worktree at `cwd`.
-
-        Raises `VcsError` on a detached HEAD, which no worktree this module
-        creates is ever in.
-        """
+        """The checked-out branch. Raises `VcsError` on a detached HEAD."""
 
     @abstractmethod
     def is_dirty(self, cwd: Path | None = None) -> bool:
@@ -107,6 +93,13 @@ class Vcs(ABC):
     @abstractmethod
     def status(self, cwd: Path | None = None) -> tuple[FileStatus, ...]:
         """Every changed path with its porcelain code, sorted by path."""
+
+    @abstractmethod
+    def discard_changes(self, cwd: Path) -> None:
+        """Throws away every uncommitted change in this tree, tracked or not.
+
+        Ignored files are left alone. `cwd` is required, never defaulted.
+        """
 
     # -- refs -------------------------------------------------------------
 
@@ -128,19 +121,16 @@ class Vcs(ABC):
 
     @abstractmethod
     def create_branch(self, name: str, base: str) -> None:
-        """Create `name` at `base` without checking it out.
+        """Creates `name` at `base` without checking it out.
 
-        Raises `BranchExistsError` if the name is taken — the caller decides
-        whether that is recoverable — or `UnknownRefError` if `base` does not
-        resolve.
+        Raises `BranchExistsError` or `UnknownRefError`.
         """
 
     @abstractmethod
     def delete_branch(self, name: str, force: bool = False) -> None:
-        """Delete a local branch.
+        """Deletes a local branch.
 
-        Raises `VcsError` if it holds commits that are not merged anywhere,
-        unless `force`, and `UnknownRefError` if there is no such branch.
+        param: force - delete even when it holds commits merged nowhere
         """
 
     @abstractmethod
@@ -149,30 +139,29 @@ class Vcs(ABC):
 
     @abstractmethod
     def is_ancestor(self, maybe_ancestor: str, descendant: str) -> bool:
-        """Whether the first ref is reachable from the second.
-
-        A ref is its own ancestor. Raises `UnknownRefError` if either side does
-        not resolve.
-        """
+        """Whether the first ref is reachable from the second. A ref is its own ancestor."""
 
     # -- worktrees --------------------------------------------------------
 
     @abstractmethod
     def add_worktree(self, path: Path, branch: str, base: str) -> Worktree:
-        """Create `branch` off `base` and check it out at `path`, in one step.
+        """Creates `branch` off `base` and checks it out at `path`, in one step.
 
-        Raises `BranchExistsError` if the branch is already there,
-        `UnknownRefError` if `base` does not resolve, and `VcsError` if the
-        path is taken.
+        Raises `BranchExistsError`, `UnknownRefError`, or `VcsError` on a taken path.
+        """
+
+    @abstractmethod
+    def attach_worktree(self, path: Path, branch: str) -> Worktree:
+        """Checks an existing branch out at `path` — the counterpart to `add_worktree`.
+
+        Raises `UnknownRefError`, or `VcsError` if the path or branch is taken.
         """
 
     @abstractmethod
     def remove_worktree(self, path: Path, force: bool = False) -> None:
-        """Deregister the worktree and delete its directory.
+        """Deregisters the worktree and deletes its directory, leaving its branch alone.
 
-        Raises `DirtyWorktreeError` if it holds uncommitted work and `force` is
-        not set, or `VcsError` if no worktree is registered at `path`. The
-        branch it had checked out is left alone.
+        param: force - remove even when it holds uncommitted work
         """
 
     @abstractmethod
@@ -191,11 +180,9 @@ class Vcs(ABC):
 
     @abstractmethod
     def commit_all(self, cwd: Path, message: str) -> str | None:
-        """Stage everything, including untracked files, commit, return the sha.
+        """Stages everything including untracked files, commits, returns the sha.
 
-        Returns `None` when there was nothing to commit, rather than raising:
-        a tree that ended up unchanged is an ordinary outcome for the caller to
-        handle, not an error. Raises `VcsError` if the commit fails.
+        return: str | None - `None` when there was nothing to commit, which is not an error
         """
 
     # -- diffs ------------------------------------------------------------
@@ -204,33 +191,21 @@ class Vcs(ABC):
     def diff(self, cwd: Path, base: str, head: str) -> str:
         """Unified diff of what `head` added since it diverged from `base`.
 
-        This is the merge-base diff — `base...head` — so commits made on `base`
-        after the divergence do not appear: what `head` did is `head`'s, and
-        nothing that landed elsewhere meanwhile belongs in it. Raises
-        `UnknownRefError`.
+        The merge-base diff, `base...head`, so later commits on `base` do not appear.
         """
 
     @abstractmethod
     def changed_files(self, cwd: Path, base: str, head: str) -> tuple[str, ...]:
-        """Paths `head` touched since diverging from `base`, sorted.
-
-        The same merge-base comparison `diff` makes. Raises `UnknownRefError`.
-        """
+        """Paths `head` touched since diverging from `base`, sorted. Same comparison as `diff`."""
 
     # -- merges -----------------------------------------------------------
 
     @abstractmethod
     def merge(self, cwd: Path, source: str, no_ff: bool = True) -> MergeResult:
-        """Merge `source` into whatever `cwd` has checked out.
+        """Merges `source` into whatever `cwd` has checked out.
 
-        A clean merge commits and comes back with `clean=True` and the new sha.
-        A conflicted one comes back with `clean=False`, the conflicting paths,
-        and no sha, leaving the merge *in progress* on purpose: the caller
-        inspects, resolves, and then calls `commit_merge` — or `abort_merge`.
-        There is no third, silent state.
-
-        Raises `UnknownRefError` if `source` does not resolve, and `VcsError`
-        if git refused for any reason other than conflicts.
+        return: MergeResult - clean, with the new sha; or conflicted, with the paths
+            and the merge left *in progress* for `commit_merge` or `abort_merge`
         """
 
     @abstractmethod
@@ -239,12 +214,7 @@ class Vcs(ABC):
 
     @abstractmethod
     def unmerged_paths(self, cwd: Path) -> tuple[str, ...]:
-        """Paths git considers unresolved, sorted.
-
-        Only meaningful during a merge in progress; otherwise empty. This is
-        what tells a conflicted merge from a hard failure, and what a halt
-        banner names.
-        """
+        """Paths git considers unresolved, sorted. Empty outside a merge in progress."""
 
     @abstractmethod
     def abort_merge(self, cwd: Path) -> None:
@@ -252,16 +222,9 @@ class Vcs(ABC):
 
     @abstractmethod
     def commit_merge(self, cwd: Path, message: str) -> str:
-        """Commit a merge whose conflicts have been resolved in the worktree.
+        """Commits a merge whose conflicts have been resolved in the worktree.
 
-        Resolving means leaving the files as they should be — edited, or
-        deleted — and nothing else: the paths the merge left unmerged are
-        staged here, since `Vcs` offers no way to stage and the documented
-        path has to be walkable through this interface alone. Only those paths
-        are staged, so unrelated work in the tree stays out of the merge commit.
-
-        Conflict markers still in a file are not checked for. This commits what
-        it was given; verifying a resolution is the caller's job.
-
-        Raises `VcsError` if no merge is in progress.
+        Stages exactly the paths the merge left unmerged, so unrelated work in
+        the tree stays out. Leftover conflict markers are not checked for:
+        verifying a resolution is the caller's job.
         """

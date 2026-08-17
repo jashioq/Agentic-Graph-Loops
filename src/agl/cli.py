@@ -1,18 +1,14 @@
-"""`agl run`, `agl clean`, and `agl init` — the composition root.
+"""`agl run`, `agl resume`, `agl clean`, and `agl init` — the composition root.
 
-Layer: cli. This is the only file that constructs concrete `impl` classes;
-everything below it takes them injected. `run` resolves a project, takes a
-label via `--name`/`-n`, discovers a workflow by listing `agl.workflows`, and
-hands a `RunContext` to that workflow's `run`. A workflow is exactly that: a
-package under `agl.workflows` exposing `workflow.run(ctx)`. Nothing here reaches
-into a run afterwards — the exception `run` raises is the exit status.
-`clean` removes what a label left behind — worktrees, branches, and its run
-directory — tolerating anything already gone. `init` writes the `config.toml`
-and `standards.md` a project needs before `run` can find it.
+Layer: cli. The only file that constructs concrete `impl` classes; everything
+below takes them injected. A workflow is a package under `agl.workflows`
+exposing `workflow.run(ctx)`, discovered by name. Nothing here reaches into a
+run afterwards — the exception it raises is the exit status.
 
-`_settings` is the only place `ProjectConfig` and `ProjectSettings` meet, which
-is what keeps the config file format a cli concern: below this file a project is
-five fields of data, and nothing knows they came out of a TOML file.
+`resume` takes a label and nothing else: the rest was written to `run.json` at
+preflight, so the repository a person is standing in cannot change what the run
+was asked for. `_settings` is the only place `ProjectConfig` and
+`ProjectSettings` meet, which is what keeps the file format a cli concern.
 """
 
 import argparse
@@ -21,8 +17,9 @@ import importlib
 import pkgutil
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from pathlib import Path
+from typing import Any
 
 from agl import workflows as workflows_pkg
 from agl.config import (
@@ -41,6 +38,7 @@ from agl.core.vcs.impl.git import Git
 from agl.runtime import paths
 from agl.runtime.context import ProjectSettings, RunContext
 from agl.runtime.paths import InvalidNameError
+from agl.runtime.record import RecordError, read_record
 
 __all__ = ["main"]
 
@@ -54,6 +52,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "run":
         return _cmd_run(args)
+    if args.command == "resume":
+        return _cmd_resume(args)
     if args.command == "clean":
         return _cmd_clean(args)
     if args.command == "init":
@@ -86,6 +86,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "what to build, as free text; may start with '--'. "
             "Reads from stdin if omitted."
         ),
+    )
+
+    resume_parser = sub.add_parser("resume", help="continue a run that was stopped")
+    resume_parser.add_argument("label", help="the run label to continue")
+    resume_parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=None,
+        help="how many tickets to work on at once (default: what the run was started with)",
     )
 
     clean_parser = sub.add_parser("clean", help="remove a run's worktrees, branches, and files")
@@ -134,12 +143,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     module = importlib.import_module(f"agl.workflows.{args.workflow}.workflow")
 
-    # Assembling the context is inside the try because it is already doing real
-    # work — reading the current branch, creating the run directory — and a
-    # failure there is the same kind of thing to a person as a failure in the
-    # run itself: a message, not a traceback.
+    # Assembling the context is inside the try because it already does real work
+    # — reading the branch, creating the run directory — and a failure there
+    # deserves a message rather than a traceback, same as one in the run.
     try:
         ctx = RunContext(
+            workflow=args.workflow,
             label=label,
             request=description,
             base_branch=vcs.current_branch(),
@@ -163,9 +172,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _read_description(args: argparse.Namespace) -> str | None:
     """The run description, or `None` if none was given.
 
-    A positional description is used as-is and stdin is left untouched. Absent
-    that, stdin is read whole — unless it is a terminal, which would otherwise
-    leave a person waiting at an empty prompt with no sign it is waiting.
+    A positional argument wins and leaves stdin untouched; otherwise stdin is
+    read whole, unless it is a terminal and would just hang at a blank prompt.
     """
     if args.description:
         text = " ".join(args.description)
@@ -179,9 +187,7 @@ def _read_description(args: argparse.Namespace) -> str | None:
 def _settings(config: ProjectConfig) -> ProjectSettings:
     """The project a run is against, as the data a workflow takes.
 
-    Everything `config.toml` holds that a run may use, and nothing of where it
-    came from: `standards` and `config_dir` are the cli's own bookkeeping and
-    stop here.
+    `standards` and `config_dir` are the cli's own bookkeeping and stop here.
     """
     return ProjectSettings(
         name=config.name,
@@ -200,12 +206,103 @@ def _discover_workflows() -> tuple[str, ...]:
 
 
 def _print_interrupted(vcs: Vcs, label: str) -> None:
+    """Names the worktrees an interrupted run left, and both ways out of them.
+
+    Both offered, neither done: only the person who pressed ctrl-c knows which.
+    """
     namespace = f"{paths.branch_namespace(label)}/"
     trees = [w.path for w in vcs.list_worktrees() if w.branch.startswith(namespace)]
     print("\ninterrupted", file=sys.stderr)
     for tree in trees:
         print(f"  {tree}", file=sys.stderr)
+    print(f"run `agl resume {label}` to continue", file=sys.stderr)
     print(f"run `agl clean {label}` to remove them", file=sys.stderr)
+
+
+# -- resume ---------------------------------------------------------------
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    """Continues a run from the record it wrote when it started.
+
+    The label is the whole command line: reading the base branch off the current
+    checkout would let a run be resumed into a branch it never started from.
+    `--max-concurrent` is the exception, being about the machine, not the run.
+    """
+    label = args.label
+
+    try:
+        vcs: Vcs = Git(Path.cwd())
+    except VcsError as error:
+        return _fail(error)
+
+    try:
+        home = agl_home()
+        config = load_project(home, vcs.root())
+    except ConfigError as error:
+        return _fail(error)
+
+    try:
+        paths.validate_label(label)
+    except InvalidNameError as error:
+        return _fail(error)
+
+    # Checked before the store is built, because building one creates its root:
+    # a mistyped label would otherwise leave an empty run behind.
+    run_directory = paths.run_dir(home, label)
+    if not run_directory.is_dir():
+        return _fail(f"unknown label {label!r}; runs found: {_existing_runs(home)}")
+
+    store = FileStore(run_directory)
+    try:
+        record = read_record(store)
+    except RecordError as error:
+        return _fail(error)
+
+    if record.project != config.name:
+        return _fail(
+            f"{label!r} is a run of project {record.project!r}, and this repository is "
+            f"project {config.name!r}"
+        )
+
+    # `getattr` is the whole registry: resuming is optional, and a workflow opts
+    # in by defining the function.
+    try:
+        module = importlib.import_module(f"agl.workflows.{record.workflow}.workflow")
+    except ImportError:
+        available = _discover_workflows()
+        listing = ", ".join(available) if available else "(none found)"
+        return _fail(f"unknown workflow {record.workflow!r}; available: {listing}")
+
+    resume: Callable[[RunContext], Coroutine[Any, Any, None]] | None = getattr(
+        module, "resume", None
+    )
+    if resume is None:
+        return _fail(f"the {record.workflow!r} workflow cannot be resumed")
+
+    try:
+        ctx = RunContext(
+            workflow=record.workflow,
+            label=label,
+            request=record.request,
+            base_branch=record.base_branch,
+            max_concurrent=(
+                record.max_concurrent if args.max_concurrent is None else args.max_concurrent
+            ),
+            project=_settings(config),
+            agent=ClaudeRunner(settings_path=None),
+            vcs=vcs,
+            store=store,
+            terminal=RichTerminal(),
+        )
+        asyncio.run(resume(ctx))
+    except KeyboardInterrupt:
+        _print_interrupted(vcs, label)
+        return 1
+    except Exception as error:  # noqa: BLE001 - surfaced to the user, never a traceback
+        return _fail(error)
+
+    return 0
 
 
 # -- clean ----------------------------------------------------------------
@@ -359,12 +456,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _guess_build(repo_root: Path) -> tuple[tuple[str, ...], str]:
-    """A build command guessed from a marker file, or a placeholder.
-
-    The placeholder is deliberately a command that fails loudly on the first
-    merge rather than one that looks plausible and quietly does the wrong
-    thing.
-    """
+    """A build command guessed from a marker file, or a placeholder that fails loudly."""
     for marker, build, comment in _BUILD_GUESSES:
         if (repo_root / marker).exists():
             return build, comment

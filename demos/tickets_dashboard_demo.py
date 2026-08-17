@@ -2,9 +2,9 @@
 
 Ten Android tickets move through ninety seconds of work: three at a time, one
 stretch waiting on the user, and two tickets sent back by review to wait on bugs
-filed underneath them. Everything goes through the real `set_status` and
-`file_bugs`, so the run this draws is one the workflow could actually produce —
-the graph refuses an illegal move here exactly as it would in a live run.
+filed underneath them. Everything goes through the real `with_status` and
+`with_bugs`, so the run this draws is one the workflow could actually produce —
+an illegal move raises here exactly as it would in a live run.
 
 Nothing pushes updates. The live loop rebuilds the frame several times a second
 by calling `screens.dashboard`, which is why the timers tick and why each row's
@@ -23,8 +23,8 @@ from agl.core.terminal import Screen
 from agl.core.terminal.impl.rich_terminal import RichTerminal
 from agl.runtime.display import Board
 from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import Run, with_bugs, with_status, with_tickets
 from agl.workflows.tickets.screens import dashboard
-from agl.workflows.tickets.state import RunState
 
 LABEL = "add-auth-ticket-18732"
 
@@ -53,7 +53,7 @@ BUGS: dict[str, str] = {
 }
 
 # (seconds into the cycle, ticket id, status). A bug id appearing here for the
-# first time is what files it — `file_bugs` puts the row on the screen and sends
+# first time is what files it — `with_bugs` puts the row on the screen and sends
 # the parent back to pending behind it.
 TIMELINE: tuple[tuple[float, str, Status], ...] = (
     (0, "T-01", Status.IN_PROGRESS),
@@ -160,7 +160,8 @@ class Demo:
     """The scripted run. `build` advances the clock and draws; nothing else does."""
 
     started: float = field(default_factory=time.monotonic)
-    state: RunState = field(init=False)
+    state: Run = field(init=False)
+    board: Board = field(init=False)
     _cycle: int = -1
     _next_event: int = 0
 
@@ -172,7 +173,7 @@ class Demo:
         now = time.monotonic()
         self._advance(now)
         self._report_activity(now)
-        return dashboard(self.state, now)
+        return dashboard(self.state, self.board, LABEL, now)
 
     # -- driving the run --------------------------------------------------
 
@@ -196,11 +197,18 @@ class Demo:
             self._next_event += 1
 
     def _apply(self, ticket_id: str, status: Status, at: float) -> None:
-        """Move a ticket, or file it as a bug the first time it is named."""
-        if ticket_id not in self.state.tickets:
+        """Move a ticket, or file it as a bug the first time it is named.
+
+        Every move goes through the real transition, so the run this draws is
+        one the workflow could actually produce — an illegal move raises here
+        exactly as it would in a live run. The board is stamped alongside,
+        because the board is display-only and no transition touches it.
+        """
+        if self.state.get(ticket_id) is None:
             self._file(ticket_id, at)
             return
-        self.state.set_status(ticket_id, status, now=at)
+        self.state = with_status(self.state, ticket_id, status)
+        self.board.stamp(ticket_id, at)
 
     def _file(self, bug_id: str, at: float) -> None:
         """File one finding against the ticket its id names.
@@ -217,12 +225,15 @@ class Demo:
             deliverables=(BUGS[bug_id],),
             parent=parent,
         )
-        self.state.file_bugs(parent, (bug,), now=at)
+        self.state = with_bugs(self.state, parent, (bug,))
+        self.board.stamp(bug_id, at)
+        self.board.stamp(parent, at)
 
     def _reset(self, at: float) -> None:
-        """Start the run over: a fresh graph, fresh tickets, fresh stamps."""
-        self.state = RunState(LABEL, "main", Board(started_at=at))
-        self.state.add(
+        """Start the run over: fresh tickets, a fresh board, fresh stamps."""
+        self.board = Board(started_at=at)
+        self.state = with_tickets(
+            Run(),
             tuple(
                 Ticket(
                     id=ticket_id,
@@ -233,8 +244,9 @@ class Demo:
                 )
                 for ticket_id, title, blocked_by in FEATURES
             ),
-            now=at,
         )
+        for ticket in self.state.tickets:
+            self.board.stamp(ticket.id, at)
         self._next_event = 0
 
     # -- what the agents are saying ---------------------------------------
@@ -247,16 +259,15 @@ class Demo:
         own starting point, which is the thing worth looking at here: three rows
         changing independently rather than in lockstep.
         """
-        board = self.state.board
-        for index, ticket_id in enumerate(self.state.tickets):
-            ticket = self.state.tickets[ticket_id]
+        board = self.board
+        for index, ticket in enumerate(self.state.tickets):
             pool = _POOLS.get(ticket.status)
             if pool is None:
-                board.activity.pop(ticket_id, None)
+                board.activity.pop(ticket.id, None)
                 continue
-            since = board.status_since.get(ticket_id, board.started_at)
+            since = board.status_since.get(ticket.id, board.started_at)
             step = int(max(0.0, now - since) / (BASE_PERIOD + PERIOD_STEP * index))
-            board.activity[ticket_id] = pool[(index * 3 + step) % len(pool)]
+            board.activity[ticket.id] = pool[(index * 3 + step) % len(pool)]
 
 
 _POOLS: dict[Status, tuple[str, ...]] = {

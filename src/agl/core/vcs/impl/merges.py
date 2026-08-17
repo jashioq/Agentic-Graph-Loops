@@ -1,22 +1,13 @@
 """Commits, diffs, and merges — the half of `Git` that moves history.
 
-Layer: core. `MergeOps` is not usable on its own; it is the group of operations
-`Git` inherits, split out because one file holding all of git was over the size
-this project allows. It runs commands and reports what git said; it never opens
-a conflicted file, and nothing here has an opinion about what a `<<<<<<<` means.
+Layer: core. Not usable alone: the operations `Git` inherits, split out on file
+size. It runs commands and reports what git said, never opening a conflicted
+file or holding an opinion about what a `<<<<<<<` means.
 
-A conflicted merge is deliberately left in progress. The caller looks at the
-paths it named, resolves them in the worktree, and calls `commit_merge` — which
-stages what the merge had left unmerged — or `abort_merge`. Nothing here
-silently unwinds a merge on the caller's behalf.
-
-`merge` takes the tree to merge *into* as `cwd`, and for a caller that fans work
-out across worktrees the answer is the main repository root — not a worktree
-kept for merging. Git refuses to check out a branch another worktree already
-holds, so once the root has the base branch checked out no other tree can, and a
-merge worktree could never hold the branch being merged into. The root is
-already on the base branch, the working trees are untouched either way, and a
-conflict halt leaves the markers where someone looking to resolve them would go.
+A conflicted merge is left in progress, for the caller to resolve and then
+`commit_merge` or `abort_merge`; nothing here unwinds one silently. `merge`
+takes the tree to merge *into* as `cwd`, which for a fanned-out run is the
+repository root — git will not let a second tree hold a branch the root has.
 """
 
 from pathlib import Path
@@ -99,17 +90,11 @@ class MergeOps(GitRunner):
     # -- internals --------------------------------------------------------
 
     def _stage_resolution(self, cwd: Path) -> None:
-        """Stage the paths this merge left unmerged, and nothing else.
+        """Stages the paths this merge left unmerged, and nothing else.
 
-        Named paths rather than `add -A`, because a merge commit is the worst
-        place for a surprise: whatever else the tree happens to hold — an
-        unrelated edit, an untracked scratch file — is none of this merge's
-        business. `-A` under that pathspec is what makes a conflicted file the
-        resolver *deleted* stage as a deletion instead of failing on a path
-        that is no longer there; deleting is a legitimate resolution.
-
-        Whether the content still holds conflict markers is not asked. This
-        stages and commits what it was given; verification is the caller's.
+        Named paths, not `add -A`: unrelated work in the tree is none of this
+        merge's business. `-A` *under that pathspec* is what lets a resolver's
+        deletion stage as one. Leftover conflict markers are not checked for.
         """
         unmerged = self.unmerged_paths(cwd)
         if not unmerged:
@@ -119,11 +104,7 @@ class MergeOps(GitRunner):
             raise VcsError(f"cannot stage the resolution in {cwd}: {self._reason(result)}")
 
     def _diff(self, argv: list[str], cwd: Path, base: str, head: str) -> ExecResult:
-        """Run a `base...head` diff, naming whichever ref failed to resolve.
-
-        Three dots, always: the comparison is against the merge base, so work
-        done on `base` after the divergence is not attributed to `head`.
-        """
+        """Runs a `base...head` diff — three dots, always — naming a ref that will not resolve."""
         result = self._run(argv, cwd, check=False)
         if result.code != 0:
             self._require_refs(base, head)

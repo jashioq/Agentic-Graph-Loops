@@ -36,7 +36,7 @@ particular loop. The first workflow is a ticket orchestrator.
    its data types; `impl/` holds the implementation. `__init__.py` re-exports the
    API only. Workflows and runtime import from the package root; only `cli.py`
    imports `impl`.
-7. **`dag` and `paths` are pure single files** under `runtime`. One
+7. **`dag`, `paths` and `json_fields` are pure single files** under `runtime`. One
    implementation forever, so no ABC. Do not add a Protocol or ABC for something
    with one implementation. They are leaves: they import nothing else in AGL.
 8. **Fakes, not mocks.** Real fake classes in `tests/fakes.py`, inheriting the ABC
@@ -47,6 +47,13 @@ particular loop. The first workflow is a ticket orchestrator.
     classification are pure functions. I/O lives at the edges.
 11. **The ABC describes what workflows need**, not everything the implementation
     can do. Implementation-only helpers stay private to `impl/`.
+12. **A workflow's state is one document in its run directory.** It is read
+    fresh at every decision and written before anything acts on it; nothing
+    derivable from it — the stage, the graph, the merge queue, which step a work
+    item is on — is stored beside it. `runtime/record.py` owns the two
+    documents; the workflow owns what goes in them. A workflow may also expose
+    `resume(ctx)`, which settles its state against the world and re-enters the
+    same loop; without one, a run of it cannot be resumed.
 
 ## Style
 
@@ -54,7 +61,27 @@ particular loop. The first workflow is a ticket orchestrator.
 - Frozen dataclasses for data. No metaclasses, no decorator registration,
   no dynamic imports.
 - Files under ~300 lines. Split into a package when exceeded.
-- Module docstring stating the contract and the layer.
+- Module docstring stating the contract and the layer, in ~8 lines or fewer.
+
+### Docstrings are lean
+
+Full prose documentation lives outside the code. A docstring exists to aid
+someone who has already read it, so:
+
+- One summary line saying what the function does: takes something, does
+  something to it, returns something.
+- Then `param:` and `return:` lines, **only where the signature does not
+  already say it**:
+
+      param: dag - the graph of work items and what blocks what
+      param: scheduler - decides which node runs next
+      return: Worktree - the tree the chosen node's work happens in
+
+- Nothing else. No design rationale, no history, no justification of decisions
+  already taken. An invariant a future edit could silently break is a one-line
+  `#` comment on the code it constrains, not a paragraph.
+- A one-line docstring is the common case. Reach for the `param:`/`return:`
+  block when a call site genuinely cannot be written without it.
 
 ## TDD
 
@@ -62,6 +89,14 @@ Every module is built test-first: write the failing test, then the
 implementation. Run the checks before claiming anything works.
 
 ## Commands
+
+    agl init                   # write config.toml for the repo in this directory
+    agl run <workflow> -n <label> <description>
+    agl resume <label>         # continue a run that was stopped
+    agl clean <label>          # remove a run's worktrees, branches, and files
+
+`resume` takes the label and nothing else: everything the run was started with
+is in its `run.json`, and where it got to is derived from its `state.json`.
 
     uv run pytest              # parallel by default (-n auto)
     uv run pytest -n0          # serial, for reading a failure one worker at a time

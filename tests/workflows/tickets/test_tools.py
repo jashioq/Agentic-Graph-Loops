@@ -19,12 +19,19 @@ import pytest
 
 from agl.core.agent import AgentSpec, Tool
 from agl.core.store.impl.file_store import FileStore
-from agl.workflows.tickets.models import TICKETS_SCHEMA, Ticket, tickets_from_json
-from agl.workflows.tickets.reviews import Finding, Severity, review_key
-from agl.workflows.tickets.tools import (
+from agl.runtime.record import STATE_KEY, StateFile
+from agl.workflows.tickets.documents.state_document import StateDocument
+from agl.workflows.tickets.documents.store_keys import (
     SPEC_KEY,
     STANDARDS_KEY,
     TICKETS_KEY,
+    review_key,
+)
+from agl.workflows.tickets.documents.tickets_document import TICKETS_SCHEMA, tickets_from_json
+from agl.workflows.tickets.findings import Finding, Severity
+from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import Run, with_bugs, with_tickets
+from agl.workflows.tickets.tools import (
     decompose_tools,
     get_ticket,
     implement_tools,
@@ -58,13 +65,52 @@ PAYLOAD: dict[str, Any] = {
 }
 
 
+TICKETS: tuple[Ticket, ...] = (
+    Ticket(
+        id="T-01",
+        title="Add the token store",
+        status=Status.PENDING,
+        deliverables=("TokenStore.kt",),
+    ),
+    Ticket(
+        id="T-03",
+        title="Add the login screen",
+        status=Status.PENDING,
+        deliverables=("LoginScreen.kt", "a test"),
+        blocked_by=("T-01",),
+    ),
+    Ticket(
+        id="T-05", title="Add refresh", status=Status.PENDING, deliverables=("Refresh.kt",)
+    ),
+)
+
+BUG = Ticket(
+    id="T-03-bug-1",
+    title="Guard the null token",
+    status=Status.PENDING,
+    deliverables=("auth() does not check for a None token",),
+    parent="T-03",
+)
+
+
+def a_run() -> Run:
+    """The run's state: the decomposition, plus a bug filed against one ticket.
+
+    The bug is the point. Bugs are filed into the state and never written to
+    `tickets.json`, so a tool reading the decomposition has nothing to answer a
+    bug-fix agent with.
+    """
+    return with_bugs(with_tickets(Run(), TICKETS), "T-03", (BUG,))
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> FileStore:
-    """A run's documents: a spec, the standards, and the tickets."""
+    """A run's documents: a spec, the standards, the decomposition, and the state."""
     store = FileStore(tmp_path / "run")
     store.write(SPEC_KEY, SPEC)
     store.write(STANDARDS_KEY, STANDARDS)
     store.write_json(TICKETS_KEY, PAYLOAD)
+    StateDocument(StateFile(store)).write(a_run())
     return store
 
 
@@ -77,11 +123,6 @@ def empty(tmp_path: Path) -> FileStore:
 async def call(tool: Tool, **arguments: Any) -> str:
     """Invoke a tool's handler the way a run would, with whatever arguments."""
     return await tool.handler(dict(arguments))
-
-
-def entry(ticket_id: str) -> dict[str, Any]:
-    """The stored record for one ticket."""
-    return next(item for item in PAYLOAD["tickets"] if item["id"] == ticket_id)
 
 
 def spec(role: str, cwd: Path, tools: tuple[Tool, ...]) -> AgentSpec:
@@ -139,7 +180,25 @@ async def test_a_missing_spec_is_reported_rather_than_raised(empty: FileStore) -
 
 
 async def test_get_ticket_returns_the_ticket_it_was_built_for(store: FileStore) -> None:
-    assert json.loads(await call(get_ticket(store, "T-03"))) == entry("T-03")
+    answer = json.loads(await call(get_ticket(store, "T-03")))
+    assert answer["id"] == "T-03"
+    assert answer["title"] == "Add the login screen"
+    assert answer["deliverables"] == ["LoginScreen.kt", "a test"]
+    assert "T-01" in answer["blocked_by"]
+
+
+async def test_get_ticket_answers_for_a_bug_ticket(store: FileStore) -> None:
+    # The reason this reads the state at all. A bug lives only in the state, so
+    # a tool reading the decomposition told every bug-fix agent — the ones whose
+    # prompt opens "Call `get_ticket` first" — that its own ticket did not exist.
+    decomposed = store.read_json(TICKETS_KEY)["tickets"]
+    assert not any(item["id"] == BUG.id for item in decomposed)
+
+    answer = json.loads(await call(get_ticket(store, BUG.id)))
+
+    assert answer["title"] == BUG.title
+    assert answer["deliverables"] == list(BUG.deliverables)
+    assert answer["parent"] == "T-03"
 
 
 def test_get_ticket_has_no_parameter_to_pass(store: FileStore) -> None:
@@ -153,25 +212,42 @@ def test_get_ticket_has_no_parameter_to_pass(store: FileStore) -> None:
 
 async def test_no_argument_reaches_another_ticket(store: FileStore) -> None:
     answer = await call(get_ticket(store, "T-03"), id="T-05", ticket_id="T-05")
-    assert json.loads(answer) == entry("T-03")
+    assert json.loads(answer)["id"] == "T-03"
 
 
 async def test_two_tools_bound_to_different_ids_each_return_their_own(
     store: FileStore,
 ) -> None:
-    assert json.loads(await call(get_ticket(store, "T-01"))) == entry("T-01")
-    assert json.loads(await call(get_ticket(store, "T-05"))) == entry("T-05")
+    assert json.loads(await call(get_ticket(store, "T-01")))["id"] == "T-01"
+    assert json.loads(await call(get_ticket(store, "T-05")))["id"] == "T-05"
 
 
-async def test_get_ticket_reads_the_store_at_call_time(store: FileStore) -> None:
-    # Not a snapshot taken when the tool was built: a ticket edited mid-run —
-    # by the orchestrator, or by a decompose that ran again — reads as it is now.
+async def test_get_ticket_answers_with_the_run_s_bookkeeping_left_out(
+    store: FileStore,
+) -> None:
+    # What a ticket is for the role holding it: what to build, and what it waits
+    # for. The status it is parked at and the sha its branch stood at are the
+    # run's business and nothing an agent decides.
+    answer = json.loads(await call(get_ticket(store, "T-03")))
+    assert set(answer) == {"id", "title", "deliverables", "blocked_by", "parent"}
+
+
+async def test_get_ticket_reads_the_state_at_call_time(store: FileStore) -> None:
+    # Not a snapshot taken when the tool was built: a ticket the run has since
+    # edited — another round of bugs filed against it — reads as it is now.
     tool = get_ticket(store, "T-03")
-    changed = json.loads(json.dumps(PAYLOAD))
-    changed["tickets"][1]["title"] = "Add the login screen, with biometrics"
-    store.write_json(TICKETS_KEY, changed)
+    state = StateDocument(StateFile(store))
+    second = Ticket(
+        id="T-03-bug-2",
+        title="Log the failure",
+        status=Status.PENDING,
+        deliverables=("say why the login failed",),
+        parent="T-03",
+    )
 
-    assert json.loads(await call(tool))["title"] == "Add the login screen, with biometrics"
+    state.write(with_bugs(state.load(), "T-03", (second,)))
+
+    assert "T-03-bug-2" in json.loads(await call(tool))["blocked_by"]
 
 
 async def test_an_unknown_ticket_is_reported_rather_than_raised(store: FileStore) -> None:
@@ -180,8 +256,19 @@ async def test_an_unknown_ticket_is_reported_rather_than_raised(store: FileStore
     assert not answer.startswith("{")
 
 
-async def test_get_ticket_with_no_tickets_stored_is_reported(empty: FileStore) -> None:
-    assert TICKETS_KEY in await call(get_ticket(empty, "T-03"))
+async def test_get_ticket_with_no_state_written_yet_is_reported(empty: FileStore) -> None:
+    assert STATE_KEY in await call(get_ticket(empty, "T-03"))
+
+
+async def test_an_unreadable_state_is_reported_rather_than_raised(store: FileStore) -> None:
+    # Someone has the document open in an editor. The agent is told, and the
+    # session it is in survives to call again.
+    store.write(STATE_KEY, "{ half an edit")
+
+    answer = await call(get_ticket(store, "T-03"))
+
+    assert STATE_KEY in answer
+    assert not answer.startswith("{")
 
 
 # -- writes land where the closure said ------------------------------------
@@ -275,8 +362,8 @@ INVALID: dict[str, dict[str, Any]] = {
 async def test_invalid_tickets_come_back_as_something_to_fix(
     payload: dict[str, Any], empty: FileStore
 ) -> None:
-    # The whole reason these are tools rather than an `output_schema`: the model
-    # is told what was wrong and gets to call again in the same session.
+    # The whole reason these are tools rather than JSON in a final message:
+    # the model is told what was wrong and calls again in the same session.
     answer = await call(save_tickets(empty), **payload)
     assert answer.strip()
     assert not answer.startswith("Saved")
@@ -478,8 +565,8 @@ FINDINGS_INVALID: dict[str, dict[str, Any]] = {
 async def test_save_findings_invalid_shapes_come_back_as_something_to_fix(
     payload: dict[str, Any], empty: FileStore
 ) -> None:
-    # The whole reason this is a tool rather than an `output_schema`: the model
-    # is told what was wrong and gets to call again in the same session.
+    # The whole reason this is a tool rather than JSON in a final message:
+    # the model is told what was wrong and calls again in the same session.
     tool = save_findings(empty, "T-03", 1, "quality")
     answer = await call(tool, **payload)
     assert answer.strip()

@@ -158,9 +158,9 @@ class ScriptedRun:
     """What one call to `FakeAgentRunner` should do, and what it hands back.
 
     `text` is the shorthand every script starts as; pass a whole `AgentResult`
-    as `result` when a test cares about the cost, the session, or the structured
-    output. `calls` names tools from the spec the run should invoke on its way
-    through, which is how a workflow test proves a role was given the right ones.
+    as `result` when a test cares about the cost or the session. `calls` names
+    tools from the spec the run should invoke on its way through, which is how a
+    workflow test proves a role was given the right ones.
     """
 
     text: str = ""
@@ -175,7 +175,6 @@ class ScriptedRun:
             return self.result
         return AgentResult(
             text=self.text,
-            structured=None,
             session_id="fake-session",
             cost_usd=0.0,
             num_turns=1,

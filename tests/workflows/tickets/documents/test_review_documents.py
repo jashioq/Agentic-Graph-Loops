@@ -1,26 +1,21 @@
-"""Review findings, and the transformation from findings into bug tickets."""
+"""The two review documents: what a reviewer and triage have to produce.
+
+The schemas are what the agents are asked for and the parsers are what the run
+trusts, so the two are checked against each other rather than separately.
+"""
 
 from typing import Any
 
 import pytest
 
-from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.reviews import (
+from agl.workflows.tickets.documents.review_documents import (
     FINDINGS_SCHEMA,
     TRIAGE_SCHEMA,
-    BugGroup,
-    CoverageError,
-    Finding,
-    InvalidFindingsError,
-    InvalidGroupsError,
-    Severity,
     bug_groups_from_json,
-    check_coverage,
     findings_from_json,
-    high,
-    review_key,
-    to_bug_tickets,
 )
+from agl.workflows.tickets.errors import InvalidFindingsError, InvalidGroupsError
+from agl.workflows.tickets.findings import BugGroup, Finding, Severity
 
 # -- fixtures as data -------------------------------------------------------
 
@@ -53,17 +48,6 @@ def a_finding(**overrides: Any) -> Finding:
     }
     fields.update(overrides)
     return Finding(**fields)
-
-
-def parent_ticket(**overrides: Any) -> Ticket:
-    fields: dict[str, Any] = {
-        "id": "T-03",
-        "title": "Add auth",
-        "status": Status.IN_REVIEW,
-        "deliverables": ("src/auth.py",),
-    }
-    fields.update(overrides)
-    return Ticket(**fields)
 
 
 def group_payload(**overrides: Any) -> dict[str, Any]:
@@ -139,125 +123,6 @@ def test_rejects_non_object_payload() -> None:
         findings_from_json(["not", "an", "object"])
 
 
-# -- high ----------------------------------------------------------------
-
-
-def test_high_filters_and_preserves_order() -> None:
-    findings = (
-        a_finding(id="Q-1", severity=Severity.MEDIUM),
-        a_finding(id="Q-2", severity=Severity.HIGH),
-        a_finding(id="Q-3", severity=Severity.LOW),
-        a_finding(id="Q-4", severity=Severity.HIGH),
-    )
-
-    assert high(findings) == (findings[1], findings[3])
-
-
-# -- check_coverage --------------------------------------------------------
-
-
-def test_check_coverage_passes_when_every_high_is_covered_once() -> None:
-    highs = (a_finding(id="Q-1"), a_finding(id="Q-2"))
-    groups = (BugGroup(title="fix", deliverables=("x",), findings=("Q-1", "Q-2")),)
-
-    check_coverage(groups, highs)  # does not raise
-
-
-def test_check_coverage_raises_when_a_high_is_missing() -> None:
-    highs = (a_finding(id="Q-1"), a_finding(id="Q-2"))
-    groups = (BugGroup(title="fix", deliverables=("x",), findings=("Q-1",)),)
-
-    with pytest.raises(CoverageError, match="Q-2"):
-        check_coverage(groups, highs)
-
-
-def test_check_coverage_raises_when_a_high_appears_in_two_groups() -> None:
-    highs = (a_finding(id="Q-1"),)
-    groups = (
-        BugGroup(title="a", deliverables=("x",), findings=("Q-1",)),
-        BugGroup(title="b", deliverables=("y",), findings=("Q-1",)),
-    )
-
-    with pytest.raises(CoverageError, match="Q-1"):
-        check_coverage(groups, highs)
-
-
-def test_check_coverage_raises_when_a_group_names_an_unknown_id() -> None:
-    highs = (a_finding(id="Q-1"),)
-    groups = (BugGroup(title="a", deliverables=("x",), findings=("Q-1", "Q-99")),)
-
-    with pytest.raises(CoverageError, match="Q-99"):
-        check_coverage(groups, highs)
-
-
-def test_check_coverage_raises_when_a_group_names_a_medium_or_low() -> None:
-    # Q-2 is a real finding id, but it is not HIGH, so it is absent from `highs`.
-    highs = (a_finding(id="Q-1"),)
-    groups = (BugGroup(title="a", deliverables=("x",), findings=("Q-1", "Q-2")),)
-
-    with pytest.raises(CoverageError, match="Q-2"):
-        check_coverage(groups, highs)
-
-
-# -- to_bug_tickets --------------------------------------------------------
-
-
-def test_to_bug_tickets_produces_right_ids_parent_status_and_deliverables() -> None:
-    parent = parent_ticket()
-    groups = (
-        BugGroup(title="Fix null check", deliverables=("d1", "d2"), findings=("Q-1",)),
-        BugGroup(title="Fix other", deliverables=("d3",), findings=("Q-2",)),
-    )
-
-    tickets = to_bug_tickets(parent, groups, start=1)
-
-    assert tickets == (
-        Ticket(
-            id="T-03-bug-1",
-            title="Fix null check",
-            status=Status.PENDING,
-            deliverables=("d1", "d2"),
-            parent="T-03",
-            review_round=0,
-        ),
-        Ticket(
-            id="T-03-bug-2",
-            title="Fix other",
-            status=Status.PENDING,
-            deliverables=("d3",),
-            parent="T-03",
-            review_round=0,
-        ),
-    )
-
-
-def test_start_offsets_ids_so_a_second_round_does_not_collide_with_the_first() -> None:
-    parent = parent_ticket()
-    groups = (BugGroup(title="Fix", deliverables=("d",), findings=("S-1",)),)
-
-    tickets = to_bug_tickets(parent, groups, start=3)
-
-    assert tickets[0].id == "T-03-bug-3"
-
-
-# -- review_key -------------------------------------------------------------
-
-
-def test_review_key_shape() -> None:
-    assert review_key("T-03", 1, "quality") == "reviews/T-03/round-1/quality.json"
-
-
-def test_review_key_is_distinct_per_ticket_round_and_source() -> None:
-    keys = {
-        review_key("T-03", 1, "quality"),
-        review_key("T-03", 2, "quality"),
-        review_key("T-03", 1, "spec"),
-        review_key("T-04", 1, "quality"),
-    }
-
-    assert len(keys) == 4
-
-
 # -- triage groups (agent output) --------------------------------------------
 
 
@@ -288,6 +153,22 @@ def test_bug_groups_rejects_unknown_field() -> None:
 def test_bug_groups_rejects_non_array() -> None:
     with pytest.raises(InvalidGroupsError):
         bug_groups_from_json({"groups": "nope"})
+
+
+def test_bug_groups_rejects_an_empty_array_by_default() -> None:
+    with pytest.raises(InvalidGroupsError, match="at least one group"):
+        bug_groups_from_json({"groups": []})
+
+
+def test_bug_groups_accepts_an_empty_array_when_asked_to() -> None:
+    # Reading a recorded outcome back, not judging an agent's answer: a round
+    # that produced nothing to fix is written down as an empty `groups` array.
+    assert bug_groups_from_json({"groups": []}, allow_empty=True) == ()
+
+
+def test_bug_groups_still_checks_shape_when_empty_is_allowed() -> None:
+    with pytest.raises(InvalidGroupsError):
+        bug_groups_from_json({"groups": "nope"}, allow_empty=True)
 
 
 # -- schemas are what they claim to be ---------------------------------------

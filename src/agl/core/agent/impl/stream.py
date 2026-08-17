@@ -1,33 +1,20 @@
 """The SDK's message stream, folded into one `AgentResult`.
 
-Layer: core. Everything here is a function of the messages that arrived; the
-only side effect is `on_activity`, which is fire-and-forget UI and is wrapped so
-a broken dashboard can never fail an agent run.
+Layer: core. A function of the messages that arrived; the only side effect is
+`on_activity`, wrapped so a broken dashboard cannot fail a run.
 
-Token counts on assistant messages cover the top-level loop only and exclude
-anything a subagent spent, so they understate a run that delegated. `cost_usd`
-comes from the result message and is the number to trust.
-
-A result the SDK marked as an error is raised, not returned: `AgentResult` has
-no way to say "this failed", and a caller handed one as a success would never
-send it back round the retry ladder. Exhaustion is the exception — it is not
-retryable, and the caller has a distinct error and a better message for it — so
-an exhausted run comes back as an ordinary result for the caller to classify.
-
-`expect_json` failures raise `AgentOutputError`, not the bare `AgentError`
-every other failure here raises: a model that answered in prose instead of
-JSON gives the same prose back on an identical retry, so this is the second
-failure — after exhaustion — that a caller should not send back round the
-retry ladder.
+Token counts on assistant messages exclude subagent spend, so trust `cost_usd`.
+A result the SDK marked as an error is raised, since `AgentResult` cannot say
+"this failed" — except exhaustion, which comes back as a result for the caller
+to classify.
 """
 
-import json
 from collections.abc import AsyncIterable, Callable, Mapping
 from typing import Any
 
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent.api import AgentError, AgentOutputError, AgentResult
+from agl.core.agent.api import AgentError, AgentResult
 from agl.core.agent.impl.tools import MCP_PREFIX
 
 __all__ = ["EXHAUSTED", "fold", "summarize_tool_use"]
@@ -54,11 +41,9 @@ SUBJECT_KEYS = (
 
 
 def summarize_tool_use(tool: str, tool_input: Mapping[str, Any]) -> str:
-    """A short one-line description of a tool call, for a status footer.
+    """A one-line description of a tool call, for a status footer.
 
-    `Edit src/auth/TokenStore.kt`, `Bash ./gradlew build`, `Read README.md`. An
-    input with no obvious subject gives the bare tool name, which is still more
-    informative than a blank footer.
+    return: str - `Edit src/auth/TokenStore.kt`, or the bare tool name if it has no subject
     """
     name = tool.removeprefix(MCP_PREFIX)
     subject = next(
@@ -83,15 +68,11 @@ def _shorten(text: str, limit: int) -> str:
 async def fold(
     messages: AsyncIterable[Any],
     on_activity: Callable[[str], None] | None,
-    expect_json: bool,
 ) -> AgentResult:
-    """Consume the stream and return what the run produced.
+    """Consumes the stream and returns what the run produced.
 
-    Raises `AgentError` if the stream ends without a result message — a run
-    that never resolved is not a result with fields missing — or if the
-    result reports an error that is not exhaustion. Raises `AgentOutputError`,
-    an `AgentError` subclass, if `expect_json` was asked for and the final
-    text does not parse.
+    return: AgentResult - raises `AgentError` if the stream never resolved or
+        reported a non-exhaustion error
     """
     text = ""
     session_id: str | None = None
@@ -126,7 +107,6 @@ async def fold(
 
     return AgentResult(
         text=text,
-        structured=_parse(text) if expect_json else None,
         session_id=session_id,
         cost_usd=outcome.total_cost_usd or 0.0,
         num_turns=outcome.num_turns,
@@ -148,23 +128,9 @@ def _report(on_activity: Callable[[str], None] | None, block: ToolUseBlock) -> N
 def _terminal_reason(outcome: ResultMessage) -> str | None:
     """Why the loop stopped, preferring the subtype when it names a limit.
 
-    `terminal_reason` is `None` on older CLIs and says `"completed"` or
-    `"max_turns"` on newer ones — it never mentions the budget. The `error_max_`
-    subtypes do, and telling budget exhaustion apart from an ordinary failure is
-    the difference between retrying and not.
+    `terminal_reason` never mentions the budget; the `error_max_` subtypes do,
+    and that difference is the difference between retrying and not.
     """
     if outcome.subtype.startswith("error_max_"):
         return outcome.subtype
     return outcome.terminal_reason
-
-
-def _parse(text: str) -> Any:
-    """The text as JSON, with any code fence stripped first."""
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        _, _, rest = stripped.partition("\n")
-        stripped = rest.rpartition("```")[0].strip() or rest.strip()
-    try:
-        return json.loads(stripped)
-    except ValueError as error:
-        raise AgentOutputError(f"expected JSON output, got {text!r}: {error}") from error

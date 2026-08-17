@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 
-from agl.core.agent import AgentBudgetError, AgentError, AgentOutputError
+from agl.core.agent import AgentBudgetError, AgentError
 from agl.core.agent.impl.stream import fold, summarize_tool_use
 
 
@@ -52,19 +52,19 @@ async def stream(*messages: Any) -> AsyncIterator[Any]:
 
 
 async def test_the_final_assistant_text_wins() -> None:
-    folded = await fold(stream(said("first"), said("second"), result()), None, False)
+    folded = await fold(stream(said("first"), said("second"), result()), None)
     assert folded.text == "second"
 
 
 async def test_several_text_blocks_in_one_message_accumulate() -> None:
     message = assistant(TextBlock(text="one"), TextBlock(text="two"))
-    folded = await fold(stream(message, result()), None, False)
+    folded = await fold(stream(message, result()), None)
     assert folded.text == "one\ntwo"
 
 
 async def test_a_message_carrying_no_text_does_not_wipe_what_came_before() -> None:
     folded = await fold(
-        stream(said("kept"), used("Read", file_path="README.md"), result()), None, False
+        stream(said("kept"), used("Read", file_path="README.md"), result()), None
     )
     assert folded.text == "kept"
 
@@ -76,13 +76,12 @@ async def test_the_session_id_is_captured_from_the_first_message_carrying_one() 
     folded = await fold(
         stream(said("a", session_id="s-first"), said("b", session_id="s-later"), result()),
         None,
-        False,
     )
     assert folded.session_id == "s-first"
 
 
 async def test_the_result_supplies_the_session_id_when_nothing_earlier_did() -> None:
-    folded = await fold(stream(said("a"), result(session_id="s-9")), None, False)
+    folded = await fold(stream(said("a"), result(session_id="s-9")), None)
     assert folded.session_id == "s-9"
 
 
@@ -98,7 +97,7 @@ async def test_every_tool_use_fires_on_activity_once_in_order() -> None:
         result(),
     )
 
-    await fold(messages, seen.append, False)
+    await fold(messages, seen.append)
 
     assert seen == ["Read README.md", "Bash ./gradlew build"]
 
@@ -110,7 +109,7 @@ async def test_two_tool_uses_in_one_message_both_fire() -> None:
         ToolUseBlock(id="b", name="Read", input={"file_path": "b.py"}),
     )
 
-    await fold(stream(message, result()), seen.append, False)
+    await fold(stream(message, result()), seen.append)
 
     assert seen == ["Read a.py", "Read b.py"]
 
@@ -119,7 +118,7 @@ async def test_a_broken_dashboard_does_not_fail_an_agent_run() -> None:
     def explode(activity: str) -> None:
         raise RuntimeError("the footer is on fire")
 
-    folded = await fold(stream(used("Read", file_path="a.py"), result()), explode, False)
+    folded = await fold(stream(used("Read", file_path="a.py"), result()), explode)
 
     assert folded.terminal_reason == "completed"
 
@@ -128,7 +127,7 @@ async def test_a_broken_dashboard_does_not_fail_an_agent_run() -> None:
 
 
 async def test_the_result_fields_map_onto_the_agent_result() -> None:
-    folded = await fold(stream(said("done"), result()), None, False)
+    folded = await fold(stream(said("done"), result()), None)
 
     assert folded.cost_usd == 0.42
     assert folded.num_turns == 3
@@ -137,7 +136,7 @@ async def test_the_result_fields_map_onto_the_agent_result() -> None:
 
 
 async def test_a_missing_cost_reads_as_nothing_spent() -> None:
-    folded = await fold(stream(said("done"), result(total_cost_usd=None)), None, False)
+    folded = await fold(stream(said("done"), result(total_cost_usd=None)), None)
     assert folded.cost_usd == 0.0
 
 
@@ -148,7 +147,6 @@ async def test_an_error_result_raises_rather_than_coming_back_as_a_success() -> 
         await fold(
             stream(said("nope"), result(is_error=True, subtype="error_during_execution")),
             None,
-            False,
         )
 
 
@@ -163,14 +161,13 @@ async def test_the_error_carries_whatever_the_result_said_went_wrong() -> None:
                 )
             ),
             None,
-            False,
         )
 
 
 async def test_an_error_result_is_not_a_budget_error() -> None:
     with pytest.raises(AgentError) as raised:
         await fold(
-            stream(result(is_error=True, subtype="error_during_execution")), None, False
+            stream(result(is_error=True, subtype="error_during_execution")), None
         )
 
     assert not isinstance(raised.value, AgentBudgetError)
@@ -184,7 +181,6 @@ async def test_an_exhaustion_result_is_left_for_the_caller_to_classify() -> None
     folded = await fold(
         stream(said("…"), result(is_error=True, subtype="error_max_budget_usd")),
         None,
-        False,
     )
 
     assert folded.terminal_reason == "error_max_budget_usd"
@@ -192,51 +188,15 @@ async def test_an_exhaustion_result_is_left_for_the_caller_to_classify() -> None
 
 async def test_a_turn_limit_result_is_left_alone_too() -> None:
     folded = await fold(
-        stream(said("…"), result(is_error=True, subtype="error_max_turns")), None, False
+        stream(said("…"), result(is_error=True, subtype="error_max_turns")), None
     )
 
     assert folded.terminal_reason == "error_max_turns"
 
 
 async def test_an_ordinary_subtype_leaves_the_terminal_reason_alone() -> None:
-    folded = await fold(stream(said("hi"), result(terminal_reason="completed")), None, False)
+    folded = await fold(stream(said("hi"), result(terminal_reason="completed")), None)
     assert folded.terminal_reason == "completed"
-
-
-# -- structured output -----------------------------------------------------
-
-
-async def test_bare_json_parses() -> None:
-    folded = await fold(stream(said('{"ok": true}'), result()), None, True)
-    assert folded.structured == {"ok": True}
-
-
-async def test_fenced_json_parses() -> None:
-    fenced = '```json\n{"ok": true, "count": 2}\n```'
-    folded = await fold(stream(said(fenced), result()), None, True)
-    assert folded.structured == {"ok": True, "count": 2}
-
-
-async def test_an_unlabelled_fence_parses() -> None:
-    folded = await fold(stream(said('```\n[1, 2, 3]\n```'), result()), None, True)
-    assert folded.structured == [1, 2, 3]
-
-
-async def test_malformed_json_raises() -> None:
-    with pytest.raises(AgentError, match="JSON"):
-        await fold(stream(said("not json at all"), result()), None, True)
-
-
-async def test_malformed_json_raises_the_output_specific_error() -> None:
-    # Distinct from the bare `AgentError` other failures raise here: this one
-    # is not worth retrying, and the caller tells the two apart by type.
-    with pytest.raises(AgentOutputError):
-        await fold(stream(said("not json at all"), result()), None, True)
-
-
-async def test_nothing_is_parsed_when_no_schema_was_asked_for() -> None:
-    folded = await fold(stream(said('{"ok": true}'), result()), None, False)
-    assert folded.structured is None
 
 
 # -- a stream that never resolved -----------------------------------------
@@ -244,12 +204,12 @@ async def test_nothing_is_parsed_when_no_schema_was_asked_for() -> None:
 
 async def test_an_empty_stream_raises_rather_than_half_building_a_result() -> None:
     with pytest.raises(AgentError):
-        await fold(stream(), None, False)
+        await fold(stream(), None)
 
 
 async def test_a_stream_that_ends_without_a_result_raises() -> None:
     with pytest.raises(AgentError, match="result"):
-        await fold(stream(said("half a thought")), None, False)
+        await fold(stream(said("half a thought")), None)
 
 
 # -- summarize_tool_use ----------------------------------------------------

@@ -1,29 +1,14 @@
 """The Rich-backed terminal: a live display plus a question flow.
 
-Layer: core (impl). This is where the I/O lives. Nothing pushes updates — a
-repaint task calls `build()` at `1/fps` and renders whatever it returns, so a
-`Timer` ticks because the frame is rebuilt, not because anything told it to.
+Layer: core (impl). Where the I/O lives. Nothing pushes updates: a repaint task
+calls `build()` at `1/fps`, so a `Timer` ticks because the frame is rebuilt. The
+builder lives on the session, so `show` can replace it mid-flight.
 
-The builder lives on the session, so `show` can replace it mid-flight and the
-repaint task keeps ticking against whatever is current. A session opened with no
-builder paints a blank screen until the first `show`.
-
-A question takes the whole screen: the live display stops, the question is
-printed, stdin is read on a worker thread so the event loop keeps running, and
-the display is restored. A lock serializes concurrent askers into a FIFO queue.
-
-When the console cannot animate — piped output, a dumb terminal — there is no
-display to update, so frames are printed as they change instead.
-
-A `build()` that raises becomes an error frame rather than a dead repaint task:
-the display keeps moving, the failure is on screen, and the next tick retries.
-
-Nothing about reading an answer is allowed to fail a run. Blank input and a
-number outside the offered range are re-prompted; anything that is not a plain
-decimal number is taken as the user's own words. The one thing that cannot be
-recovered from is stdin having nothing left in it, and that raises
-`TerminalError` — the module's only exception, and not the `EOFError` that used
-to escape from here undocumented.
+A question takes the whole screen — the display stops, stdin is read on a worker
+thread, the display is restored — and a lock queues concurrent askers FIFO. A
+console that cannot animate gets frames printed as they change. A `build()` that
+raises becomes an error frame, never a dead repaint task. Only exhausted stdin
+fails a question; everything else is re-prompted or taken as free text.
 """
 
 import asyncio
@@ -74,14 +59,10 @@ class RichTerminal(Terminal):
     def live(
         self, build: Callable[[], Screen] | None = None, fps: int = 4
     ) -> AbstractAsyncContextManager[LiveSession]:
-        """Repaint `build()` at `fps` for as long as the context is open.
+        """Repaints `build()` at `fps` for as long as the context is open.
 
-        With no `build`, the screen starts blank and stays that way until the
-        first `show`; the repaint task runs either way, so the screen a later
-        `show` installs ticks like any other.
-
-        Checked here rather than inside the context manager's body, so a caller
-        that passes nonsense hears about it at the call and not on entry.
+        `fps` is checked here, not in the context body, so a bad value raises at
+        the call rather than on entry.
         """
         if fps <= 0:
             raise ValueError(f"fps must be positive, got {fps}")
@@ -108,14 +89,7 @@ class RichTerminal(Terminal):
             display.stop()
 
     async def _repaint(self, session: "_RichLiveSession", fps: int) -> None:
-        """Tick until cancelled.
-
-        The builder lives on the session, so a `show` mid-flight changes what
-        this paints without the task knowing anything happened.
-
-        `paint` handles a failing frame, so this task ends only by cancellation
-        and the `await repaint` on exit cannot mask an error from the body.
-        """
+        """Ticks until cancelled. `paint` handles a failing frame, so nothing else ends it."""
         interval = 1 / fps
         while True:
             await asyncio.sleep(interval)
@@ -150,21 +124,15 @@ class _RichLiveSession(LiveSession):
         self._last_frame = ""
 
     def show(self, build: Callable[[], Screen]) -> None:
-        """Replace the frame source and paint it once.
+        """Replaces the frame source and paints it once, so a stage change is immediate.
 
-        Painting here rather than waiting for the next tick is what makes a
-        stage change immediate. While a question owns the screen the paint is a
-        no-op, and the new screen is what comes back when the question ends.
+        A no-op while a question owns the screen; the new screen returns with it.
         """
         self._build = build
         self.paint()
 
     def paint(self) -> None:
-        """Render one frame, unless a question currently owns the screen.
-
-        A `build()` that raises is caught here, not left to kill the repaint
-        task: the failure is shown as a frame and the next tick tries again.
-        """
+        """Renders one frame, unless a question owns the screen. A failing frame is shown."""
         if self._suspended:
             return
         screen = self._frame()
@@ -213,8 +181,8 @@ class _RichLiveSession(LiveSession):
                 return await self._read_answer(question)
             finally:
                 self._console.clear()
-                # The question took the screen with it: the next frame is new
-                # again, however much it looks like the one before the question.
+                # The question took the screen with it, so the next frame is new
+                # however much it looks like the one before.
                 self._last_frame = ""
                 self._display.start(refresh=False)
                 self._suspended = False
@@ -232,16 +200,10 @@ class _RichLiveSession(LiveSession):
         self._console.print()
 
     async def _read_answer(self, question: Question) -> Answer:
-        """Loop until the input means something.
+        """Loops until the input means something.
 
-        Blank input re-prompts, and so does a number outside the range on
-        screen: with three options, `9` is a slip, and returning `Answer("9")`
-        would hand an agent a digit as though the user had meant to say it.
-
-        `isdecimal` rather than `isdigit`, because `isdigit` says yes to
-        superscripts and other numerics that `int` then refuses — `"²"` used to
-        get a `ValueError` out of here. Anything that is not a plain decimal
-        number is what the user typed, and comes straight back.
+        Blank input and an out-of-range number re-prompt. `isdecimal`, not
+        `isdigit`, which says yes to superscripts that `int` then refuses.
         """
         while True:
             reply = await self._read()
@@ -267,13 +229,7 @@ class _RichLiveSession(LiveSession):
                 return reply
 
     async def _read(self) -> str:
-        """Read one line off the event loop, so the rest of the run keeps going.
-
-        Raises `TerminalError` when there is nothing left to read. Both sources
-        report that as `EOFError` — `input()` on a closed stdin, and the
-        scripted iterator when it runs out — and it is the one thing here a
-        re-prompt cannot fix.
-        """
+        """Reads one line off the event loop. Raises `TerminalError` on exhausted stdin."""
         loop = asyncio.get_running_loop()
         try:
             line = await loop.run_in_executor(None, self._read_line)

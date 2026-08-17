@@ -1,15 +1,11 @@
 """Terminal API: immutable screen descriptions and the abstract terminal.
 
-Layer: core. Everything a workflow needs to drive the terminal lives here.
-A screen is data — a tree of components — and rendering is a pure function of
-that tree plus the current time, so timers tick without anything pushing
-updates. This module holds no I/O and knows nothing about Rich.
+Layer: core. A screen is data — a tree of components — and rendering is a pure
+function of that tree plus the current time, so timers tick with nothing pushing
+updates. No I/O here, and nothing about Rich.
 
-`TerminalError` is the module's one failure. A terminal is never the interesting
-part of a run, so the rule is that it must not be the reason one fails: bad
-input is re-prompted, not raised on. What is left is the case where there is no
-answer to be had at all — stdin exhausted or closed — and that is what the error
-is for.
+A terminal must not be the reason a run fails: bad input is re-prompted, and
+`TerminalError` is left for the one case with no answer to be had.
 """
 
 from abc import ABC, abstractmethod
@@ -37,13 +33,7 @@ __all__ = [
 
 
 class TerminalError(Exception):
-    """Raised when the terminal cannot do what was asked of it.
-
-    In practice that is one thing: a question with nobody able to answer it,
-    because stdin is exhausted or closed. Deliberately not an `EOFError` —
-    a caller catching this is catching a terminal failure, not adopting a
-    built-in whose meaning is wider.
-    """
+    """Raised when the terminal cannot do what was asked: stdin exhausted or closed."""
 
 
 class Color(Enum):
@@ -112,11 +102,9 @@ type Component = Text | Timer | Spacer | Row | Rows
 
 @dataclass(frozen=True)
 class Screen:
-    """Three sticky regions: header on top, footer on the bottom, content between.
+    """Three sticky regions: header on top, footer below, content between.
 
-    Content comes first because it is the only one a screen must have; most
-    frames are content alone, and saying so twice over at every call site added
-    nothing.
+    Content is first because it is the only one a screen must have.
     """
 
     content: Rows
@@ -156,15 +144,10 @@ class Terminal(ABC):
     def live(
         self, build: Callable[[], Screen] | None = None, fps: int = 4
     ) -> AbstractAsyncContextManager["LiveSession"]:
-        """Repaint `build()` at `fps` until the context exits.
+        """Repaints `build()` at `fps` until the context exits.
 
-        `build` is optional: with none, the screen is blank until the first
-        `LiveSession.show`, which is what lets a run open one session up front
-        and decide what to draw as it goes.
-
-        `fps` is frames per second and must be positive; a non-positive value
-        raises `ValueError` here rather than becoming a division inside the
-        repaint loop.
+        param: build - `None` leaves the screen blank until the first `show`
+        param: fps - frames per second; non-positive raises `ValueError`
         """
 
 
@@ -173,24 +156,13 @@ class LiveSession(ABC):
 
     @abstractmethod
     def show(self, build: Callable[[], Screen]) -> None:
-        """Replace the frame source and paint it once.
-
-        A run has stages, and each stage has its own screen; swapping the
-        builder is how it moves between them without stopping and restarting
-        the display. The new screen is painted straight away rather than at the
-        next tick, so a stage change is visible even if nothing else happens.
-        """
-
+        """Replaces the frame source and paints it once, so a stage change shows at once."""
+# TODO ask should be a runtime module or workflow defined. Core module should be only for displaying stuff. If a different screen needs to be displayed (for question) then that should be requested by runtime or workflow
     @abstractmethod
     async def ask(self, question: Question) -> Answer:
-        """Take over the screen to ask. Concurrent callers queue FIFO.
+        """Takes over the screen to ask. Concurrent callers queue FIFO.
 
-        Input that means nothing — blank, or a number outside the offered range
-        — is re-prompted rather than raised on or taken at face value. Anything
-        that is not a plain decimal number is the user's own words and comes
-        back as free text.
-
-        Raises `TerminalError` when there is no answer to be had: stdin
-        exhausted or closed, which is what a run on piped input meets at its
-        first question.
+        return: Answer - a chosen label, or free text for anything that is not a
+            plain decimal; meaningless input is re-prompted, and stdin with no
+            answer to give raises `TerminalError`
         """

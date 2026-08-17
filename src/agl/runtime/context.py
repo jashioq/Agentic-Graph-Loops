@@ -1,21 +1,10 @@
 """What a run was given: its settings, its connectors, and the checks before it starts.
 
-Layer: runtime. `RunContext` is data and nothing else — the connectors a run
-was handed, the project it is against, and the four things that make this run
-this run. It has no lifecycle and no `start()`: every resource a run needs is
-opened by the workflow, visibly, in its own `run()`, so reading that function
-tells you what is open and when it closes. A context that opened things would
-move half of that story in here, where it is nobody's local variable.
-
-`preflight` is a function rather than something imposed on a workflow. It is the
-first line of `run` because a workflow decides its own first line — one that
-resumes an interrupted run would want different checks, and it should not have
-to inherit these to get a context.
-
-`build_gate` is the one place a project's build command becomes the callable the
-merge queue holds. The queue never learns what a build is: it gets something to
-await that answers with an `ExecResult`, which is why a run with no build and a
-run behind Gradle are the same code path there.
+Layer: runtime. `RunContext` is data and nothing else — no lifecycle, no
+`start()`: every resource is opened by the workflow, visibly, in its own `run`.
+The two preflights are functions a workflow calls rather than checks imposed on
+it, so each entry point picks the set it wants. `build_gate` is the one place a
+project's build command becomes the callable the merge queue awaits.
 """
 
 from dataclasses import dataclass
@@ -35,24 +24,20 @@ __all__ = [
     "RunContext",
     "build_gate",
     "preflight",
+    "resume_preflight",
 ]
 
 _TRUNK = ("main", "master")
-"""Branch names a run refuses to start on. Not configuration: the point is that
-a run creates and deletes branches under a namespace and merges into the branch
-it was started from, and doing that to a shared trunk is a mistake in every
-project, whatever the trunk is called."""
+"""Branch names a run refuses to start on. Not configuration: a run branches from
+and merges into wherever it started, which must never be a shared trunk."""
 
 
 @dataclass(frozen=True)
 class ProjectSettings:
     """What runtime needs to know about a project, as data.
 
-    A translation of the cli's `config.toml`, kept deliberately narrow: five
-    fields a workflow uses, and none of the file-format knowledge that produced
-    them. `agl.config` stays a cli concern, and a workflow can be handed
-    settings assembled any other way — by a test, or by a caller with no config
-    file at all.
+    A narrow translation of the cli's `config.toml`, carrying none of the
+    file-format knowledge that produced it.
     """
 
     name: str
@@ -66,12 +51,12 @@ class ProjectSettings:
 class RunContext:
     """One run's inputs: what it was asked to do, and what it may use to do it.
 
-    Frozen, and holding no run state — nothing here changes between the first
-    line of a run and the last. What a run has *done* lives in the workflow's
-    own state and on the display's board, both of which the workflow creates and
-    owns; this is only the part that was decided before it started.
+    Frozen, and holding no run state — nothing here changes between a run's
+    first line and its last. `workflow` is the one field a run cannot work out
+    from the inside, and the record has to name it for `agl resume`.
     """
 
+    workflow: str
     label: str
     request: str
     base_branch: str
@@ -86,15 +71,12 @@ class RunContext:
 class PreflightError(Exception):
     """Raised when the repository or the label is not in a state to start a run."""
 
-
+# TODO preflight checks should be defined by each workflow specifically. To achieve that lets add some PreflightConfig object as a param to preflight functions. We can specify there a set of rules like if a workflow can run on main branch, can we allow for uncommited changes and stuff like that. There will be more and some of these requirements might be reused by other workflows but each will have a subset of them.
 def preflight(vcs: Vcs, store: Store, label: str) -> None:
-    """Refuse to start unless the repository and the label are clear.
+    """Refuses to start unless the repository and the label are clear.
 
-    Every check is about work that already exists and would be silently mixed
-    into this run's: uncommitted edits that a worktree's commits would land on
-    top of, a trunk that must not be branched from and merged into, and a label
-    whose branches or documents are still around from a run that did not finish.
-    The last one names `agl clean` because that is the whole remedy.
+    Raises `PreflightError` on uncommitted changes, a trunk branch, or a label
+    already in use — every case being work that would silently mix into this run.
     """
     if vcs.is_dirty():
         raise PreflightError("the repository has uncommitted changes")
@@ -103,16 +85,34 @@ def preflight(vcs: Vcs, store: Store, label: str) -> None:
         raise PreflightError(f"cannot run on {branch!r}; check out a feature branch first")
     namespace = paths.branch_namespace(label)
     if vcs.branches(namespace) or store.list():
-        raise PreflightError(f"{label!r} is already in use; run `agl clean {label}` first")
+        raise PreflightError(
+            f"{label!r} is already in use; run `agl resume {label}` to continue it, "
+            f"or `agl clean {label}` to discard it"
+        )
+
+
+def resume_preflight(vcs: Vcs, base_branch: str) -> None:
+    """Refuses to resume unless the repository is where the run left it.
+
+    The base branch must be checked out and the tree clean, except for a merge
+    left in progress, which is the one mess a resume knows how to settle. None
+    of `preflight`'s other checks: leftovers are the point of resuming.
+    """
+    branch = vcs.current_branch()
+    if branch != base_branch:
+        raise PreflightError(
+            f"the run was started from {base_branch!r} and the repository is on "
+            f"{branch!r}; check {base_branch!r} out first"
+        )
+    if vcs.is_dirty() and not vcs.merge_in_progress(vcs.root()):
+        raise PreflightError("the repository has uncommitted changes")
 
 
 def build_gate(project: ProjectSettings) -> Build:
     """The project's build, as the callable a merge queue awaits.
 
-    `check=False`: a failing build is the answer to the question the gate asked,
-    not an error to raise past the queue that asked it. The timeout is the
-    project's, and `run_async` kills the child when it expires, so a hung build
-    ends the merge rather than the run.
+    return: Build - `check=False`, so a failing build is an answer, not an error;
+        a timeout kills the child, ending the merge rather than the run
     """
 
     async def build() -> ExecResult:

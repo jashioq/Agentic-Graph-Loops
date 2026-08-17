@@ -1,31 +1,14 @@
 """`AgentRunner` over the Claude Agent SDK. The only code here that does I/O.
 
-Layer: core. Thin by design: `options` decides the configuration, `tools` builds
-the server, `stream` folds the messages, and what is left is the retry ladder,
-the question callback, and calling `query`.
+Layer: core. Thin: `options` configures, `tools` builds the server, `stream`
+folds the messages; what is left is the retry ladder and the question callback.
 
-**Every call runs in streaming mode.** The SDK rejects a permission callback
-outright when the prompt is a plain string, and the callback is how a question
-reaches the caller — so the prompt is always sent as a one-message stream, and
-an in-process MCP server is always registered so the SDK holds stdin open until
-the run resolves (see `build_keepalive_server`).
-
-**`AskUserQuestion` is not available to subagents.** Anything spawned through
-the Agent tool cannot ask, so a call that may need to ask has to be a top-level
-one. That is a constraint on how callers are shaped, not a bug here.
-
-Exhaustion and a bad `output_schema` parse are the two failures never retried:
-both fail the same way next time and spend the budget again, so three attempts
-would cost three times as much for the same outcome — a run out of budget
-stays out of budget, and a model that answered in prose instead of JSON gives
-the same prose back. Every other failure — a transport error, an SDK error
-result — goes back round the ladder, because those *can* differ on a retry.
-
-**Nothing is pre-allowed.** The permission callback allows every tool that is
-not the question tool, so an `allowed_tools` entry would buy one skipped round
-trip and, for `AskUserQuestion`, would skip the callback the answers ride on.
-With nothing to pre-allow there is no shadowing for the SDK to warn about, and
-so nothing here touches the process-wide warning filters.
+Every call runs in streaming mode, because the SDK rejects a permission callback
+on a plain-string prompt and that callback is how a question reaches the caller.
+`AskUserQuestion` is unavailable to subagents, so a call that may ask must be a
+top-level one. Exhaustion is never retried — the task is too large and fails
+identically next time; everything else goes round the ladder. Nothing
+is pre-allowed: the callback allows every tool that is not the question tool.
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -45,7 +28,6 @@ from agl.core.agent.api import (
     AgentBudgetError,
     AgentError,
     AgentOption,
-    AgentOutputError,
     AgentQuestion,
     AgentResult,
     AgentRunner,
@@ -72,20 +54,12 @@ class ClaudeRunner(AgentRunner):
         max_attempts: int = 3,
         query_fn: Callable[..., AsyncIterator[Any]] | None = None,
     ) -> None:
-        """`query_fn` defaults to the SDK's `query`.
+        """Builds a runner over the SDK.
 
-        It exists so the retry ladder can be driven against a stub, and it is
-        the only injection seam in this module.
-
-        `settings_path` is made absolute here, so the guarantee is enforced
-        rather than assumed: a run's `cwd` is the target repository, and a
-        relative path handed to the SDK would be read from inside the very
-        repository this module's configuration exists to seal out. Absolute, not
-        resolved — following symlinks would hand the SDK a path the caller never
-        named, and it is the anchoring that matters.
-
-        Raises `ValueError` for fewer than one attempt: the ladder would never
-        run, and a run that was never attempted has no failure to report.
+        param: settings_path - made absolute, not resolved: a run's `cwd` is the
+            target repository, and a relative path would be read from inside it
+        param: max_attempts - at least 1, or `ValueError`
+        param: query_fn - the SDK's `query` by default; the module's one seam
         """
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be at least 1, got {max_attempts}")
@@ -106,7 +80,7 @@ class ClaudeRunner(AgentRunner):
         for _ in range(self._max_attempts):
             try:
                 result = await self._attempt(spec, options, on_activity)
-            except (AgentBudgetError, AgentOutputError):
+            except AgentBudgetError:
                 raise
             except Exception as error:  # noqa: BLE001 - transport, API, or ours
                 failure = error
@@ -124,15 +98,12 @@ class ClaudeRunner(AgentRunner):
         options: ClaudeAgentOptions,
         on_activity: Callable[[str], None] | None,
     ) -> AgentResult:
-        """One call.
+        """One call. Raises `AgentBudgetError` or `AgentError`.
 
-        Raises `AgentBudgetError` when the run hit a ceiling, `AgentOutputError`
-        when `output_schema` was set and the text did not parse, and `AgentError`
-        — from `fold` — for every other way the run failed to complete. Only
-        the first two are exempt from the retry ladder.
+        Only the first is exempt from the retry ladder.
         """
         stream = self._query(prompt=_streamed(spec.prompt), options=options)
-        result = await fold(stream, on_activity, spec.output_schema is not None)
+        result = await fold(stream, on_activity)
 
         if result.terminal_reason in EXHAUSTED:
             raise AgentBudgetError(
@@ -176,10 +147,8 @@ def _permission_handler(
 ) -> Callable[[str, dict[str, Any], ToolPermissionContext], Awaitable[PermissionResult]]:
     """A permission callback that intercepts questions and allows everything else.
 
-    This is not a permission policy. What a run may do is decided by the options
-    it was built with; this callback exists because the SDK routes
-    `AskUserQuestion` through the same channel, and it is the only way to get
-    the question out and an answer back in.
+    Not a permission policy — the options decide that. It exists only because
+    the SDK routes `AskUserQuestion` through this same channel.
     """
 
     async def can_use_tool(
@@ -193,12 +162,9 @@ def _permission_handler(
         answers: dict[str, str] = {}
         for entry in tool_input.get("questions", []):
             question = _question(entry)
-            # Four questions can arrive in one call and nothing stops two of
-            # them sharing their text. The map the tool reads is keyed by that
-            # text, so a second answer has nowhere to go but on top of the
-            # first. Asking once and letting both take the answer loses nothing
-            # a second round trip would have kept, and does not put the same
-            # string in front of a person twice.
+            # Two questions in one call can share their text, and the answers
+            # map is keyed by it — so ask once and let both take the answer
+            # rather than putting the same string in front of a person twice.
             if question.title in answers:
                 continue
             answers[question.title] = await on_question(question)
@@ -211,8 +177,7 @@ def _permission_handler(
 def _question(entry: Mapping[str, Any]) -> AgentQuestion:
     """One entry of the tool's input as this module's own question type.
 
-    The answers map is keyed by the question text, so the title has to be that
-    same string — the header is a chip in the UI, and two questions can share it.
+    `title` must be the question text, since the answers map is keyed by it.
     """
     return AgentQuestion(
         title=str(entry.get("question") or entry.get("header") or ""),

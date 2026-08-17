@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 
-from agl.core.agent import NO_PARAMS, AgentResult, AgentSpec, Tool
+from agl.core.agent import NO_PARAMS, AgentSpec, Tool
 from agl.core.store import Store
 from agl.core.store.impl.file_store import FileStore
 from agl.core.vcs import MergeResult, VcsError
@@ -41,17 +41,6 @@ BUGS = [
     {"id": f"{PARENT}-bug-2", "n": 2, "file": "fix-2.txt", "title": "No test for the refusal"},
 ]
 
-FOUND_BUGS = AgentResult(
-    text="Two problems.",
-    structured={"bugs": BUGS},
-    session_id="fake-session",
-    cost_usd=0.0,
-    num_turns=3,
-    duration_ms=0,
-    terminal_reason="completed",
-)
-
-
 def write_tool(store: Store, tree: Path, key: str) -> Tool:
     """Writes one file into one worktree, with the content taken from the store."""
 
@@ -60,6 +49,18 @@ def write_tool(store: Store, tree: Path, key: str) -> Tool:
         return f"wrote {key}"
 
     return Tool(name="write", description="Write your file.", schema=NO_PARAMS, handler=handler)
+
+
+def report_tool(found: list[dict[str, Any]]) -> Tool:
+    """Hands the review's bugs back through a tool, the way a real role reports."""
+
+    async def handler(arguments: dict[str, Any]) -> str:
+        found.extend(BUGS)
+        return f"recorded {len(BUGS)} bugs"
+
+    return Tool(
+        name="report", description="Report what you found.", schema=NO_PARAMS, handler=handler
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +108,7 @@ async def drive(repo: Path, home: Path, trees: Path) -> Ran:
     runner = FakeAgentRunner(
         {
             "implement": ScriptedRun("done", calls=(("write", {}),)),
-            "review": ScriptedRun(result=FOUND_BUGS),
+            "review": ScriptedRun("Two problems.", calls=(("report", {}),)),
             "fix": ScriptedRun("fixed", calls=(("write", {}),)),
         }
     )
@@ -127,10 +128,15 @@ async def drive(repo: Path, home: Path, trees: Path) -> Ran:
     parent_sha = vcs.commit_all(parent.path, f"{PARENT}: add auth")
     assert parent_sha is not None
 
-    review = await runner.run(
-        AgentSpec(prompt="Review it.", cwd=parent.path, role="review", output_schema={})
+    bugs: list[dict[str, Any]] = []
+    await runner.run(
+        AgentSpec(
+            prompt="Review it.",
+            cwd=parent.path,
+            role="review",
+            tools=(report_tool(bugs),),
+        )
     )
-    bugs = review.structured["bugs"]
 
     # The mutation, in the order `Dag`'s docstring gives: the new work goes in,
     # then the edges, then the parent goes back to pending. Adding a blocker to

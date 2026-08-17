@@ -5,8 +5,11 @@ the test decides exactly when each finishes and can inspect the whole system
 while some are held. Every run is wrapped in a timeout so a deadlock fails the
 test instead of hanging the suite.
 
-Nothing here knows what a node is, either — the scheduler takes a `Dag` and a
-body over node ids, so these tests are graphs and gates and nothing else.
+Nothing here knows what a node is, either — the scheduler takes four callables
+and a body over node ids, so these tests are graphs and gates and nothing else.
+`claims_over` is the adapter that turns a held graph into those callables, and
+one test at the bottom drives a `Claims` built over a plain list to prove the
+scheduler no longer needs a graph at all.
 
 The graph shapes mirror `tests/integration/test_concurrency.py::run_graph`,
 the reference this scheduler was built from: `wide_dag` is five independent
@@ -21,7 +24,8 @@ from dataclasses import dataclass
 import pytest
 
 from agl.runtime.dag import Dag, NodeId, NodeState
-from agl.runtime.scheduler import StalledGraphError, drive, run
+from agl.runtime.scheduler import Claims, StalledGraphError, drive, run
+from tests.runtime.conftest import claims_over
 
 TIMEOUT = 10.0
 
@@ -159,7 +163,7 @@ async def run_to_completion(dag: Dag, cap: int) -> Observer:
     gates.open()
     errors = Errors()
     async with asyncio.timeout(TIMEOUT):
-        await run(dag, gated_body(dag, observer, gates), cap, errors)
+        await run(claims_over(dag), gated_body(dag, observer, gates), cap, errors)
     assert errors.calls == []
     return observer
 
@@ -183,7 +187,7 @@ async def drive_wide(cap: int) -> Ran:
     dag = wide_dag()
     observer, errors = Observer(), Errors()
     gates = Gates(dag.nodes())
-    task = asyncio.create_task(run(dag, gated_body(dag, observer, gates), cap, errors))
+    task = asyncio.create_task(run(claims_over(dag), gated_body(dag, observer, gates), cap, errors))
     await observer.until(lambda: len(observer.running) == cap, task)
 
     held_running = tuple(sorted(observer.running))
@@ -253,7 +257,7 @@ async def test_every_node_runs_exactly_once_even_with_simultaneous_completions()
     dag = wide_dag()
     observer, errors = Observer(), Errors()
     gates = Gates(dag.nodes())
-    task = asyncio.create_task(run(dag, gated_body(dag, observer, gates), CAP, errors))
+    task = asyncio.create_task(run(claims_over(dag), gated_body(dag, observer, gates), CAP, errors))
     await observer.until(lambda: len(observer.running) == CAP, task)
 
     # Releasing every held gate at once: several bodies finish in the same
@@ -285,7 +289,7 @@ async def test_a_cap_above_the_ready_set_runs_everything_at_once() -> None:
     dag = build_dag(plain(*ROOTS))
     observer, errors = Observer(), Errors()
     gates = Gates(dag.nodes())
-    task = asyncio.create_task(run(dag, gated_body(dag, observer, gates), 8, errors))
+    task = asyncio.create_task(run(claims_over(dag), gated_body(dag, observer, gates), 8, errors))
 
     await observer.until(lambda: len(observer.running) == len(ROOTS), task)
     assert observer.peak == len(ROOTS)
@@ -351,7 +355,7 @@ async def test_work_filed_mid_run_runs_before_the_released_parent() -> None:
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     await observer.until(lambda: filed.is_set(), task)
 
     # The parent is blocked by the work it just filed; only that work is ready.
@@ -382,7 +386,8 @@ async def test_halt_set_mid_run_stops_admission_and_lets_inflight_finish() -> No
     observer, errors = Observer(), Errors()
     gates = Gates(dag.nodes())
     halted = Halted()
-    task = asyncio.create_task(run(dag, gated_body(dag, observer, gates), 2, errors, halted))
+    body = gated_body(dag, observer, gates)
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors, halted))
 
     await observer.until(lambda: len(observer.running) == 2, task)
     assert "T3" not in observer.started  # ready, but the cap held it back
@@ -417,7 +422,7 @@ async def test_a_halt_set_before_the_run_admits_nothing() -> None:
         raise AssertionError("nothing should have been admitted")
 
     async with asyncio.timeout(TIMEOUT):
-        await run(dag, body, 2, errors, halted)
+        await run(claims_over(dag), body, 2, errors, halted)
 
     assert errors.calls == []
     assert dag.is_complete() is False
@@ -450,7 +455,7 @@ async def test_a_stalled_graph_reports_through_on_error_and_returns() -> None:
         raise AssertionError("nothing was ever claimable")
 
     async with asyncio.timeout(TIMEOUT):
-        await run(dag, body, 2, errors)
+        await run(claims_over(dag), body, 2, errors)
 
     assert len(errors.calls) == 1
     node_id, error = errors.calls[0]
@@ -470,7 +475,7 @@ async def test_body_raising_reports_on_error_and_does_not_leave_the_node_claimed
         raise boom
 
     async with asyncio.timeout(TIMEOUT):
-        await run(dag, body, 2, errors)
+        await run(claims_over(dag), body, 2, errors)
 
     assert errors.calls == [("T1", boom)]
     assert dag.state("T1") is NodeState.PENDING
@@ -492,7 +497,7 @@ async def test_body_raising_stops_admission_and_lets_inflight_work_finish() -> N
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     await observer.until(lambda: len(errors.calls) == 1, task)
 
     assert observer.running == {"T2"}
@@ -519,7 +524,7 @@ async def test_two_bodies_raising_at_once_are_both_reported() -> None:
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     await observer.until(lambda: len(observer.running) == 2, task)
     release.set()
 
@@ -569,7 +574,7 @@ async def test_a_raising_on_error_on_a_body_failure_still_cancels_and_awaits_inf
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     with pytest.raises(RuntimeError) as excinfo:
         async with asyncio.timeout(TIMEOUT):
             await task
@@ -615,7 +620,7 @@ async def test_a_raising_on_error_on_a_stalled_graph_still_cancels_and_awaits_in
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     await observer.until(lambda: observer.running == {"T2", "T3"}, task)
 
     gates.open("T3")
@@ -647,7 +652,7 @@ async def test_cancelling_the_run_cancels_inflight_bodies_and_propagates() -> No
         finally:
             observer.leave(node_id)
 
-    task = asyncio.create_task(run(dag, body, 2, errors))
+    task = asyncio.create_task(run(claims_over(dag), body, 2, errors))
     await observer.until(lambda: len(observer.running) == 2, task)
 
     task.cancel()
@@ -669,7 +674,7 @@ async def test_drive_returns_once_the_graph_is_complete() -> None:
     gates.open()
 
     async with asyncio.timeout(TIMEOUT):
-        await drive(dag, gated_body(dag, observer, gates), CAP, errors)
+        await drive(claims_over(dag), gated_body(dag, observer, gates), CAP, errors)
 
     assert dag.is_complete() is True
     assert errors.calls == []
@@ -707,7 +712,7 @@ async def test_drive_re_enters_run_when_a_pass_left_the_graph_incomplete() -> No
 
     gates.open()
     async with asyncio.timeout(TIMEOUT):
-        await drive(dag, body, 1, errors, halted)
+        await drive(claims_over(dag), body, 1, errors, halted)
 
     assert errors.calls == []
     assert dag.is_complete() is True
@@ -730,7 +735,7 @@ async def test_drive_returns_with_the_graph_incomplete_when_the_halt_is_still_se
             observer.leave(node_id)
 
     async with asyncio.timeout(TIMEOUT):
-        await drive(dag, body, 1, errors, halted)
+        await drive(claims_over(dag), body, 1, errors, halted)
 
     assert dag.is_complete() is False
     assert len(observer.finished) == 1
@@ -747,7 +752,7 @@ async def test_drive_over_a_complete_graph_never_calls_the_body() -> None:
         raise AssertionError("the graph was already complete")
 
     async with asyncio.timeout(TIMEOUT):
-        await drive(dag, body, 2, errors)
+        await drive(claims_over(dag), body, 2, errors)
 
     assert errors.calls == []
 
@@ -769,7 +774,58 @@ async def test_drive_returns_when_a_failing_body_leaves_the_graph_incomplete() -
         raise boom
 
     async with asyncio.timeout(TIMEOUT):
-        await drive(dag, body, 1, on_error, halted)
+        await drive(claims_over(dag), body, 1, on_error, halted)
 
     assert len(errors.calls) == 1
     assert dag.is_complete() is False
+
+
+# -- claims without a graph -------------------------------------------------
+
+
+async def test_a_claims_over_a_plain_list_drives_to_completion() -> None:
+    # The point of the four callables: there is no `Dag` anywhere here, only a
+    # queue and a set, and the scheduler cannot tell the difference. A workflow
+    # deriving its graph fresh from a document answers the same four questions.
+    waiting = ["A", "B", "C", "D"]
+    running: set[str] = set()
+    done: set[str] = set()
+    observer, errors = Observer(), Errors()
+
+    def take() -> NodeId | None:
+        if not waiting:
+            return None
+        node_id = waiting.pop(0)
+        running.add(node_id)
+        return node_id
+
+    def give_back(node_id: NodeId) -> None:
+        running.discard(node_id)
+        waiting.append(node_id)
+
+    def stalled() -> tuple[NodeId, ...] | None:
+        if waiting or running:
+            return None
+        return ()  # nothing claimable and nothing in flight
+
+    claims = Claims(
+        next=take,
+        release=give_back,
+        complete=lambda: len(done) == 4,
+        stalled=stalled,
+    )
+
+    async def body(node_id: NodeId) -> None:
+        observer.enter(node_id)
+        try:
+            running.discard(node_id)
+            done.add(node_id)
+        finally:
+            observer.leave(node_id)
+
+    async with asyncio.timeout(TIMEOUT):
+        await drive(claims, body, 2, errors)
+
+    assert errors.calls == []
+    assert done == {"A", "B", "C", "D"}
+    assert sorted(observer.finished) == ["A", "B", "C", "D"]

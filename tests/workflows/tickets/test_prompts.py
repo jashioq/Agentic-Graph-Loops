@@ -19,8 +19,8 @@ from agl.workflows.tickets.agents import (
     review,
     triage,
 )
+from agl.workflows.tickets.findings import Finding, Severity
 from agl.workflows.tickets.models import Status, Ticket
-from agl.workflows.tickets.reviews import Finding, Severity
 from tests.fakes import FakeAgentRunner, ScriptedRun
 from tests.runtime.conftest import context
 

@@ -28,9 +28,10 @@ from agl.runtime.context import (
     RunContext,
     build_gate,
     preflight,
+    resume_preflight,
 )
 from agl.runtime.display import Board, live
-from tests.conftest import git
+from tests.conftest import git, make_diverged
 from tests.fakes import FakeAgentRunner, HeadlessTerminal, MemoryStore
 from tests.runtime.conftest import LABEL, PROJECT, context, feature, settings
 
@@ -69,6 +70,15 @@ def test_a_context_records_this_run_s_request(repo: Path) -> None:
     assert ctx.request == "Add auth"
     assert ctx.base_branch == "auth"
     assert ctx.max_concurrent == 3
+
+
+def test_a_context_names_the_workflow_it_belongs_to(repo: Path) -> None:
+    """The one field a run cannot work out for itself: which workflow it is a
+    run of, which is what a resume needs before it has anything else."""
+    feature(repo)
+
+    assert context(repo).workflow == "tickets"
+    assert context(repo, workflow="review").workflow == "review"
 
 
 def test_project_settings_hold_what_runtime_needs_of_a_project(repo: Path) -> None:
@@ -146,6 +156,63 @@ def test_preflight_refuses_a_label_that_could_never_name_a_branch(repo: Path) ->
 
     with pytest.raises(paths.InvalidNameError):
         preflight(Git(repo), MemoryStore(), "Add Auth")
+
+
+def test_preflight_offers_both_ways_out_of_a_label_already_in_use(repo: Path) -> None:
+    """A run left behind is two different situations — one to pick up and one to
+    throw away — so the refusal names the command for each."""
+    feature(repo)
+    git(repo, "branch", paths.branch(LABEL, "T-01"))
+
+    with pytest.raises(PreflightError) as refusal:
+        preflight(Git(repo), MemoryStore(), LABEL)
+
+    assert f"agl resume {LABEL}" in str(refusal.value)
+    assert f"agl clean {LABEL}" in str(refusal.value)
+
+
+# -- resume_preflight ---------------------------------------------------------
+
+
+def test_resume_preflight_passes_on_the_branch_the_run_was_started_from(repo: Path) -> None:
+    branch = feature(repo)
+
+    resume_preflight(Git(repo), branch)
+
+
+def test_resume_preflight_allows_the_leftovers_a_start_refuses(repo: Path) -> None:
+    """Branches and run state under the label are what there is to resume, so
+    none of `preflight`'s other checks are made here."""
+    branch = feature(repo)
+    git(repo, "branch", paths.branch(LABEL, "T-01"))
+
+    resume_preflight(Git(repo), branch)
+
+
+def test_resume_preflight_allows_a_merge_this_run_left_in_progress(repo: Path) -> None:
+    """The one kind of mess a resume knows how to settle: a conflicted merge
+    into the base branch, sitting in the repository exactly as the queue left
+    it."""
+    diverged = make_diverged(repo, "app.py", "base\n", "ours\n", "theirs\n")
+    vcs = Git(repo)
+    assert not vcs.merge(repo, diverged.theirs).clean
+
+    resume_preflight(vcs, diverged.ours)
+
+
+def test_resume_preflight_refuses_another_branch(repo: Path) -> None:
+    feature(repo, "other")
+
+    with pytest.raises(PreflightError, match="feature"):
+        resume_preflight(Git(repo), "feature")
+
+
+def test_resume_preflight_refuses_a_tree_dirty_for_any_other_reason(repo: Path) -> None:
+    branch = feature(repo)
+    (repo / "dirty.txt").write_text("oops\n", encoding="utf-8")
+
+    with pytest.raises(PreflightError, match="uncommitted"):
+        resume_preflight(Git(repo), branch)
 
 
 # -- the build gate -----------------------------------------------------------

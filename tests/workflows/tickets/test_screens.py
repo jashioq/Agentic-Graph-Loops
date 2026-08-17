@@ -10,6 +10,7 @@ disagree with the real one.
 """
 
 import time
+from dataclasses import dataclass, replace
 
 import pytest
 from rich.console import Console
@@ -17,7 +18,16 @@ from rich.console import Console
 from agl.core.terminal import Color, Component, Row, Rows, Screen, Spacer, Text, Timer
 from agl.core.terminal.impl.screen import to_layout
 from agl.runtime.display import Board
+from agl.workflows.tickets.errors import Halt
 from agl.workflows.tickets.models import Status, Ticket
+from agl.workflows.tickets.run_state import (
+    Run,
+    display_order,
+    with_bugs,
+    with_halt,
+    with_status,
+    with_tickets,
+)
 from agl.workflows.tickets.screens import (
     APPROVED,
     SESSION_ACTIVITY_WIDTH,
@@ -26,13 +36,16 @@ from agl.workflows.tickets.screens import (
     session,
     session_header,
 )
-from agl.workflows.tickets.state import Halt, RunState
 
 NOW = 1_000.0
 WIDTH = 100
 HEIGHT = 40
+LABEL = "add-auth-ticket-18732"
 
-# How a ticket reaches each status, since only `set_status` may put it there.
+# How a ticket reaches each status, one legal move at a time. A run does claim a
+# pending ticket straight into a later status when git says the work is already
+# there, but that is a resume, and what these frames are about is the ordinary
+# life cycle.
 _ROUTE: dict[Status, tuple[Status, ...]] = {
     Status.PENDING: (),
     Status.IN_PROGRESS: (Status.IN_PROGRESS,),
@@ -72,24 +85,66 @@ def watched(started_at: float = NOW) -> Board:
     return board
 
 
-def new_run(*tickets: Ticket) -> RunState:
+@dataclass
+class Scene:
+    """The three things a dashboard frame is made of, held together for a test.
+
+    They are separate arguments in the real call for a reason — the run is a
+    document, the board is ephemeral, the label is neither — and this only puts
+    them in one place so a test can say `draw(scene)`.
+    """
+
+    run: Run
+    board: Board
+    label: str = LABEL
+
+
+def new_run(*tickets: Ticket) -> Scene:
     """A run holding `tickets`, watched since `NOW` and approved at `NOW`."""
-    state = RunState("add-auth-ticket-18732", "main", watched())
-    state.add(tickets, now=NOW)
-    return state
+    scene = Scene(with_tickets(Run(), tickets), watched())
+    for ticket in tickets:
+        scene.board.stamp(ticket.id, NOW)
+    return scene
 
 
-def walk_to(state: RunState, ticket_id: str, status: Status, *, at: float = NOW) -> None:
+def walk_to(scene: Scene, ticket_id: str, status: Status, *, at: float = NOW) -> None:
     """Move a ticket to `status` the way the workflow would, one legal step at a time."""
     for step in _ROUTE[status]:
-        state.set_status(ticket_id, step, now=at)
+        scene.run = with_status(scene.run, ticket_id, step)
+        scene.board.stamp(ticket_id, at)
 
 
-def one_at(status: Status) -> RunState:
+def file_bugs(scene: Scene, parent_id: str, bugs: list[Ticket], *, at: float = NOW) -> None:
+    """Send a ticket back behind its bugs, stamping every row that moved."""
+    scene.run = with_bugs(scene.run, parent_id, bugs)
+    for ticket_id in (parent_id, *(b.id for b in bugs)):
+        scene.board.stamp(ticket_id, at)
+
+
+def retitle(scene: Scene, ticket_id: str, title: str) -> None:
+    """Give one ticket a different title, without going through a transition."""
+    scene.run = replace(
+        scene.run,
+        tickets=tuple(
+            replace(t, title=title) if t.id == ticket_id else t for t in scene.run.tickets
+        ),
+    )
+
+
+def halted(scene: Scene, halt: Halt) -> None:
+    scene.run = with_halt(scene.run, halt)
+
+
+def draw(scene: Scene, now: float = NOW) -> Screen:
+    """The dashboard this scene renders to."""
+    return dashboard(scene.run, scene.board, scene.label, now)
+
+
+def one_at(status: Status) -> Scene:
     """A single-ticket run sitting at `status`."""
-    state = new_run(feature("T-01"))
-    walk_to(state, "T-01", status)
-    return state
+    scene = new_run(feature("T-01"))
+    walk_to(scene, "T-01", status)
+    return scene
 
 
 # -- reading the tree -----------------------------------------------------
@@ -157,7 +212,7 @@ def content_lines(screen: Screen, now: float = NOW) -> list[str]:
 def test_a_run_with_no_tickets_renders_header_and_footer() -> None:
     board = Board(started_at=NOW)
     board.mark(APPROVED, NOW - 767.0)
-    screen = dashboard(RunState("add-auth", "main", board), NOW)
+    screen = dashboard(Run(), board, "add-auth", NOW)
     assert screen.content.children == ()
     assert "add-auth" in words(screen.header)
     assert lines(screen)[0] == "add-auth"
@@ -165,8 +220,8 @@ def test_a_run_with_no_tickets_renders_header_and_footer() -> None:
 
 
 def test_the_header_carries_the_run_label() -> None:
-    state = one_at(Status.PENDING)
-    assert "add-auth-ticket-18732" in words(dashboard(state, NOW).header)
+    scene = one_at(Status.PENDING)
+    assert "add-auth-ticket-18732" in words(draw(scene).header)
 
 
 # -- status text and colour -----------------------------------------------
@@ -186,15 +241,15 @@ def test_the_header_carries_the_run_label() -> None:
 def test_each_status_has_its_own_text_and_colour(
     status: Status, shown: str, color: Color
 ) -> None:
-    state = one_at(status)
-    cell = status_cell(dashboard(state, NOW), "T-01")
+    scene = one_at(status)
+    cell = status_cell(draw(scene), "T-01")
     assert cell.content.strip() == shown
     assert cell.color is color
 
 
 def test_a_row_carries_its_id_and_title() -> None:
-    state = one_at(Status.PENDING)
-    assert words(row_of(dashboard(state, NOW), "T-01"))[:2] == ["T-01", "Do T-01"]
+    scene = one_at(Status.PENDING)
+    assert words(row_of(draw(scene), "T-01"))[:2] == ["T-01", "Do T-01"]
 
 
 def status_column(screen: Screen, ticket_id: str, now: float = NOW) -> int:
@@ -205,9 +260,9 @@ def status_column(screen: Screen, ticket_id: str, now: float = NOW) -> int:
 
 def test_a_long_title_is_cut_so_the_status_column_stays_put() -> None:
     long_title = "Migrate every last login screen in the app to Jetpack Compose"
-    state = new_run(feature("T-01"), feature("T-02"))
-    state.tickets["T-02"].title = long_title
-    screen = dashboard(state, NOW)
+    scene = new_run(feature("T-01"), feature("T-02"))
+    retitle(scene, "T-02", long_title)
+    screen = draw(scene)
     shown = words(row_of(screen, "T-02"))[1]
     assert shown != long_title
     assert long_title.startswith(shown[:-1]) and shown.endswith("…")
@@ -215,23 +270,23 @@ def test_a_long_title_is_cut_so_the_status_column_stays_put() -> None:
 
 
 def test_a_title_that_fits_is_left_alone() -> None:
-    state = new_run(feature("T-01"))
-    state.tickets["T-01"].title = "Add biometric unlock"
-    assert words(row_of(dashboard(state, NOW), "T-01"))[1] == "Add biometric unlock"
+    scene = new_run(feature("T-01"))
+    retitle(scene, "T-01", "Add biometric unlock")
+    assert words(row_of(draw(scene), "T-01"))[1] == "Add biometric unlock"
 
 
 def test_a_long_bug_title_is_cut_to_the_room_the_indent_leaves() -> None:
-    state = run_with_bugs(1)
-    state.tickets["T-01-bug-1"].title = "The refresh call loops forever on an expired token"
-    screen = dashboard(state, NOW)
+    scene = run_with_bugs(1)
+    retitle(scene, "T-01-bug-1", "The refresh call loops forever on an expired token")
+    screen = draw(scene)
     assert words(row_of(screen, "T-01-bug-1"))[1].endswith("…")
     assert status_column(screen, "T-01-bug-1") == status_column(screen, "T-01")
 
 
 def test_a_bug_row_is_red_so_it_does_not_read_as_a_feature_row() -> None:
     # Indentation alone made a bug look like a feature ticket one column over.
-    state = run_with_bugs(1)
-    screen = dashboard(state, NOW)
+    scene = run_with_bugs(1)
+    screen = draw(scene)
     assert [text.color for text in texts(row_of(screen, "T-01-bug-1"))[:2]] == [
         Color.RED,
         Color.DIM_RED,
@@ -239,8 +294,8 @@ def test_a_bug_row_is_red_so_it_does_not_read_as_a_feature_row() -> None:
 
 
 def test_a_feature_row_keeps_the_colours_it_had() -> None:
-    state = run_with_bugs(1)
-    screen = dashboard(state, NOW)
+    scene = run_with_bugs(1)
+    screen = draw(scene)
     assert [text.color for text in texts(row_of(screen, "T-01"))[:2]] == [
         Color.WHITE,
         Color.GREY,
@@ -248,9 +303,9 @@ def test_a_feature_row_keeps_the_colours_it_had() -> None:
 
 
 def test_a_merged_bug_row_dims_like_any_other_merged_row() -> None:
-    state = run_with_bugs(1)
-    walk_to(state, "T-01-bug-1", Status.MERGED)
-    screen = dashboard(state, NOW)
+    scene = run_with_bugs(1)
+    walk_to(scene, "T-01-bug-1", Status.MERGED)
+    screen = draw(scene)
     assert [text.color for text in texts(row_of(screen, "T-01-bug-1"))[:2]] == [
         Color.DIM_RED,
         Color.DIM_GREY,
@@ -258,9 +313,9 @@ def test_a_merged_bug_row_dims_like_any_other_merged_row() -> None:
 
 
 def test_a_merged_row_is_dimmed_rather_than_dropped() -> None:
-    state = new_run(feature("T-01"), feature("T-02"))
-    walk_to(state, "T-01", Status.MERGED)
-    screen = dashboard(state, NOW)
+    scene = new_run(feature("T-01"), feature("T-02"))
+    walk_to(scene, "T-01", Status.MERGED)
+    screen = draw(scene)
     assert id_column(screen) == ["T-01", "T-02"]
     assert [text.color for text in texts(row_of(screen, "T-01"))[:2]] == [
         Color.DIM_GREY,
@@ -269,8 +324,8 @@ def test_a_merged_row_is_dimmed_rather_than_dropped() -> None:
 
 
 def test_a_ticket_blocked_by_feature_tickets_is_plainly_pending() -> None:
-    state = new_run(feature("T-01"), feature("T-02", "T-01"))
-    cell = status_cell(dashboard(state, NOW), "T-02")
+    scene = new_run(feature("T-01"), feature("T-02", "T-01"))
+    cell = status_cell(draw(scene), "T-02")
     assert cell.content.strip() == "pending"
     assert cell.color is Color.WHITE
 
@@ -278,65 +333,61 @@ def test_a_ticket_blocked_by_feature_tickets_is_plainly_pending() -> None:
 # -- pending, but waiting on bugs -----------------------------------------
 
 
-def run_with_bugs(count: int) -> RunState:
+def run_with_bugs(count: int) -> Scene:
     """`T-01` under review, then sent back with `count` bugs filed against it."""
-    state = new_run(feature("T-01"))
-    walk_to(state, "T-01", Status.IN_REVIEW)
-    state.file_bugs(
-        "T-01",
-        [bug(f"T-01-bug-{index}", "T-01") for index in range(1, count + 1)],
-        now=NOW,
-    )
-    return state
+    scene = new_run(feature("T-01"))
+    walk_to(scene, "T-01", Status.IN_REVIEW)
+    file_bugs(scene, "T-01", [bug(f"T-01-bug-{index}", "T-01") for index in range(1, count + 1)])
+    return scene
 
 
 def test_a_ticket_waiting_on_bugs_says_so_and_says_how_many() -> None:
-    state = run_with_bugs(2)
-    cell = status_cell(dashboard(state, NOW), "T-01")
+    scene = run_with_bugs(2)
+    cell = status_cell(draw(scene), "T-01")
     assert cell.content.strip() == "pending (2 bugs)"
     assert cell.color is Color.RED
 
 
 def test_one_bug_is_counted_in_the_singular() -> None:
-    state = run_with_bugs(1)
-    assert status_cell(dashboard(state, NOW), "T-01").content.strip() == "pending (1 bug)"
+    scene = run_with_bugs(1)
+    assert status_cell(draw(scene), "T-01").content.strip() == "pending (1 bug)"
 
 
 def test_merging_the_bugs_returns_the_parent_to_plain_pending() -> None:
-    state = run_with_bugs(2)
+    scene = run_with_bugs(2)
     for index in (1, 2):
-        walk_to(state, f"T-01-bug-{index}", Status.MERGED)
-    cell = status_cell(dashboard(state, NOW), "T-01")
+        walk_to(scene, f"T-01-bug-{index}", Status.MERGED)
+    cell = status_cell(draw(scene), "T-01")
     assert cell.content.strip() == "pending"
     assert cell.color is Color.WHITE
 
 
 def test_a_bug_still_open_keeps_the_parent_red() -> None:
-    state = run_with_bugs(2)
-    walk_to(state, "T-01-bug-1", Status.MERGED)
-    assert status_cell(dashboard(state, NOW), "T-01").content.strip() == "pending (1 bug)"
+    scene = run_with_bugs(2)
+    walk_to(scene, "T-01-bug-1", Status.MERGED)
+    assert status_cell(draw(scene), "T-01").content.strip() == "pending (1 bug)"
 
 
 def test_a_bug_ticket_of_its_own_is_never_counted_against_itself() -> None:
-    state = run_with_bugs(1)
-    assert status_cell(dashboard(state, NOW), "T-01-bug-1").content.strip() == "pending"
+    scene = run_with_bugs(1)
+    assert status_cell(draw(scene), "T-01-bug-1").content.strip() == "pending"
 
 
 # -- rows, and where they sit ---------------------------------------------
 
 
 def test_a_bug_row_is_indented_under_its_parent() -> None:
-    state = run_with_bugs(1)
-    drawn = content_lines(dashboard(state, NOW))
+    scene = run_with_bugs(1)
+    drawn = content_lines(draw(scene, NOW))
     assert drawn[0].startswith("T-01 ")
     assert drawn[1].startswith("      T-01-bug-1")
 
 
 def test_two_bugs_under_one_parent_stay_adjacent() -> None:
-    state = new_run(feature("T-01"), feature("T-02"))
-    walk_to(state, "T-01", Status.IN_REVIEW)
-    state.file_bugs("T-01", [bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01")], now=NOW)
-    assert id_column(dashboard(state, NOW)) == [
+    scene = new_run(feature("T-01"), feature("T-02"))
+    walk_to(scene, "T-01", Status.IN_REVIEW)
+    file_bugs(scene, "T-01", [bug("T-01-bug-1", "T-01"), bug("T-01-bug-2", "T-01")])
+    assert id_column(draw(scene)) == [
         "T-01",
         "T-01-bug-1",
         "T-01-bug-2",
@@ -345,18 +396,18 @@ def test_two_bugs_under_one_parent_stay_adjacent() -> None:
 
 
 def test_row_order_is_the_display_order() -> None:
-    state = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
-    walk_to(state, "T-02", Status.IN_REVIEW)
-    state.file_bugs("T-02", [bug("T-02-bug-1", "T-02")], now=NOW)
-    assert id_column(dashboard(state, NOW)) == list(state.display_order())
+    scene = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
+    walk_to(scene, "T-02", Status.IN_REVIEW)
+    file_bugs(scene, "T-02", [bug("T-02-bug-1", "T-02")])
+    assert id_column(draw(scene)) == list(display_order(scene.run))
 
 
 def test_row_order_does_not_move_when_a_status_changes() -> None:
-    state = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
-    before = id_column(dashboard(state, NOW))
-    walk_to(state, "T-03", Status.MERGED)
-    walk_to(state, "T-01", Status.IN_REVIEW)
-    assert id_column(dashboard(state, NOW)) == before
+    scene = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
+    before = id_column(draw(scene))
+    walk_to(scene, "T-03", Status.MERGED)
+    walk_to(scene, "T-01", Status.IN_REVIEW)
+    assert id_column(draw(scene)) == before
 
 
 # -- timers ---------------------------------------------------------------
@@ -376,29 +427,29 @@ def test_row_order_does_not_move_when_a_status_changes() -> None:
 def test_a_timer_runs_only_while_an_agent_is_working_the_ticket(
     status: Status, ticking: bool
 ) -> None:
-    state = one_at(status)
-    assert bool(timers(row_of(dashboard(state, NOW), "T-01"))) is ticking
+    scene = one_at(status)
+    assert bool(timers(row_of(draw(scene), "T-01"))) is ticking
 
 
 def test_a_timer_counts_from_the_stamp_on_the_status() -> None:
-    state = new_run(feature("T-01"))
-    walk_to(state, "T-01", Status.IN_PROGRESS, at=NOW - 38.0)
-    assert content_lines(dashboard(state, NOW))[0].endswith("0:38")
+    scene = new_run(feature("T-01"))
+    walk_to(scene, "T-01", Status.IN_PROGRESS, at=NOW - 38.0)
+    assert content_lines(draw(scene, NOW))[0].endswith("0:38")
 
 
 def test_a_ticket_with_no_stamp_shows_no_timer_rather_than_crashing() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    state.board.status_since.clear()
-    screen = dashboard(state, NOW)
+    scene = one_at(Status.IN_PROGRESS)
+    scene.board.status_since.clear()
+    screen = draw(scene)
     assert timers(row_of(screen, "T-01")) == []
     assert content_lines(screen)[0].startswith("T-01")
 
 
 def test_the_footer_timer_reads_from_ticket_approval_not_session_start() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    state.board.mark(APPROVED, NOW - 767.0)
-    assert timers(dashboard(state, NOW).footer) == [Timer(since=NOW - 767.0)]
-    assert lines(dashboard(state, NOW))[-1] == "12:47"
+    scene = one_at(Status.IN_PROGRESS)
+    scene.board.mark(APPROVED, NOW - 767.0)
+    assert timers(draw(scene).footer) == [Timer(since=NOW - 767.0)]
+    assert lines(draw(scene))[-1] == "12:47"
 
 
 def test_the_footer_timer_does_not_move_when_the_session_start_does() -> None:
@@ -408,23 +459,23 @@ def test_the_footer_timer_does_not_move_when_the_session_start_does() -> None:
     dashboard's first frame — the footer is a function of the `approved` mark
     alone, never of `started_at`.
     """
-    state = one_at(Status.IN_PROGRESS)
-    state.board.started_at = NOW - 300.0
-    state.board.mark(APPROVED, NOW)
-    assert timers(dashboard(state, NOW).footer) == [Timer(since=NOW)]
-    assert lines(dashboard(state, NOW))[-1] == "0:00"
+    scene = one_at(Status.IN_PROGRESS)
+    scene.board.started_at = NOW - 300.0
+    scene.board.mark(APPROVED, NOW)
+    assert timers(draw(scene).footer) == [Timer(since=NOW)]
+    assert lines(draw(scene))[-1] == "0:00"
 
 
 # -- activity, one string per row -----------------------------------------
 
 
 def test_each_row_reports_its_own_activity_and_nobody_elses() -> None:
-    state = new_run(feature("T-01"), feature("T-02"))
-    walk_to(state, "T-01", Status.IN_PROGRESS)
-    walk_to(state, "T-02", Status.IN_REVIEW)
-    state.board.activity["T-01"] = "Edit LoginScreen.kt"
-    state.board.activity["T-02"] = "Reading TokenStore.kt"
-    screen = dashboard(state, NOW)
+    scene = new_run(feature("T-01"), feature("T-02"))
+    walk_to(scene, "T-01", Status.IN_PROGRESS)
+    walk_to(scene, "T-02", Status.IN_REVIEW)
+    scene.board.activity["T-01"] = "Edit LoginScreen.kt"
+    scene.board.activity["T-02"] = "Reading TokenStore.kt"
+    screen = draw(scene)
 
     assert activity_of(screen, "T-01") == "Edit LoginScreen.kt"
     assert activity_of(screen, "T-02") == "Reading TokenStore.kt"
@@ -434,17 +485,17 @@ def test_each_row_reports_its_own_activity_and_nobody_elses() -> None:
 
 
 def test_a_working_ticket_with_no_activity_shows_the_timer_alone() -> None:
-    state = new_run(feature("T-01"))
-    walk_to(state, "T-01", Status.IN_PROGRESS, at=NOW - 38.0)
-    screen = dashboard(state, NOW)
+    scene = new_run(feature("T-01"))
+    walk_to(scene, "T-01", Status.IN_PROGRESS, at=NOW - 38.0)
+    screen = draw(scene)
     assert activity_of(screen, "T-01") is None
     assert content_lines(screen)[0].endswith("0:38")
 
 
 def test_activity_on_a_status_with_no_timer_still_renders() -> None:
-    state = one_at(Status.AWAITING_INPUT)
-    state.board.activity["T-01"] = "Waiting on an answer"
-    screen = dashboard(state, NOW)
+    scene = one_at(Status.AWAITING_INPUT)
+    scene.board.activity["T-01"] = "Waiting on an answer"
+    screen = draw(scene)
     assert timers(row_of(screen, "T-01")) == []
     assert activity_of(screen, "T-01") == "Waiting on an answer"
 
@@ -460,12 +511,12 @@ def test_activity_on_a_status_with_no_timer_still_renders() -> None:
 LABELLED = "quality · Read AuthRepository.kt"
 
 
-def in_review_with(activity: str) -> RunState:
+def in_review_with(activity: str) -> Scene:
     """`T-01` under review reporting `activity`, with `T-02` on the row below."""
-    state = new_run(feature("T-01"), feature("T-02"))
-    walk_to(state, "T-01", Status.IN_REVIEW, at=NOW - 72.0)
-    state.board.activity["T-01"] = activity
-    return state
+    scene = new_run(feature("T-01"), feature("T-02"))
+    walk_to(scene, "T-01", Status.IN_REVIEW, at=NOW - 72.0)
+    scene.board.activity["T-01"] = activity
+    return scene
 
 
 def drawn_row(screen: Screen, ticket_id: str, now: float = NOW) -> tuple[list[str], int]:
@@ -476,8 +527,8 @@ def drawn_row(screen: Screen, ticket_id: str, now: float = NOW) -> tuple[list[st
 
 
 def test_a_labelled_activity_is_drawn_whole_and_moves_nothing() -> None:
-    state = in_review_with(LABELLED)
-    screen = dashboard(state, NOW)
+    scene = in_review_with(LABELLED)
+    screen = draw(scene)
 
     assert activity_of(screen, "T-01") == LABELLED
     drawn, index = drawn_row(screen, "T-01")
@@ -491,7 +542,7 @@ def test_a_label_does_not_move_the_activity_column() -> None:
     labelled = in_review_with(LABELLED)
     walk_to(labelled, "T-02", Status.IN_REVIEW, at=NOW - 72.0)
     labelled.board.activity["T-02"] = "Read AuthRepository.kt"
-    drawn = lines(dashboard(labelled, NOW))
+    drawn = lines(draw(labelled))
     rows = [line for line in drawn if line.startswith(("T-01 ", "T-02 "))]
     assert rows[0].index(LABELLED) == rows[1].index("Read AuthRepository.kt")
 
@@ -505,19 +556,19 @@ def test_the_room_a_labelled_activity_has_is_what_the_screen_leaves() -> None:
     discovered: one column too many and the row wraps onto a second line,
     pushing everything below it down.
     """
-    state = in_review_with("x")
-    _, index = drawn_row(dashboard(state, NOW), "T-01")
-    column = len(lines(dashboard(state, NOW))[index]) - 1
+    scene = in_review_with("x")
+    _, index = drawn_row(draw(scene), "T-01")
+    column = len(lines(draw(scene))[index]) - 1
     room = WIDTH - column
     assert (column, room) == (63, 37)
 
     fits, over = "q" * room, "q" * (room + 1)
-    state = in_review_with(fits)
-    drawn, index = drawn_row(dashboard(state, NOW), "T-01")
+    scene = in_review_with(fits)
+    drawn, index = drawn_row(draw(scene), "T-01")
     assert drawn[index].endswith(fits) and drawn[index + 1].startswith("T-02")
 
-    state = in_review_with(over)
-    drawn, index = drawn_row(dashboard(state, NOW), "T-01")
+    scene = in_review_with(over)
+    drawn, index = drawn_row(draw(scene), "T-01")
     # Rich wraps at a word boundary, so one column too many does not trail off
     # the end of the line — the whole string leaves the row it belongs to.
     assert over not in drawn[index]
@@ -526,11 +577,11 @@ def test_the_room_a_labelled_activity_has_is_what_the_screen_leaves() -> None:
 
 
 def test_an_empty_board_renders_every_row() -> None:
-    state = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
-    walk_to(state, "T-01", Status.IN_PROGRESS)
-    walk_to(state, "T-02", Status.MERGED)
-    state.board = watched()
-    screen = dashboard(state, NOW)
+    scene = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
+    walk_to(scene, "T-01", Status.IN_PROGRESS)
+    walk_to(scene, "T-02", Status.MERGED)
+    scene.board = watched()
+    screen = draw(scene)
     assert id_column(screen) == ["T-01", "T-02", "T-03"]
     assert timers(screen.content) == []
 
@@ -539,57 +590,57 @@ def test_an_empty_board_renders_every_row() -> None:
 
 
 def test_one_waiting_ticket_is_named_in_the_header() -> None:
-    state = new_run(feature("T-01"), feature("T-02"))
-    walk_to(state, "T-02", Status.AWAITING_INPUT)
-    header = dashboard(state, NOW).header
+    scene = new_run(feature("T-01"), feature("T-02"))
+    walk_to(scene, "T-02", Status.AWAITING_INPUT)
+    header = draw(scene).header
     marker = [text for text in texts(header) if "needs input" in text.content]
     assert [text.content.strip() for text in marker] == ["⏸ T-02 needs input"]
     assert marker[0].color is Color.BOLD_YELLOW
 
 
 def test_several_waiting_tickets_are_counted() -> None:
-    state = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
+    scene = new_run(feature("T-01"), feature("T-02"), feature("T-03"))
     for ticket_id in ("T-01", "T-03"):
-        walk_to(state, ticket_id, Status.AWAITING_INPUT)
-    header = dashboard(state, NOW).header
+        walk_to(scene, ticket_id, Status.AWAITING_INPUT)
+    header = draw(scene).header
     assert [text.content.strip() for text in texts(header) if "need" in text.content] == [
         "⏸ 2 tickets need input"
     ]
 
 
 def test_nothing_waiting_means_no_marker() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    assert not [text for text in texts(dashboard(state, NOW).header) if "input" in text.content]
+    scene = one_at(Status.IN_PROGRESS)
+    assert not [text for text in texts(draw(scene).header) if "input" in text.content]
 
 
 def test_a_halt_puts_its_reason_in_the_header() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    state.halt = Halt(reason="merge conflict on T-01", detail="two agents touched build.gradle")
-    header = dashboard(state, NOW).header
+    scene = one_at(Status.IN_PROGRESS)
+    halted(scene, Halt(reason="merge conflict on T-01", detail="two agents touched build.gradle"))
+    header = draw(scene).header
     banner = [text for text in texts(header) if "merge conflict on T-01" in text.content]
     assert len(banner) == 1
     assert banner[0].color is Color.BOLD_RED
-    assert "two agents touched build.gradle" in "\n".join(lines(dashboard(state, NOW)))
+    assert "two agents touched build.gradle" in "\n".join(lines(draw(scene)))
 
 
 def test_no_halt_means_no_banner() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    assert not [text for text in texts(dashboard(state, NOW).header) if "halt" in text.content]
+    scene = one_at(Status.IN_PROGRESS)
+    assert not [text for text in texts(draw(scene).header) if "halt" in text.content]
 
 
 def test_a_resumable_halt_tells_a_person_enter_continues() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    state.halt = Halt(reason="merge conflict on T-01", resumable=True)
-    header = dashboard(state, NOW).header
+    scene = one_at(Status.IN_PROGRESS)
+    halted(scene, Halt(reason="merge conflict on T-01", resumable=True))
+    header = draw(scene).header
     hint = [text for text in texts(header) if "enter" in text.content.lower()]
     assert len(hint) == 1
     assert hint[0].color is Color.BOLD_RED
 
 
 def test_a_non_resumable_halt_says_stop_and_restart() -> None:
-    state = one_at(Status.IN_PROGRESS)
-    state.halt = Halt(reason="build command not found", resumable=False)
-    header = dashboard(state, NOW).header
+    scene = one_at(Status.IN_PROGRESS)
+    halted(scene, Halt(reason="build command not found", resumable=False))
+    header = draw(scene).header
     hint = [text for text in texts(header) if "restart" in text.content.lower()]
     assert len(hint) == 1
     assert hint[0].color is Color.BOLD_RED
@@ -597,73 +648,66 @@ def test_a_non_resumable_halt_says_stop_and_restart() -> None:
 
 
 def test_the_two_halt_banners_are_distinguishable() -> None:
-    resumable_state = one_at(Status.IN_PROGRESS)
-    resumable_state.halt = Halt(reason="x", resumable=True)
-    resumable_words = words(dashboard(resumable_state, NOW).header)
+    resumable = one_at(Status.IN_PROGRESS)
+    halted(resumable, Halt(reason="x", resumable=True))
 
-    stuck_state = one_at(Status.IN_PROGRESS)
-    stuck_state.halt = Halt(reason="x", resumable=False)
-    stuck_words = words(dashboard(stuck_state, NOW).header)
+    stuck = one_at(Status.IN_PROGRESS)
+    halted(stuck, Halt(reason="x", resumable=False))
 
-    assert resumable_words != stuck_words
+    assert words(draw(resumable).header) != words(draw(stuck).header)
 
 
 # -- purity ---------------------------------------------------------------
 
 
 def test_the_same_arguments_produce_an_equal_screen() -> None:
-    state = run_with_bugs(2)
-    walk_to(state, "T-01-bug-1", Status.IN_PROGRESS)
-    state.board.activity["T-01-bug-1"] = "Edit AuthError.kt"
-    assert dashboard(state, NOW) == dashboard(state, NOW)
+    scene = run_with_bugs(2)
+    walk_to(scene, "T-01-bug-1", Status.IN_PROGRESS)
+    scene.board.activity["T-01-bug-1"] = "Edit AuthError.kt"
+    assert draw(scene) == draw(scene)
 
 
-def test_a_frame_writes_to_neither_the_state_nor_the_board() -> None:
-    state = run_with_bugs(2)
-    walk_to(state, "T-01-bug-1", Status.IN_PROGRESS)
-    state.board.activity["T-01-bug-1"] = "Edit AuthError.kt"
-    before = (
-        {ticket_id: vars(ticket).copy() for ticket_id, ticket in state.tickets.items()},
-        {node: state.dag.state(node) for node in state.dag.nodes()},
-        state.halt,
-        dict(state.board.status_since),
-        dict(state.board.activity),
-        state.board.started_at,
-    )
-    dashboard(state, NOW)
-    assert (
-        {ticket_id: vars(ticket).copy() for ticket_id, ticket in state.tickets.items()},
-        {node: state.dag.state(node) for node in state.dag.nodes()},
-        state.halt,
-        dict(state.board.status_since),
-        dict(state.board.activity),
-        state.board.started_at,
-    ) == before
+def test_a_frame_writes_to_neither_the_run_nor_the_board() -> None:
+    scene = run_with_bugs(2)
+    walk_to(scene, "T-01-bug-1", Status.IN_PROGRESS)
+    scene.board.activity["T-01-bug-1"] = "Edit AuthError.kt"
+
+    def snapshot() -> tuple[object, ...]:
+        return (
+            scene.run,
+            dict(scene.board.status_since),
+            dict(scene.board.activity),
+            scene.board.started_at,
+        )
+
+    before = snapshot()
+    draw(scene)
+    assert snapshot() == before
 
 
 def test_a_frame_never_reads_the_clock() -> None:
     """`now` is the only clock a frame sees, so a frame can be asserted on."""
-    state = one_at(Status.IN_PROGRESS)
-    later = dashboard(state, NOW + 120.0)
-    assert timers(row_of(later, "T-01")) == timers(row_of(dashboard(state, NOW), "T-01"))
+    scene = one_at(Status.IN_PROGRESS)
+    later = draw(scene, NOW + 120.0)
+    assert timers(row_of(later, "T-01")) == timers(row_of(draw(scene), "T-01"))
     assert time.monotonic() > 0  # the real clock moved; the frame did not
 
 
 def test_the_layout_is_columns_of_spacers_and_padded_text() -> None:
     """Nothing in a row separates itself; the gaps are all deliberate."""
-    state = run_with_bugs(1)
-    row = row_of(dashboard(state, NOW), "T-01-bug-1")
+    scene = run_with_bugs(1)
+    row = row_of(draw(scene), "T-01-bug-1")
     assert isinstance(row.children[0], Spacer)
 
 
 def test_a_frame_of_a_real_looking_run_reads_as_expected() -> None:
-    state = new_run(feature("T-01"), feature("T-02"), feature("T-03"), feature("T-04"))
-    walk_to(state, "T-01", Status.MERGED)
-    walk_to(state, "T-02", Status.IN_REVIEW, at=NOW - 72.0)
-    walk_to(state, "T-04", Status.AWAITING_INPUT)
-    state.board.activity["T-02"] = "Reading TokenStore.kt"
-    state.board.mark(APPROVED, NOW - 767.0)
-    drawn = lines(dashboard(state, NOW))
+    scene = new_run(feature("T-01"), feature("T-02"), feature("T-03"), feature("T-04"))
+    walk_to(scene, "T-01", Status.MERGED)
+    walk_to(scene, "T-02", Status.IN_REVIEW, at=NOW - 72.0)
+    walk_to(scene, "T-04", Status.AWAITING_INPUT)
+    scene.board.activity["T-02"] = "Reading TokenStore.kt"
+    scene.board.mark(APPROVED, NOW - 767.0)
+    drawn = lines(draw(scene))
     assert drawn[0].startswith("add-auth-ticket-18732")
     assert drawn[0].endswith("⏸ T-04 needs input")
     assert "in review" in drawn[3] and "1:12" in drawn[3] and "Reading TokenStore.kt" in drawn[3]
@@ -704,7 +748,7 @@ def test_an_activity_written_through_the_boards_lookup_reaches_the_header() -> N
 
 
 def test_both_screens_render_before_any_activity_has_arrived() -> None:
-    """The state during the first seconds of every run: no crash, no gap."""
+    """The scene during the first seconds of every run: no crash, no gap."""
     board = Board(started_at=NOW)
     header = session_header("add-auth", board)
     assert timers(header) == [Timer(since=NOW)]
@@ -733,12 +777,12 @@ def test_the_session_timer_and_the_dashboard_timer_are_independent() -> None:
     remembers the session's own elapsed time. Neither stamp is derived from
     the other.
     """
-    state = one_at(Status.IN_PROGRESS)
-    state.board.started_at = NOW - 300.0
-    state.board.mark(APPROVED, NOW)
+    scene = one_at(Status.IN_PROGRESS)
+    scene.board.started_at = NOW - 300.0
+    scene.board.mark(APPROVED, NOW)
 
-    assert lines(dashboard(state, NOW))[-1] == "0:00"
-    header = session_header(state.label, state.board)
+    assert lines(draw(scene))[-1] == "0:00"
+    header = session_header(scene.label, scene.board)
     assert lines(Screen(content=Rows(header)), NOW)[0].endswith("5:00")
 
 
